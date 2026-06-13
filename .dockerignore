@@ -1,0 +1,8 @@
+node_modules
+dist
+storage
+client
+examples
+.git
+.env
+*.log

@@ -1,0 +1,30 @@
+services:
+  backend:
+    build: .
+    image: addressables-backend
+    environment:
+      PORT: 3001
+      API_USER: ${API_USER:-unity}
+      API_PASS: ${API_PASS:-changeme}
+      API_REALM: ${API_REALM:-Addressables}
+      STORAGE_DIR: /data
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-536870912}
+      PROTECT_DOWNLOADS: ${PROTECT_DOWNLOADS:-false}
+    volumes:
+      - bundles:/data
+    restart: unless-stopped
+    # Exposed only to the internal network; the frontend proxies to it.
+    expose:
+      - "3001"
+
+  frontend:
+    build: ./client
+    image: addressables-frontend
+    depends_on:
+      - backend
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+volumes:
+  bundles:

@@ -46,6 +46,38 @@ Then open:
 - Admin UI: <http://localhost:3001/>
 - Swagger:  <http://localhost:3001/api/docs>
 
+## Run with Docker
+
+Frontend and backend each have their own image; `docker-compose` wires them
+together. The frontend (nginx) serves the React UI and reverse‑proxies
+`/api`, `/content` and `/health` to the backend, so everything is reachable on
+a single port.
+
+```bash
+cp .env.example .env        # set API_USER / API_PASS (used by compose)
+docker compose up --build
+```
+
+Then open:
+
+- App + API: <http://localhost:8080/>
+- Swagger:   <http://localhost:8080/api/docs>
+
+Uploaded bundles are persisted in the `bundles` named volume. Point Unity at
+`http://YOUR_HOST:8080/...` for both upload and `RemoteLoadPath`.
+
+Compose env vars (all optional, see `.env.example`):
+
+| Variable            | Default    | Description                           |
+| ------------------- | ---------- | ------------------------------------- |
+| `WEB_PORT`          | `8080`     | Host port for the frontend            |
+| `API_USER`/`API_PASS` | `unity`/`changeme` | Basic-auth credentials      |
+| `PROTECT_DOWNLOADS` | `false`    | Require auth on `/content` downloads  |
+| `MAX_FILE_SIZE`     | `536870912`| Max upload size per file (bytes)      |
+
+> nginx is configured with `client_max_body_size 1024m`; raise it in
+> `client/nginx.conf` if your bundles are larger.
+
 ## Configuration
 
 All settings come from environment variables (see `.env.example`):
