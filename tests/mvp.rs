@@ -32,7 +32,7 @@ fn test2_partial_recall() {
     let a = random_code(&mut rng);
     let id = mem.learn(Input::Code(&a), LearnOptions::new()).unwrap();
 
-    for keep in [24, 12, 6] {
+    for keep in [18, 9, 3] {
         let cue = partial(&mut rng, &a, keep);
         let r = mem.recall(Input::Code(&cue), &opts()).unwrap();
         let hit = r.best().unwrap_or_else(|| panic!("partial cue of {keep}/{K} failed"));
@@ -44,10 +44,10 @@ fn test2_partial_recall() {
 
 #[test]
 fn test2b_partial_recall_dense_hidden_states() {
-    let dim = 512;
+    let dim = 729;
     let mut mem = dense_memory(dim, MemoryConfig::default());
     let mut rng = SplitMix64::new(22);
-    let keys: Vec<Vec<f32>> = (0..200).map(|_| random_vec(&mut rng, dim)).collect();
+    let keys: Vec<Vec<f32>> = (0..243).map(|_| random_vec(&mut rng, dim)).collect();
     let ids: Vec<u64> = keys.iter().map(|k| mem.learn(Input::Dense(k), LearnOptions::new()).unwrap()).collect();
 
     let mut correct = 0;
@@ -57,7 +57,7 @@ fn test2b_partial_recall_dense_hidden_states() {
             correct += 1;
         }
     }
-    assert!(correct >= 195, "noisy dense recall {correct}/200");
+    assert!(correct >= 237, "noisy dense recall {correct}/243");
 }
 
 #[test]
@@ -115,17 +115,17 @@ fn test5_context_reset() {
     assert!(mem.recall(Input::Code(&c), &in1).unwrap().is_miss());
 }
 
-/// Many similar patterns: families of variants sharing 60% of a prototype.
+/// Many similar patterns: families of variants sharing 2/3 of a prototype.
 #[test]
 fn test6_interference() {
     let cfg = MemoryConfig { dedupe_threshold: None, ..Default::default() };
     let (mut mem, _) = code_memory(cfg);
     let mut rng = SplitMix64::new(6);
-    let shared = K * 6 / 10;
+    let shared = K * 2 / 3;
     let mut stored = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..81 {
         let proto = random_code(&mut rng);
-        for _ in 0..20 {
+        for _ in 0..27 {
             let mut v = partial(&mut rng, &proto, shared);
             while v.len() < K {
                 let n = rng.below(N_NEURONS as u64) as u32;
@@ -139,11 +139,11 @@ fn test6_interference() {
         }
     }
 
-    // Cue: 75% of a variant. The variant explains all of it; its siblings
+    // Cue: 2/3 of a variant. The variant explains all of it; its siblings
     // explain at most the shared part.
     let (mut correct, mut wrong) = (0, 0);
     for (v, id) in &stored {
-        let cue = partial(&mut rng, v, K * 3 / 4);
+        let cue = partial(&mut rng, v, K * 2 / 3);
         match mem.recall(Input::Code(&cue), &opts()).unwrap().id() {
             Some(got) if got == *id => correct += 1,
             Some(_) => wrong += 1,
@@ -155,13 +155,13 @@ fn test6_interference() {
     assert!((wrong as f32) < 0.02 * n as f32, "false recall {wrong}/{n}");
 
     // Unseen random patterns must not be recalled.
-    let false_hits = (0..500)
+    let false_hits = (0..729)
         .filter(|_| !mem.recall(Input::Code(&random_code(&mut rng)), &opts()).unwrap().is_miss())
         .count();
     assert_eq!(false_hits, 0);
 
-    // The first memories are still intact after 2000 later writes.
-    for (v, id) in stored.iter().take(20) {
+    // The first memories are still intact after 2000+ later writes.
+    for (v, id) in stored.iter().take(27) {
         assert_eq!(mem.recall(Input::Code(v), &opts()).unwrap().id(), Some(*id));
     }
 }

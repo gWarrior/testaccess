@@ -3,8 +3,11 @@
 use snn_memory::rng::SplitMix64;
 use snn_memory::{CodeEncoder, FlyHashEncoder, ManualClock, MemoryConfig, SnnMemory};
 
-pub const N_NEURONS: u32 = 16_384;
-pub const K: usize = 48;
+/// One tryte of neurons (3^9); raw codes have 3^3 active neurons.
+pub const N_NEURONS: u32 = 19_683;
+pub const K: usize = 27;
+/// Winners of the dense (hidden-state) encoder, 3^4.
+pub const DENSE_K: usize = 81;
 
 /// Memory over raw spike codes with a manual clock.
 pub fn code_memory(cfg: MemoryConfig) -> (SnnMemory<&'static str>, ManualClock) {
@@ -15,8 +18,8 @@ pub fn code_memory(cfg: MemoryConfig) -> (SnnMemory<&'static str>, ManualClock) 
 
 /// Memory over dense vectors (hidden-state stand-ins).
 pub fn dense_memory(dim: usize, cfg: MemoryConfig) -> SnnMemory<u32> {
-    let enc = FlyHashEncoder::new(dim, N_NEURONS, K, 32, 7).unwrap();
-    SnnMemory::new(enc, MemoryConfig { max_ensemble: K, ..cfg }).unwrap()
+    let enc = FlyHashEncoder::new(dim, N_NEURONS, DENSE_K, 27, 7).unwrap();
+    SnnMemory::new(enc, MemoryConfig { max_ensemble: DENSE_K, ..cfg }).unwrap()
 }
 
 pub fn random_code(rng: &mut SplitMix64) -> Vec<u32> {

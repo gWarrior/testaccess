@@ -84,7 +84,7 @@ mod tests {
     fn background_worker_expires_and_cleans() {
         let clock = ManualClock::new(0.0);
         let cfg = MemoryConfig { auto_cleanup: 0, ..Default::default() };
-        let mem: SnnMemory<()> = SnnMemory::new(CodeEncoder::new(1024), cfg).unwrap().with_clock(clock.clone());
+        let mem: SnnMemory<()> = SnnMemory::new(CodeEncoder::new(729), cfg).unwrap().with_clock(clock.clone());
         let shared = SharedMemory::new(mem);
         {
             let mut m = shared.lock();

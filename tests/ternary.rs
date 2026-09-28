@@ -40,10 +40,11 @@ fn known_unknown_absent() {
     assert_eq!((r.verdict, r.basis), (Verdict::Absent, Basis::NoEvidence));
     assert_eq!(r.verdict.trit(), -1);
 
-    // A cue half explained by A: evidence between the two thresholds.
-    let cue = mixed(&mut rng, &a, 16);
+    // A cue weakly explained by A: evidence between the two thresholds
+    // (reject 1/9, recall 2/9).
+    let cue = mixed(&mut rng, &a, 6);
     let r = mem.recall(Input::Code(&cue), &opts()).unwrap();
-    assert!(r.evidence > 0.15 && r.evidence < 0.3, "evidence {}", r.evidence);
+    assert!(r.evidence > 1.0 / 9.0 && r.evidence < 2.0 / 9.0, "evidence {}", r.evidence);
     assert_eq!((r.verdict, r.basis), (Verdict::Unknown, Basis::Partial));
     assert_eq!(r.verdict.trit(), 0);
 }
@@ -67,7 +68,7 @@ fn negative_knowledge_answers_definitely_not() {
     let fact = random_code(&mut rng);
     let id = mem.learn(Input::Code(&fact), LearnOptions::new().negative().payload("false claim")).unwrap();
 
-    let r = mem.recall(Input::Code(&partial(&mut rng, &fact, 30)), &opts()).unwrap();
+    let r = mem.recall(Input::Code(&partial(&mut rng, &fact, 18)), &opts()).unwrap();
     assert_eq!((r.verdict, r.basis), (Verdict::Absent, Basis::NegativeKnowledge));
     let hit = r.best().expect("the negative memory is the evidence");
     assert_eq!((hit.id, hit.polarity, hit.payload), (id, -1, Some("false claim")));
@@ -96,13 +97,13 @@ fn suppression_vetoes_a_misleading_cue_only() {
     let a = random_code(&mut rng);
     let id = mem.learn(Input::Code(&a), LearnOptions::new()).unwrap();
 
-    // 60% of A plus foreign neurons: recalled as A before correction.
-    let misleading = mixed(&mut rng, &a, 29);
+    // 16 of A's 27 neurons plus foreign ones: recalled as A before correction.
+    let misleading = mixed(&mut rng, &a, 16);
     assert_eq!(mem.recall(Input::Code(&misleading), &opts()).unwrap().id(), Some(id));
 
-    // Limited by the engram's free synapse positions (64 - 48).
+    // Every foreign cue neuron becomes an inhibitory input of A.
     let n = mem.suppress(id, Input::Code(&misleading)).unwrap();
-    assert_eq!(n, 16);
+    assert_eq!(n, K - 16);
     let states = mem.get_memory(id).unwrap().states;
     assert_eq!(states.iter().filter(|&&s| s == -1).count(), n);
 
@@ -110,7 +111,7 @@ fn suppression_vetoes_a_misleading_cue_only() {
     assert_eq!((r.verdict, r.basis), (Verdict::Absent, Basis::Inhibited));
     // A is still recalled from its own pattern and from clean partial cues.
     assert_eq!(mem.recall(Input::Code(&a), &opts()).unwrap().id(), Some(id));
-    assert_eq!(mem.recall(Input::Code(&partial(&mut rng, &a, 20)), &opts()).unwrap().id(), Some(id));
+    assert_eq!(mem.recall(Input::Code(&partial(&mut rng, &a, 12)), &opts()).unwrap().id(), Some(id));
 }
 
 #[test]
@@ -119,7 +120,7 @@ fn suppression_in_long_term_memory_is_fast_and_resettable() {
     let mut rng = SplitMix64::new(35);
     let a = random_code(&mut rng);
     let id = mem.learn(Input::Code(&a), LearnOptions::new().pin()).unwrap();
-    let misleading = mixed(&mut rng, &a, 29);
+    let misleading = mixed(&mut rng, &a, 16);
     mem.suppress(id, Input::Code(&misleading)).unwrap();
     assert!(mem.recall(Input::Code(&misleading), &opts()).unwrap().is_absent());
 

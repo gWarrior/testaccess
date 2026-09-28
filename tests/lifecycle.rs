@@ -136,9 +136,9 @@ fn reinforcement_tracks_a_drifting_pattern() {
     let mut rng = SplitMix64::new(16);
     let a = random_code(&mut rng);
     let id = mem.learn(Input::Code(&a), LearnOptions::new()).unwrap();
-    // Replace 10% of the pattern with new neurons and present it repeatedly.
-    let mut drifted = a[..K - 5].to_vec();
-    drifted.extend(random_code(&mut rng).into_iter().take(5));
+    // Replace 1/9 of the pattern with new neurons and present it repeatedly.
+    let mut drifted = a[..K - 3].to_vec();
+    drifted.extend(random_code(&mut rng).into_iter().take(3));
     drifted.sort_unstable();
     drifted.dedup();
     for _ in 0..6 {
@@ -187,10 +187,10 @@ fn facilitation_prefers_recent_duplicate() {
 #[test]
 fn errors_are_reported() {
     let (mut mem, _) = code_memory(MemoryConfig::default());
-    let big: Vec<u32> = (0..200).collect();
+    let big: Vec<u32> = (0..243).collect();
     assert!(matches!(
         mem.learn(Input::Code(&big), LearnOptions::new()),
-        Err(MemoryError::EnsembleTooLarge { len: 200, .. })
+        Err(MemoryError::EnsembleTooLarge { len: 243, .. })
     ));
     assert!(matches!(
         mem.learn(Input::Code(&[N_NEURONS]), LearnOptions::new()),
@@ -210,14 +210,14 @@ fn errors_are_reported() {
 
 #[test]
 fn slots_are_recycled_after_cleanup() {
-    let cfg = MemoryConfig { auto_cleanup: 8, dedupe_threshold: None, ..Default::default() };
+    let cfg = MemoryConfig { auto_cleanup: 9, dedupe_threshold: None, ..Default::default() };
     let (mut mem, _) = code_memory(cfg);
     let mut rng = SplitMix64::new(19);
-    for _ in 0..100 {
+    for _ in 0..81 {
         let id = mem.learn(Input::Code(&random_code(&mut rng)), LearnOptions::new()).unwrap();
         mem.forget(id);
     }
     let s = mem.stats();
-    assert!(s.slots <= 9, "slots grow unbounded: {}", s.slots);
+    assert!(s.slots <= 10, "slots grow unbounded: {}", s.slots);
     assert_eq!(s.fast_memories, 0);
 }

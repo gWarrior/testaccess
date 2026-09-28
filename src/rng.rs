@@ -50,7 +50,7 @@ impl SplitMix64 {
     /// `k` distinct values from `0..n`, in random order (`k <= n`).
     pub fn sample_distinct(&mut self, n: u32, k: usize) -> Vec<u32> {
         assert!(k <= n as usize, "cannot sample {k} distinct values from {n}");
-        if k * 4 >= n as usize {
+        if k * 3 >= n as usize {
             let mut all: Vec<u32> = (0..n).collect();
             for i in 0..k {
                 let j = i + self.below((n as usize - i) as u64) as usize;

@@ -7,10 +7,10 @@
 //! touches the synapses of its own active neurons, so retrieval cost scales
 //! with their fan-out, not with the number of memories.
 
-/// Maximum synapses per engram (positions fit in 8 bits).
-pub(crate) const MAX_WIDTH: usize = 256;
-/// Maximum engram slots per bank (slots fit in 24 bits).
-pub(crate) const MAX_SLOTS: usize = 1 << 24;
+/// Maximum synapses per engram, 3^5 (positions are stored in 8 bits).
+pub(crate) const MAX_WIDTH: usize = 243;
+/// Maximum engram slots per bank, 3^15 (slots are stored in 24 bits).
+pub(crate) const MAX_SLOTS: usize = 14_348_907;
 
 #[inline]
 pub(crate) fn entry(slot: u32, pos: usize) -> u32 {
@@ -112,13 +112,13 @@ mod tests {
 
     #[test]
     fn entry_packing_roundtrip() {
-        let e = entry(123_456, 200);
-        assert_eq!((entry_slot(e), entry_pos(e)), (123_456, 200));
+        let e = entry(123_456, 242);
+        assert_eq!((entry_slot(e), entry_pos(e)), (123_456, 242));
     }
 
     #[test]
     fn add_remove_purge() {
-        let mut idx = PostingIndex::new(16);
+        let mut idx = PostingIndex::new(27);
         idx.add_engram(0, &[1, 2, 3]);
         idx.add_engram(1, &[2, 3, 4]);
         idx.add_engram(2, &[3]);

@@ -29,8 +29,8 @@ impl Default for DynamicsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            steps: 12,
-            tau_m: 4.0,
+            steps: 9,
+            tau_m: 3.0,
             inhibition: 0.5,
             rate_decay: 0.8,
             completion: true,
@@ -57,7 +57,7 @@ pub struct PlasticityConfig {
 
 impl Default for PlasticityConfig {
     fn default() -> Self {
-        Self { p_potentiate: 1.0, p_depress: 0.35, max_new_synapses: 8 }
+        Self { p_potentiate: 1.0, p_depress: 0.35, max_new_synapses: 9 }
     }
 }
 
@@ -76,14 +76,14 @@ pub struct StpConfig {
 
 impl Default for StpConfig {
     fn default() -> Self {
-        Self { utilization: 0.3, tau: 30.0, max_gain: 0.15, capacity: 4096 }
+        Self { utilization: 0.3, tau: 27.0, max_gain: 0.15, capacity: 6561 }
     }
 }
 
 /// Top-level configuration.
 #[derive(Clone, Debug)]
 pub struct MemoryConfig {
-    /// Maximum synapses of one engram (at most 256).
+    /// Maximum synapses of one engram (at most 243 = 3^5).
     pub max_ensemble: usize,
     /// Candidates passed from the index to the spiking stage.
     pub max_candidates: usize,
@@ -120,17 +120,17 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            max_ensemble: 64,
-            max_candidates: 32,
-            recall_threshold: 0.3,
-            reject_threshold: 0.15,
+            max_ensemble: 81,
+            max_candidates: 27,
+            recall_threshold: 2.0 / 9.0,
+            reject_threshold: 1.0 / 9.0,
             prefilter: 0.5,
-            max_scan: 100_000,
+            max_scan: 59_049,
             homeostasis: true,
             dedupe_threshold: Some(0.9),
             default_ttl: None,
-            consolidate_after: Some(16),
-            auto_cleanup: 1024,
+            consolidate_after: Some(9),
+            auto_cleanup: 729,
             dynamics: DynamicsConfig::default(),
             plasticity: PlasticityConfig::default(),
             stp: StpConfig::default(),
@@ -142,7 +142,7 @@ impl MemoryConfig {
     pub fn validate(&self) -> Result<(), MemoryError> {
         let bad = |m: &str| Err(MemoryError::InvalidConfig(m.to_string()));
         if self.max_ensemble == 0 || self.max_ensemble > crate::index::MAX_WIDTH {
-            return bad("max_ensemble must be in 1..=256");
+            return bad("max_ensemble must be in 1..=243");
         }
         if self.max_candidates == 0 {
             return bad("max_candidates must be > 0");

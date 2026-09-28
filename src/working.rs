@@ -91,27 +91,27 @@ mod tests {
 
     #[test]
     fn facilitation_accumulates_and_decays() {
-        let cfg = StpConfig { utilization: 0.5, tau: 10.0, max_gain: 0.2, capacity: 4 };
+        let cfg = StpConfig { utilization: 0.5, tau: 9.0, max_gain: 0.2, capacity: 3 };
         let mut wm = WorkingMemory::new(cfg);
         assert_eq!(wm.gain(1, 0.0), 1.0);
         wm.facilitate(1, 0.0);
         wm.facilitate(1, 0.0);
         assert!((wm.utilization(1, 0.0) - 0.75).abs() < 1e-6);
         assert!((wm.gain(1, 0.0) - 1.15).abs() < 1e-6);
-        assert!(wm.utilization(1, 50.0) < 0.01);
+        assert!(wm.utilization(1, 54.0) < 0.01);
         wm.forget(1);
         assert_eq!(wm.utilization(1, 0.0), 0.0);
     }
 
     #[test]
     fn prune_keeps_strongest() {
-        let cfg = StpConfig { utilization: 0.5, tau: 1.0, max_gain: 0.2, capacity: 2 };
+        let cfg = StpConfig { utilization: 0.5, tau: 1.0, max_gain: 0.2, capacity: 3 };
         let mut wm = WorkingMemory::new(cfg);
-        for id in 1..=5u64 {
+        for id in 1..=9u64 {
             wm.facilitate(id, id as f64);
         }
-        assert!(wm.len() <= 4);
-        assert!(wm.utilization(5, 5.0) > 0.0);
-        assert_eq!(wm.recent().next(), Some(5));
+        assert!(wm.len() <= 6);
+        assert!(wm.utilization(9, 9.0) > 0.0);
+        assert_eq!(wm.recent().next(), Some(9));
     }
 }

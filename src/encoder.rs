@@ -379,40 +379,40 @@ mod tests {
 
     #[test]
     fn flyhash_is_sparse_sorted_and_similarity_preserving() {
-        let d = 256;
-        let enc = FlyHashEncoder::new(d, 8192, 32, 16, 42).unwrap();
+        let d = 243;
+        let enc = FlyHashEncoder::new(d, 6561, 27, 9, 42).unwrap();
         let mut rng = SplitMix64::new(3);
         let x: Vec<f32> = (0..d).map(|_| rng.normal() as f32).collect();
         let near: Vec<f32> = x.iter().map(|v| v + 0.3 * rng.normal() as f32).collect();
         let far: Vec<f32> = (0..d).map(|_| rng.normal() as f32).collect();
 
         let cx = encode(&enc, Input::Dense(&x));
-        assert_eq!(cx.len(), 32);
+        assert_eq!(cx.len(), 27);
         assert!(cx.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(cx, encode(&enc, Input::Dense(&x)), "encoding must be deterministic");
         let o_near = overlap(&cx, &encode(&enc, Input::Dense(&near)));
         let o_far = overlap(&cx, &encode(&enc, Input::Dense(&far)));
-        assert!(o_near > 12, "near overlap too small: {o_near}");
-        assert!(o_far < 4, "far overlap too large: {o_far}");
+        assert!(o_near > 9, "near overlap too small: {o_near}");
+        assert!(o_far < 3, "far overlap too large: {o_far}");
     }
 
     #[test]
     fn flyhash_rejects_wrong_dimension() {
-        let enc = FlyHashEncoder::new(16, 128, 8, 4, 1).unwrap();
+        let enc = FlyHashEncoder::new(9, 81, 9, 3, 1).unwrap();
         let err = enc.encode(Input::Dense(&[0.0; 3]), &mut Vec::new()).unwrap_err();
-        assert_eq!(err, MemoryError::DimensionMismatch { expected: 16, got: 3 });
+        assert_eq!(err, MemoryError::DimensionMismatch { expected: 9, got: 3 });
     }
 
     #[test]
     fn ngram_fragment_code_is_subset_of_sequence_code() {
-        let enc = NGramEncoder::new(1 << 18, &[1, 2, 3], 1, 9).unwrap();
-        let seq: Vec<u32> = (100..132).collect();
+        let enc = NGramEncoder::new(177_147, &[1, 2, 3], 1, 9).unwrap();
+        let seq: Vec<u32> = (100..127).collect();
         let full = encode(&enc, Input::Tokens(&seq));
-        let part = encode(&enc, Input::Tokens(&seq[10..18]));
+        let part = encode(&enc, Input::Tokens(&seq[9..18]));
         assert!(full.len() <= enc.max_code_len(seq.len()));
         assert_eq!(overlap(&part, &full), part.len());
 
-        let mut reordered = seq[10..18].to_vec();
+        let mut reordered = seq[9..18].to_vec();
         reordered.reverse();
         let rev = encode(&enc, Input::Tokens(&reordered));
         // Unigrams still match, but bigrams/trigrams encode order.
