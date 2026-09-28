@@ -1,4 +1,5 @@
 pub mod data;
+pub mod infer;
 pub mod layers;
 pub mod model;
 pub mod ngram;
