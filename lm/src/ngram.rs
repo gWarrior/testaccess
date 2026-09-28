@@ -91,6 +91,25 @@ impl NGram {
         (b / n as f64, t / n as f64)
     }
 
+    /// Same as [`evaluate`](Self::evaluate) on the positions a model sees
+    /// with `batch` streams of `windows × window` tokens (targets only).
+    pub fn evaluate_streams(&self, tokens: &[u16], batch: usize, windows: usize, window: usize) -> (f64, f64) {
+        let region = tokens.len() / batch;
+        let (mut b, mut t, mut n) = (0f64, 0f64, 0usize);
+        for s in 0..batch {
+            let start = s * region;
+            let end = (start + windows * window + 1).min(start + region);
+            for p in start + 1..end {
+                let w = tokens[p];
+                let v = tokens[p - 1];
+                b -= self.p_bigram(v, w).ln();
+                t -= if p >= start + 2 { self.p_trigram(tokens[p - 2], v, w) } else { self.p_bigram(v, w) }.ln();
+                n += 1;
+            }
+        }
+        (b / n as f64, t / n as f64)
+    }
+
     pub fn vocab(&self) -> usize {
         self.vocab
     }

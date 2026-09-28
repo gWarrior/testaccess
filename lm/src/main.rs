@@ -123,7 +123,13 @@ fn ngram(args: &[String]) -> std::io::Result<()> {
         sample.extend_from_slice(&train.tokens[b * region..b * region + per]);
     }
     let m = snn_lm::ngram::NGram::train(&sample, 6561);
-    let (bi, tri) = m.evaluate(&val.tokens[..nv.min(val.len())]);
+    let windows: usize = arg(args, "--windows", "0").parse().expect("--windows");
+    let (bi, tri) = if windows > 0 {
+        // Exactly the positions `eval --windows N` scores.
+        m.evaluate_streams(&val.tokens, 27, windows, 243)
+    } else {
+        m.evaluate(&val.tokens[..nv.min(val.len())])
+    };
     println!(
         "n-gram on {} tokens ({:.1}s): bigram {:.4} nats (ppl {:.1}), trigram {:.4} nats (ppl {:.1})",
         sample.len(),
