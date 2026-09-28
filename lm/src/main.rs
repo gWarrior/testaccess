@@ -382,6 +382,66 @@ fn reread(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Memory alone, without the model: load `--context` into the SNN memory,
+/// then answer every `prefix|answer` line of `--probes` with the memory's
+/// own continuation. An answer of `-` expects "точно нет" (Absent).
+fn probe(args: &[String]) -> std::io::Result<()> {
+    use snn_memory::{ContextConfig, ContextMemory, Verdict};
+    let dir = PathBuf::from(arg(args, "--model", "lm/model"));
+    let tok = load_tokenizer(&dir);
+    let text = std::fs::read_to_string(arg(args, "--context", ""))?;
+    let probes = std::fs::read_to_string(arg(args, "--probes", ""))?;
+    let ids = tok.encode(&text);
+    let mut memory = ContextMemory::new(ContextConfig { max_tokens: 300_000, ..Default::default() })
+        .map_err(std::io::Error::other)?;
+    let t = Instant::now();
+    memory.append(&ids).map_err(std::io::Error::other)?;
+    memory.flush().map_err(std::io::Error::other)?;
+    println!("(в память загружено {} токенов за {:.2}s)", ids.len(), t.elapsed().as_secs_f64());
+    let (mut right, mut total) = (0, 0);
+    for line in probes.lines().filter(|l| !l.trim().is_empty()) {
+        let (prefix, answer) = line.rsplit_once('|').unwrap_or((line, ""));
+        // Mid-paragraph, BPE glues the leading space to the first word: try
+        // the prefix both as a line start and as a continuation.
+        let t = Instant::now();
+        let mut prefix_ids = tok.encode(prefix);
+        let mut located = memory.locate(&prefix_ids).map_err(std::io::Error::other)?;
+        if located.positions.is_empty() {
+            let spaced = tok.encode(&format!(" {prefix}"));
+            let again = memory.locate(&spaced).map_err(std::io::Error::other)?;
+            if !again.positions.is_empty() || again.verdict != Verdict::Absent {
+                (prefix_ids, located) = (spaced, again);
+            }
+        }
+        let cont = memory.continuation(&prefix_ids, 9).map_err(std::io::Error::other)?;
+        let us = t.elapsed().as_micros();
+        let (said, ok) = match (&cont, answer.trim()) {
+            (_, "-") => (String::new(), located.verdict == Verdict::Absent),
+            (Some((_, c)), a) => {
+                let s = tok.decode(c);
+                let ok = s.trim_start().starts_with(a);
+                (s, ok)
+            }
+            (None, _) => (String::new(), false),
+        };
+        total += 1;
+        right += usize::from(ok);
+        let verdict = match located.verdict {
+            Verdict::Known => "уверен",
+            Verdict::Unknown => "не знаю",
+            Verdict::Absent => "точно нет",
+        };
+        let said = said.replace('\n', "⏎");
+        println!(
+            "{} {prefix} → «{said}» [{verdict}, {} вхожд., {us} мкс]",
+            if ok { "✓" } else { "✗" },
+            located.positions.len()
+        );
+    }
+    println!("верно {right}/{total}");
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
@@ -394,6 +454,7 @@ fn main() {
         Some("chat") => chat(&args),
         Some("ablate") => ablate(&args),
         Some("reread") => reread(&args),
+        Some("probe") => probe(&args),
         _ => {
             eprintln!("usage: snn-lm prepare [--src DIR] [--out DIR] [--vocab N] [--sample-mb N]");
             eprintln!("       snn-lm train [--steps N] [--hours H] [--memory on|off] [--out DIR] [--lr X] [--batch N]");
@@ -403,6 +464,7 @@ fn main() {
             eprintln!(
                 "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16]"
             );
+            eprintln!("       snn-lm probe --context FILE --probes FILE [--model lm/model]  (memory alone, lines prefix|answer)");
             std::process::exit(2);
         }
     };
