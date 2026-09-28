@@ -6,55 +6,25 @@
 //! No synapse is shared between memories, so forgetting one memory removes
 //! exactly its own contribution and cannot damage any other memory.
 //!
-//! Synapses are ternary: `+1` excitatory, `0` silent, `-1` inhibitory.
-//! Each synapse has a slow and a fast ternary component (concept §7) packed
-//! into one byte, `effective = clamp(slow + fast, -1, 1)`. Fast-tier engrams
-//! live in the fast component; consolidated engrams keep their knowledge in
-//! the slow one, while later plasticity lands in the fast component and is
-//! wiped by a fast reset. Plasticity is a discrete state machine (in the
-//! spirit of Amit–Fusi bounded synapses) rather than a real-valued update.
+//! Storage is ternary. A synapse is addressed by its presynaptic neuron, one
+//! [`Tryte`](crate::trit::Tryte) (9 trits), and holds two trits of state, a
+//! slow and a fast component (concept §7), densely packed in a
+//! [`TritVec`] (40 trits per 64-bit word):
+//! `effective = clamp(slow + fast, -1, 1)` ∈ {`-1` inhibitory, `0` silent,
+//! `+1` excitatory}. Fast-tier engrams live in the fast component;
+//! consolidated engrams keep their knowledge in the slow one, while later
+//! plasticity lands in the fast component and is wiped by a fast reset.
+//! Plasticity is a discrete state machine (in the spirit of Amit–Fusi
+//! bounded synapses) rather than a real-valued update.
 
 use crate::config::PlasticityConfig;
 use crate::index::{entry, entry_pos, entry_slot, PostingIndex, MAX_SLOTS};
 use crate::rng::SplitMix64;
+use crate::trit::TritVec;
 use crate::types::{ContextId, MemoryId, Tier};
 
 pub(crate) const NO_ID: MemoryId = 0;
-const NO_NEURON: u32 = u32::MAX;
-
-#[inline]
-fn enc(t: i8) -> u8 {
-    match t {
-        1 => 1,
-        -1 => 2,
-        _ => 0,
-    }
-}
-
-#[inline]
-fn dec(b: u8) -> i8 {
-    match b & 3 {
-        1 => 1,
-        2 => -1,
-        _ => 0,
-    }
-}
-
-#[inline]
-fn pack(slow: i8, fast: i8) -> u8 {
-    enc(slow) | enc(fast) << 2
-}
-
-#[inline]
-fn unpack(b: u8) -> (i8, i8) {
-    (dec(b), dec(b >> 2))
-}
-
-#[inline]
-fn effective(b: u8) -> i8 {
-    let (s, f) = unpack(b);
-    (s + f).clamp(-1, 1)
-}
+const NO_NEURON: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlotStatus {
@@ -122,8 +92,10 @@ pub(crate) struct Gathered {
 pub(crate) struct EngramBank<P> {
     tier: Tier,
     width: usize,
-    ens: Vec<u32>,
-    syn: Vec<u8>,
+    /// Presynaptic neuron of every synapse position, one tryte each.
+    ens: Vec<u16>,
+    /// Two trits per synapse position: `[slow, fast]`.
+    syn: TritVec,
     pub meta: Vec<SlotMeta>,
     payload: Vec<Option<P>>,
     free: Vec<u32>,
@@ -144,7 +116,7 @@ impl<P> EngramBank<P> {
             tier,
             width,
             ens: Vec::new(),
-            syn: Vec::new(),
+            syn: TritVec::new(),
             meta: Vec::new(),
             payload: Vec::new(),
             free: Vec::new(),
@@ -191,7 +163,7 @@ impl<P> EngramBank<P> {
                 self.meta.push(SlotMeta::new(NO_ID));
                 self.payload.push(None);
                 self.ens.extend(std::iter::repeat(NO_NEURON).take(self.width));
-                self.syn.extend(std::iter::repeat(0).take(self.width));
+                self.syn.extend_zeros(2 * self.width);
                 self.score.push(0.0);
                 self.exc.push(0.0);
                 self.stamp.push(0);
@@ -199,12 +171,14 @@ impl<P> EngramBank<P> {
             }
         };
         let (s, base, len) = (slot as usize, slot as usize * self.width, e.code.len());
-        self.ens[base..base + len].copy_from_slice(&e.code);
-        for (b, &t) in self.syn[base..base + len].iter_mut().zip(&e.states) {
-            *b = match self.tier {
-                Tier::Fast => pack(0, t),
-                Tier::LongTerm => pack(t, 0),
+        for (i, (&n, &t)) in e.code.iter().zip(&e.states).enumerate() {
+            self.ens[base + i] = n as u16;
+            let (slow, fast) = match self.tier {
+                Tier::Fast => (0, t),
+                Tier::LongTerm => (t, 0),
             };
+            self.syn.set(2 * (base + i), slow);
+            self.syn.set(2 * (base + i) + 1, fast);
         }
         self.meta[s] = SlotMeta { status: SlotStatus::Active, len: len as u32, ..e.meta };
         self.payload[s] = e.payload;
@@ -214,16 +188,27 @@ impl<P> EngramBank<P> {
     }
 
     #[inline]
-    pub fn code(&self, slot: u32) -> &[u32] {
+    fn raw_code(&self, slot: u32) -> &[u16] {
         let base = slot as usize * self.width;
         &self.ens[base..base + self.meta[slot as usize].len as usize]
+    }
+
+    /// Presynaptic neurons of `slot`, in synapse-position order.
+    pub fn code(&self, slot: u32) -> Vec<u32> {
+        self.raw_code(slot).iter().map(|&n| n as u32).collect()
+    }
+
+    /// Effective state of synapse position `idx` (`slot * width + pos`).
+    #[inline]
+    fn eff(syn: &TritVec, idx: usize) -> i8 {
+        (syn.get(2 * idx) + syn.get(2 * idx + 1)).clamp(-1, 1)
     }
 
     /// Effective ternary states of `slot`'s synapses.
     pub fn states(&self, slot: u32) -> Vec<i8> {
         let base = slot as usize * self.width;
         let len = self.meta[slot as usize].len as usize;
-        self.syn[base..base + len].iter().map(|&b| effective(b)).collect()
+        (base..base + len).map(|i| Self::eff(&self.syn, i)).collect()
     }
 
     /// Effective states as `f32` weights for the dynamics.
@@ -275,7 +260,7 @@ impl<P> EngramBank<P> {
     /// Detach a memory from this bank (it is logically deleted here).
     pub fn take(&mut self, slot: u32) -> Engram<P> {
         let e = Engram {
-            code: self.code(slot).to_vec(),
+            code: self.code(slot),
             states: self.states(slot),
             meta: self.meta[slot as usize].clone(),
             payload: self.payload[slot as usize].take(),
@@ -291,7 +276,7 @@ impl<P> EngramBank<P> {
         }
         let mut neurons: Vec<u32> = Vec::new();
         for &slot in &self.pending {
-            neurons.extend_from_slice(self.code(slot));
+            neurons.extend(self.raw_code(slot).iter().map(|&n| n as u32));
         }
         neurons.sort_unstable();
         neurons.dedup();
@@ -302,7 +287,7 @@ impl<P> EngramBank<P> {
         for slot in std::mem::take(&mut self.pending) {
             let (s, base) = (slot as usize, slot as usize * self.width);
             self.ens[base..base + self.width].fill(NO_NEURON);
-            self.syn[base..base + self.width].fill(0);
+            self.syn.clear_range(2 * base, 2 * (base + self.width));
             self.meta[s] = SlotMeta::new(NO_ID);
             self.free.push(slot);
         }
@@ -316,7 +301,9 @@ impl<P> EngramBank<P> {
 
     /// Clear the fast component of every synapse.
     pub fn reset_fast_weights(&mut self) {
-        self.syn.iter_mut().for_each(|b| *b &= 3);
+        for i in 0..self.syn.len() / 2 {
+            self.syn.set(2 * i + 1, 0);
+        }
     }
 
     /// Index stage: accumulate the signed, gain-weighted input every live
@@ -344,7 +331,7 @@ impl<P> EngramBank<P> {
             }
             for &e in list {
                 let s = entry_slot(e) as usize;
-                let w = effective(syn[s * *width + entry_pos(e)]);
+                let w = Self::eff(syn, s * *width + entry_pos(e));
                 if w == 0 {
                     continue;
                 }
@@ -369,9 +356,11 @@ impl<P> EngramBank<P> {
         touched.clear();
     }
 
+    /// Move the effective state of position `idx` to `target` by changing
+    /// the fast component only.
     fn set_effective(&mut self, idx: usize, target: i8) {
-        let (slow, _) = unpack(self.syn[idx]);
-        self.syn[idx] = pack(slow, (target - slow).clamp(-1, 1));
+        let slow = self.syn.get(2 * idx);
+        self.syn.set(2 * idx + 1, (target - slow).clamp(-1, 1));
     }
 
     /// A free position, or else the first silent synapse, if any. Silent
@@ -379,7 +368,7 @@ impl<P> EngramBank<P> {
     /// revive.
     fn vacant_position(&self, slot: u32) -> Option<usize> {
         let (base, len) = (slot as usize * self.width, self.meta[slot as usize].len as usize);
-        (len < self.width).then_some(len).or_else(|| (0..len).find(|&i| effective(self.syn[base + i]) == 0))
+        (len < self.width).then_some(len).or_else(|| (0..len).find(|&i| Self::eff(&self.syn, base + i) == 0))
     }
 
     /// Wire neuron `n` into position `pos` of `slot` with state `target`.
@@ -387,12 +376,12 @@ impl<P> EngramBank<P> {
         let base = slot as usize * self.width;
         let len = self.meta[slot as usize].len as usize;
         if pos < len {
-            self.postings.remove(self.ens[base + pos], entry(slot, pos));
+            self.postings.remove(self.ens[base + pos] as u32, entry(slot, pos));
         } else {
             self.meta[slot as usize].len += 1;
         }
-        self.ens[base + pos] = n;
-        self.syn[base + pos] = pack(0, 0);
+        self.ens[base + pos] = n as u16;
+        self.syn.set(2 * (base + pos), 0);
         self.set_effective(base + pos, target);
         self.postings.add(n, entry(slot, pos));
     }
@@ -412,15 +401,15 @@ impl<P> EngramBank<P> {
         let len = self.meta[slot as usize].len as usize;
         for i in 0..len {
             let idx = base + i;
-            let w = effective(self.syn[idx]);
-            let active = cue.binary_search(&self.ens[idx]).is_ok();
+            let w = Self::eff(&self.syn, idx);
+            let active = cue.binary_search(&(self.ens[idx] as u32)).is_ok();
             if active && w < 1 && self.chance(cfg.p_potentiate) {
                 self.set_effective(idx, w + 1);
             } else if !active && w == 1 && self.chance(cfg.p_depress) {
                 self.set_effective(idx, 0);
             }
         }
-        let mut present = self.code(slot).to_vec();
+        let mut present = self.code(slot);
         present.sort_unstable();
         let novel: Vec<u32> = cue.iter().copied().filter(|n| present.binary_search(n).is_err()).collect();
         let mut added = 0;
@@ -445,9 +434,9 @@ impl<P> EngramBank<P> {
                 break;
             }
             let len = self.meta[slot as usize].len as usize;
-            match (0..len).find(|&i| self.ens[base + i] == n) {
-                Some(i) if effective(self.syn[base + i]) == 1 => {}
-                Some(i) if effective(self.syn[base + i]) == 0 => {
+            match (0..len).find(|&i| self.ens[base + i] as u32 == n) {
+                Some(i) if Self::eff(&self.syn, base + i) == 1 => {}
+                Some(i) if Self::eff(&self.syn, base + i) == 0 => {
                     self.set_effective(base + i, -1);
                     changed += 1;
                 }
@@ -468,8 +457,8 @@ impl<P> EngramBank<P> {
 
     /// Approximate heap usage in bytes.
     pub fn bytes(&self) -> usize {
-        self.ens.capacity() * 4
-            + self.syn.capacity()
+        self.ens.capacity() * 2
+            + self.syn.bytes()
             + (self.score.capacity() + self.exc.capacity() + self.stamp.capacity()) * 4
             + self.meta.capacity() * std::mem::size_of::<SlotMeta>()
             + self.payload.capacity() * std::mem::size_of::<Option<P>>()
@@ -494,22 +483,12 @@ mod tests {
     }
 
     fn certain() -> PlasticityConfig {
-        PlasticityConfig { p_potentiate: 1.0, p_depress: 1.0, max_new_synapses: 8 }
-    }
-
-    #[test]
-    fn packing_roundtrip() {
-        for s in -1..=1 {
-            for f in -1..=1 {
-                assert_eq!(unpack(pack(s, f)), (s, f));
-                assert_eq!(effective(pack(s, f)), (s + f).clamp(-1, 1));
-            }
-        }
+        PlasticityConfig { p_potentiate: 1.0, p_depress: 1.0, max_new_synapses: 9 }
     }
 
     #[test]
     fn insert_gather_delete_cleanup_reuse() {
-        let mut b = EngramBank::new(Tier::Fast, 64, 8);
+        let mut b = EngramBank::new(Tier::Fast, 81, 9);
         let a = b.insert(engram(1, &[1, 2, 3, 4]));
         let c = b.insert(engram(2, &[3, 4, 5, 6]));
         assert_eq!(gather(&mut b, &[3, 4, 5]), vec![(2.0, a), (3.0, c)]);
@@ -528,7 +507,7 @@ mod tests {
 
     #[test]
     fn reinforce_depresses_silent_inputs_and_recruits_new_ones() {
-        let mut b = EngramBank::new(Tier::Fast, 64, 6);
+        let mut b = EngramBank::new(Tier::Fast, 81, 6);
         let s = b.insert(engram(1, &[1, 2, 3, 4]));
         b.reinforce(s, &[1, 2, 9], &certain());
         assert_eq!(b.code(s), &[1, 2, 3, 4, 9]);
@@ -545,16 +524,16 @@ mod tests {
 
     #[test]
     fn inhibitory_synapses_subtract() {
-        let mut b = EngramBank::new(Tier::Fast, 64, 8);
+        let mut b = EngramBank::new(Tier::Fast, 81, 9);
         let s = b.insert(engram(1, &[1, 2, 3, 4]));
-        assert_eq!(b.inhibit(s, &[1, 5, 6], 8), 2);
+        assert_eq!(b.inhibit(s, &[1, 5, 6], 9), 2);
         assert_eq!(b.states(s), vec![1, 1, 1, 1, -1, -1]);
         assert_eq!(gather(&mut b, &[1, 2, 5, 6]), vec![(0.0, s)]);
     }
 
     #[test]
     fn long_term_reset_restores_slow_states() {
-        let mut b = EngramBank::new(Tier::LongTerm, 64, 4);
+        let mut b = EngramBank::new(Tier::LongTerm, 81, 4);
         let s = b.insert(engram(1, &[1, 2, 3, 4]));
         b.reinforce(s, &[1, 2], &certain());
         assert_eq!(b.states(s), vec![1, 1, 0, 0]);

@@ -12,6 +12,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::dynamics::{self, Cand};
 use crate::encoder::{check_code, Encoder};
+use crate::trit::TRYTE_STATES;
 use crate::types::{ContextId, Input, MemoryError, MemoryId, Tier};
 use crate::working::WorkingMemory;
 
@@ -255,7 +256,8 @@ pub struct MemoryRecord<'a, P> {
     pub polarity: i8,
     pub prev: Option<MemoryId>,
     pub next: Option<MemoryId>,
-    pub pattern: &'a [u32],
+    /// Presynaptic neurons (each id is one tryte).
+    pub pattern: Vec<u32>,
     /// Ternary synapse states (`+1` excitatory, `0` silent, `-1` inhibitory),
     /// aligned with `pattern`.
     pub states: Vec<i8>,
@@ -337,8 +339,10 @@ impl<P: Clone> SnnMemory<P> {
     pub fn new<E: Encoder + 'static>(encoder: E, cfg: MemoryConfig) -> Result<Self, MemoryError> {
         cfg.validate()?;
         let n = encoder.n_neurons();
-        if n == 0 {
-            return Err(MemoryError::InvalidConfig("encoder has no neurons".into()));
+        if n == 0 || n > TRYTE_STATES {
+            return Err(MemoryError::InvalidConfig(format!(
+                "neuron ids are one tryte: n_neurons must be in 1..={TRYTE_STATES}"
+            )));
         }
         Ok(Self {
             fast: EngramBank::new(Tier::Fast, n, cfg.max_ensemble),
@@ -606,7 +610,7 @@ impl<P: Clone> SnnMemory<P> {
                 if score < 0.5 * thr * gsum {
                     continue;
                 }
-                let m = dynamics::similarity(code, &gains, bank.code(slot), &bank.weights(slot));
+                let m = dynamics::similarity(code, &gains, &bank.code(slot), &bank.weights(slot));
                 let sym = m.coverage.min(m.completeness);
                 if sym >= thr && best.map_or(true, |(s, _)| sym > s) {
                     best = Some((sym, Loc { tier, slot }));
@@ -728,7 +732,7 @@ impl<P: Clone> SnnMemory<P> {
             .map(|&(_, l)| {
                 let bank = self.bank(l.tier);
                 Cand {
-                    code: bank.code(l.slot).to_vec(),
+                    code: bank.code(l.slot),
                     w: bank.weights(l.slot),
                     gain: self.working.gain(self.meta(l).id, now),
                 }
