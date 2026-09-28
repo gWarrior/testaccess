@@ -372,7 +372,93 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.w2.forward(&(self.w1.forward(x)?.silu()? * self.w3.forward(x)?)?)
+        let (a, b) = (self.w1.forward(x)?.contiguous()?, self.w3.forward(x)?.contiguous()?);
+        self.w2.forward(&a.apply_op2_no_bwd(&b, &SwiGlu)?.detach().apply_op3(&a, &b, SwiGluGrad)?)
+    }
+}
+
+/// `silu(a) ⊙ b` in one parallel pass (candle's CPU element-wise ops are
+/// single-threaded, and silu's backward alone takes four passes).
+struct SwiGlu;
+
+fn silu_parts(a: f32) -> (f32, f32) {
+    let s = 1.0 / (1.0 + (-a).exp());
+    (a * s, s * (1.0 + a * (1.0 - s)))
+}
+
+impl candle_core::CustomOp2 for SwiGlu {
+    fn name(&self) -> &'static str {
+        "swiglu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &candle_core::CpuStorage,
+        l1: &candle_core::Layout,
+        s2: &candle_core::CpuStorage,
+        l2: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        use rayon::prelude::*;
+        let a = cpu_tensor(s1, l1)?.flatten_all()?.to_vec1::<f32>()?;
+        let b = cpu_tensor(s2, l2)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut out = vec![0f32; a.len()];
+        out.par_chunks_mut(1 << 14).zip(a.par_chunks(1 << 14).zip(b.par_chunks(1 << 14))).for_each(|(o, (a, b))| {
+            for ((o, &a), &b) in o.iter_mut().zip(a).zip(b) {
+                *o = silu_parts(a).0 * b;
+            }
+        });
+        Ok((candle_core::CpuStorage::F32(out), l1.shape().clone()))
+    }
+}
+
+/// Carries the gradient of [`SwiGlu`]: the forward returns its first
+/// argument (the detached product), the backward differentiates `a`, `b`.
+struct SwiGluGrad;
+
+impl candle_core::CustomOp3 for SwiGluGrad {
+    fn name(&self) -> &'static str {
+        "swiglu-grad"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &candle_core::CpuStorage,
+        l1: &candle_core::Layout,
+        _s2: &candle_core::CpuStorage,
+        _l2: &candle_core::Layout,
+        _s3: &candle_core::CpuStorage,
+        _l3: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let y = cpu_tensor(s1, l1)?.flatten_all()?.to_vec1::<f32>()?;
+        Ok((candle_core::CpuStorage::F32(y), l1.shape().clone()))
+    }
+
+    fn bwd(
+        &self,
+        _y: &Tensor,
+        a: &Tensor,
+        b: &Tensor,
+        _res: &Tensor,
+        g: &Tensor,
+    ) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        use rayon::prelude::*;
+        let shape = a.shape().clone();
+        let av = a.detach().flatten_all()?.to_vec1::<f32>()?;
+        let bv = b.detach().flatten_all()?.to_vec1::<f32>()?;
+        let gv = g.detach().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        let n = av.len();
+        let (mut da, mut db) = (vec![0f32; n], vec![0f32; n]);
+        const C: usize = 1 << 14;
+        da.par_chunks_mut(C).zip(db.par_chunks_mut(C)).enumerate().for_each(|(ci, (da, db))| {
+            let o = ci * C;
+            for i in 0..da.len() {
+                let (silu, dsilu) = silu_parts(av[o + i]);
+                da[i] = gv[o + i] * bv[o + i] * dsilu;
+                db[i] = gv[o + i] * silu;
+            }
+        });
+        let dev = a.device();
+        Ok((None, Some(Tensor::from_vec(da, shape.clone(), dev)?), Some(Tensor::from_vec(db, shape, dev)?)))
     }
 }
 
@@ -551,6 +637,39 @@ impl candle_core::CustomOp1 for CrossEntropy {
             o[self.targets[i] as usize] -= g[i];
         });
         Ok(Some(Tensor::from_vec(out, (n, v), arg.device())?))
+    }
+}
+
+#[cfg(test)]
+mod swiglu_tests {
+    use super::*;
+    use candle_nn::VarMap;
+
+    #[test]
+    fn fused_swiglu_matches_autograd() {
+        let dev = Device::Cpu;
+        let a = candle_core::Var::from_tensor(&Tensor::randn(0f32, 2.0, (3, 5, 7), &dev).unwrap()).unwrap();
+        let b = candle_core::Var::from_tensor(&Tensor::randn(0f32, 1.0, (3, 5, 7), &dev).unwrap()).unwrap();
+        let w = Tensor::randn(0f32, 1.0, (3, 5, 7), &dev).unwrap();
+        let fused = a.as_tensor().apply_op2_no_bwd(b.as_tensor(), &SwiGlu).unwrap().detach();
+        let fused = fused.apply_op3(a.as_tensor(), b.as_tensor(), SwiGluGrad).unwrap();
+        let plain = (a.as_tensor().silu().unwrap() * b.as_tensor()).unwrap();
+        let diff = (&fused - &plain).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff < 1e-5, "forward differs by {diff}");
+        let gf = (fused * &w).unwrap().sum_all().unwrap().backward().unwrap();
+        let gp = (plain * &w).unwrap().sum_all().unwrap().backward().unwrap();
+        for v in [&a, &b] {
+            let d = (gf.get(v.as_tensor()).unwrap() - gp.get(v.as_tensor()).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(d < 1e-4, "gradient differs by {d}");
+        }
+        let _ = VarMap::new();
     }
 }
 
