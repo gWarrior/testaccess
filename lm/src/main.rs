@@ -240,7 +240,13 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
     let precision = kv_precision(args);
     let mut session = engine.session_with(memory_tokens, precision);
-    let mut rng = snn_memory::rng::SplitMix64::new(Instant::now().elapsed().as_nanos() as u64 ^ 0x5EED);
+    let seed: u64 = arg(args, "--seed", "0").parse().expect("--seed");
+    let seed = if seed == 0 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)
+    } else {
+        seed
+    };
+    let mut rng = snn_memory::rng::SplitMix64::new(seed);
     let mut logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
     let context = arg(args, "--context", "");
     if !context.is_empty() {
