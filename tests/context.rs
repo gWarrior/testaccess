@@ -176,3 +176,30 @@ fn read_head_attends_over_retrieved_tokens() {
     assert_eq!(r.verdict, Verdict::Known);
     assert!(r.spans.iter().any(|s| s.start <= chunk_start as u64 && s.end() >= (chunk_start + 27) as u64));
 }
+
+#[test]
+fn pinned_context_is_carried_into_the_next_session() {
+    let mut rng = SplitMix64::new(6);
+    let cfg = ContextConfig { max_tokens: 6_561, ..Default::default() };
+    let mut ctx = ContextMemory::new(cfg.clone()).unwrap();
+    ctx.append(&text(&mut rng, 729)).unwrap();
+    let fact: Vec<u32> = (80_000..80_027).collect();
+    let at = ctx.position();
+    ctx.append(&fact).unwrap();
+    ctx.append(&text(&mut rng, 729)).unwrap();
+    ctx.pin(at, at + 27).unwrap();
+    let end = ctx.position();
+    let snapshot = ctx.save_pinned();
+    drop(ctx);
+
+    let mut next = ContextMemory::restore(cfg, &snapshot).unwrap();
+    assert_eq!(next.position(), end, "positions continue");
+    let (pos, tail) = next.continuation(&fact[..9], 9).unwrap().expect("fact survives the session");
+    assert_eq!((pos, tail), (at + 9, fact[9..18].to_vec()));
+    // The unpinned filler did not come along.
+    assert_eq!(next.stats().lexical.fast_memories, 0);
+
+    next.append(&text(&mut rng, 81)).unwrap();
+    assert_eq!(next.position(), end + 81);
+}
+

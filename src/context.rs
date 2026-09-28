@@ -26,6 +26,7 @@ use crate::config::MemoryConfig;
 use crate::encoder::{FlyHashEncoder, NGramEncoder};
 use crate::kv::{KvPrecision, KvStore};
 use crate::memory::{BatchOptions, RecallOptions, SnnMemory, Stats, Verdict};
+use crate::persist::{self, Persist, SnapshotScope};
 use crate::rng::mix64;
 use crate::types::{Input, MemoryError, MemoryId, Tier};
 
@@ -103,6 +104,18 @@ pub struct Chunk {
     pub start: u64,
     pub tokens: Vec<u32>,
 }
+
+impl Persist for Chunk {
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.start.to_le_bytes());
+        self.tokens.write(out);
+    }
+    fn read(input: &mut &[u8]) -> Result<Self, MemoryError> {
+        Ok(Chunk { start: persist::read_u64(input)?, tokens: Vec::<u32>::read(input)? })
+    }
+}
+
+const CONTEXT_MAGIC: &[u8; 4] = b"SNNC";
 
 /// What to look up.
 #[derive(Clone, Copy, Debug)]
@@ -642,6 +655,63 @@ impl ContextMemory {
         self.last = None;
         self.census.clear();
         self.census_from = end;
+    }
+
+    /// Snapshot of the pinned (and consolidated) chunks: what should be
+    /// carried into the next session. The window itself is not saved.
+    pub fn save_pinned(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTEXT_MAGIC);
+        out.extend_from_slice(&persist::VERSION.to_le_bytes());
+        out.extend_from_slice(&self.position().to_le_bytes());
+        let lexical = self.lexical.save(SnapshotScope::LongTerm);
+        out.extend_from_slice(&(lexical.len() as u64).to_le_bytes());
+        out.extend_from_slice(&lexical);
+        match &self.semantic {
+            Some(sem) => {
+                let semantic = sem.save(SnapshotScope::LongTerm);
+                out.extend_from_slice(&(semantic.len() as u64).to_le_bytes());
+                out.extend_from_slice(&semantic);
+            }
+            None => out.extend_from_slice(&0u64.to_le_bytes()),
+        }
+        out
+    }
+
+    /// Start a new session from [`save_pinned`](Self::save_pinned) output.
+    /// Positions continue after the saved session's last position.
+    pub fn restore(cfg: ContextConfig, bytes: &[u8]) -> Result<Self, MemoryError> {
+        let mut input = bytes;
+        if persist::take(&mut input, 4)? != CONTEXT_MAGIC {
+            return Err(persist::corrupt("not a context snapshot"));
+        }
+        if persist::read_u32(&mut input)? != persist::VERSION {
+            return Err(persist::corrupt("unsupported context snapshot version"));
+        }
+        let position = persist::read_u64(&mut input)?;
+        let mut ctx = Self::new(cfg)?;
+        let n = persist::read_u64(&mut input)? as usize;
+        ctx.lexical.restore(persist::take(&mut input, n)?)?;
+        let n = persist::read_u64(&mut input)? as usize;
+        if n > 0 {
+            let part = persist::take(&mut input, n)?;
+            match &mut ctx.semantic {
+                Some(sem) => {
+                    sem.restore(part)?;
+                }
+                None => return Err(MemoryError::InvalidConfig("snapshot has a semantic index".into())),
+            }
+        }
+        if !input.is_empty() {
+            return Err(persist::corrupt("trailing bytes"));
+        }
+        ctx.base = position;
+        ctx.next_chunk = position;
+        ctx.census_from = position;
+        if let Some(kv) = &mut ctx.kv {
+            kv.reset(position);
+        }
+        Ok(ctx)
     }
 
     pub fn stats(&self) -> ContextStats {
