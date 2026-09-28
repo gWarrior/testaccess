@@ -1,8 +1,8 @@
 //! Spike encoders: turn inputs into sparse sets of active neurons.
 //!
 //! * [`FlyHashEncoder`] — dense/sparse vectors (e.g. LLM hidden states) are
-//!   expanded through fixed sparse random connectivity into a large neuron
-//!   layer, and a k-winners-take-all (lateral inhibition) step keeps only the
+//!   expanded through fixed sparse ternary (`+1/0/-1`) random connectivity
+//!   into a large neuron layer, and a k-winners-take-all (lateral inhibition) step keeps only the
 //!   `k` most driven neurons. This is the fruit-fly olfactory circuit
 //!   (Dasgupta et al., 2017): similar inputs produce overlapping codes.
 //! * [`NGramEncoder`] — token sequences drive a bank of temporal
@@ -71,13 +71,14 @@ pub struct FlyHashEncoder {
     n_neurons: u32,
     k: usize,
     fan_in: usize,
-    /// Forward connectivity, `n_neurons * fan_in` input indices and signs.
+    /// Forward connectivity, `n_neurons * fan_in` input indices and ternary
+    /// weights (`+1` / `-1`; unconnected inputs are the implicit `0`).
     fwd_idx: Vec<u32>,
-    fwd_sign: Vec<f32>,
+    fwd_sign: Vec<i8>,
     /// Inverse connectivity (CSR by input dimension) for sparse inputs.
     inv_start: Vec<u32>,
     inv_neuron: Vec<u32>,
-    inv_sign: Vec<f32>,
+    inv_sign: Vec<i8>,
     /// Fixed per-neuron priority used to break activation ties.
     priority: Vec<u32>,
     center: Option<Vec<f32>>,
@@ -106,7 +107,7 @@ impl FlyHashEncoder {
         for _ in 0..n {
             for d in rng.sample_distinct(input_dim as u32, fan_in) {
                 fwd_idx.push(d);
-                fwd_sign.push(if rng.next_u64() & 1 == 0 { 1.0 } else { -1.0 });
+                fwd_sign.push(if rng.next_u64() & 1 == 0 { 1 } else { -1 });
             }
         }
         let priority = (0..n).map(|_| rng.next_u64() as u32).collect();
@@ -121,7 +122,7 @@ impl FlyHashEncoder {
         let inv_start = counts.clone();
         let mut fill = counts;
         let mut inv_neuron = vec![0u32; fwd_idx.len()];
-        let mut inv_sign = vec![0f32; fwd_idx.len()];
+        let mut inv_sign = vec![0i8; fwd_idx.len()];
         for (e, (&d, &s)) in fwd_idx.iter().zip(&fwd_sign).enumerate() {
             let p = fill[d as usize] as usize;
             inv_neuron[p] = (e / fan_in) as u32;
@@ -198,7 +199,7 @@ impl FlyHashEncoder {
             let base = i * self.fan_in;
             let idx = &self.fwd_idx[base..base + self.fan_in];
             let sign = &self.fwd_sign[base..base + self.fan_in];
-            *a = idx.iter().zip(sign).map(|(&d, &s)| s * x[d as usize]).sum();
+            *a = idx.iter().zip(sign).map(|(&d, &s)| if s > 0 { x[d as usize] } else { -x[d as usize] }).sum();
         }
         let mut pool: Vec<u32> = (0..self.n_neurons).collect();
         k_winners(&act, &self.priority, &mut pool, self.k, out);
@@ -218,7 +219,7 @@ impl FlyHashEncoder {
                 if act[nrn as usize] == 0.0 {
                     touched.push(nrn);
                 }
-                act[nrn as usize] += self.inv_sign[p] * v;
+                act[nrn as usize] += self.inv_sign[p] as f32 * v;
             }
         }
         touched.sort_unstable();
