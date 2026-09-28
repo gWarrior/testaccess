@@ -13,6 +13,7 @@ pub mod encoder;
 pub mod memory;
 pub mod rng;
 pub mod shared;
+pub mod trit;
 pub mod types;
 
 mod bank;
@@ -28,4 +29,5 @@ pub use memory::{
     SnnMemory, Stats, Verdict,
 };
 pub use shared::{MaintenanceHandle, SharedMemory};
+pub use trit::{TritVec, Tryte};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
