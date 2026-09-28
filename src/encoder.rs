@@ -12,6 +12,9 @@
 //!   sequence's detectors, which is what makes partial recall exact.
 //! * [`CodeEncoder`] — accepts only pre-computed spike codes.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use crate::rng::{mix64, SplitMix64};
 use crate::types::{Input, MemoryError};
 
@@ -23,6 +26,9 @@ pub trait Encoder: Send + Sync {
     /// Appends the active neurons for `input` to `out` (sorted, unique).
     fn encode(&self, input: Input<'_>, out: &mut Vec<u32>) -> Result<(), MemoryError>;
 }
+
+/// Bit 31 of a FlyHash connectivity word: the weight is `-1`.
+const SIGN_BIT: u32 = 1 << 31;
 
 /// Encoder for pre-computed spike codes only.
 #[derive(Clone, Debug)]
@@ -71,10 +77,12 @@ pub struct FlyHashEncoder {
     n_neurons: u32,
     k: usize,
     fan_in: usize,
-    /// Forward connectivity, `n_neurons * fan_in` input indices and ternary
-    /// weights (`+1` / `-1`; unconnected inputs are the implicit `0`).
-    fwd_idx: Vec<u32>,
-    fwd_sign: Vec<i8>,
+    /// Forward connectivity: `n_neurons * fan_in` words, each an input
+    /// index with the ternary weight folded into bit 31 (`0` = `+1`,
+    /// `1` = `-1`; unconnected inputs are the implicit `0`). The weight is
+    /// applied by flipping the sign bit of the input, so activation needs
+    /// neither multiplies nor data-dependent branches.
+    fwd: Vec<u32>,
     /// Inverse connectivity (CSR by input dimension) for sparse inputs.
     inv_start: Vec<u32>,
     inv_neuron: Vec<u32>,
@@ -102,14 +110,21 @@ impl FlyHashEncoder {
         let fan_in = fan_in.clamp(1, input_dim);
         let n = n_neurons as usize;
         let mut rng = SplitMix64::new(seed ^ 0xF1A5_4A54);
+        if fan_in > u8::MAX as usize {
+            return Err(MemoryError::InvalidConfig("fan_in must be at most 255".into()));
+        }
+        if input_dim >= SIGN_BIT as usize {
+            return Err(MemoryError::InvalidConfig("input_dim must be below 2^31".into()));
+        }
         let mut fwd_idx = Vec::with_capacity(n * fan_in);
         let mut fwd_sign = Vec::with_capacity(n * fan_in);
         for _ in 0..n {
             for d in rng.sample_distinct(input_dim as u32, fan_in) {
                 fwd_idx.push(d);
-                fwd_sign.push(if rng.next_u64() & 1 == 0 { 1 } else { -1 });
+                fwd_sign.push(if rng.next_u64() & 1 == 0 { 1i8 } else { -1i8 });
             }
         }
+        let fwd = fwd_idx.iter().zip(&fwd_sign).map(|(&d, &s)| if s < 0 { d | SIGN_BIT } else { d }).collect();
         let priority = (0..n).map(|_| rng.next_u64() as u32).collect();
 
         let mut counts = vec![0u32; input_dim + 1];
@@ -135,8 +150,7 @@ impl FlyHashEncoder {
             n_neurons,
             k,
             fan_in,
-            fwd_idx,
-            fwd_sign,
+            fwd,
             inv_start,
             inv_neuron,
             inv_sign,
@@ -193,16 +207,20 @@ impl FlyHashEncoder {
             }
             None => x,
         };
-        let n = self.n_neurons as usize;
-        let mut act = vec![0f32; n];
-        for (i, a) in act.iter_mut().enumerate() {
-            let base = i * self.fan_in;
-            let idx = &self.fwd_idx[base..base + self.fan_in];
-            let sign = &self.fwd_sign[base..base + self.fan_in];
-            *a = idx.iter().zip(sign).map(|(&d, &s)| if s > 0 { x[d as usize] } else { -x[d as usize] }).sum();
+        let mut top = TopK::new(self.k);
+        for (i, (words, &pri)) in self.fwd.chunks_exact(self.fan_in).zip(&self.priority).enumerate() {
+            let mut a = 0f32;
+            for &w in words {
+                let d = (w & !SIGN_BIT) as usize;
+                debug_assert!(d < x.len());
+                // SAFETY: every index was sampled from `0..input_dim` in
+                // `new`, and `x.len() == input_dim` was checked above.
+                let xi = unsafe { *x.get_unchecked(d) };
+                a += f32::from_bits(xi.to_bits() ^ (w & SIGN_BIT));
+            }
+            top.offer(a, pri, i as u32);
         }
-        let mut pool: Vec<u32> = (0..self.n_neurons).collect();
-        k_winners(&act, &self.priority, &mut pool, self.k, out);
+        top.finish(out);
         Ok(())
     }
 
@@ -222,10 +240,14 @@ impl FlyHashEncoder {
                 act[nrn as usize] += self.inv_sign[p] as f32 * v;
             }
         }
-        touched.sort_unstable();
-        touched.dedup();
-        touched.retain(|&nrn| act[nrn as usize] > 0.0);
-        k_winners(&act, &self.priority, &mut touched, self.k, out);
+        let mut top = TopK::new(self.k);
+        for &nrn in &touched {
+            let a = act[nrn as usize];
+            if a > 0.0 {
+                top.offer(a, self.priority[nrn as usize], nrn);
+            }
+        }
+        top.finish(out);
         Ok(())
     }
 }
@@ -249,25 +271,67 @@ impl Encoder for FlyHashEncoder {
             Input::Tokens(_) => Err(MemoryError::UnsupportedInput("token")),
         }
     }
+
 }
 
-/// k-winners-take-all over `pool`; appends winners to `out` sorted by id.
-fn k_winners(act: &[f32], priority: &[u32], pool: &mut [u32], k: usize, out: &mut Vec<u32>) {
-    let k = k.min(pool.len());
-    if k == 0 {
-        return;
+/// Streaming k-winners-take-all: keeps the `k` most active neurons seen so
+/// far in a min-heap, so the full activation vector is never stored or
+/// sorted. Ties are broken by the fixed neuron priority.
+struct TopK {
+    k: usize,
+    heap: BinaryHeap<Reverse<(Act, u32, u32)>>,
+    /// Smallest activation in a full heap: anything below loses at once.
+    floor: f32,
+}
+
+/// Activation with a total order.
+#[derive(Clone, Copy, PartialEq)]
+struct Act(f32);
+
+impl Eq for Act {}
+
+impl PartialOrd for Act {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
-    let cmp = |a: &u32, b: &u32| {
-        act[*b as usize]
-            .total_cmp(&act[*a as usize])
-            .then(priority[*a as usize].cmp(&priority[*b as usize]))
-    };
-    if k < pool.len() {
-        pool.select_nth_unstable_by(k - 1, cmp);
+}
+
+impl Ord for Act {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
     }
-    let start = out.len();
-    out.extend_from_slice(&pool[..k]);
-    out[start..].sort_unstable();
+}
+
+impl TopK {
+    fn new(k: usize) -> Self {
+        Self { k, heap: BinaryHeap::with_capacity(k + 1), floor: f32::NEG_INFINITY }
+    }
+
+    #[inline]
+    fn offer(&mut self, act: f32, priority: u32, neuron: u32) {
+        if act < self.floor {
+            return;
+        }
+        // Lower priority value wins ties: store its complement.
+        let key = (Act(act), u32::MAX - priority, neuron);
+        if self.heap.len() < self.k {
+            self.heap.push(Reverse(key));
+        } else if let Some(mut min) = self.heap.peek_mut() {
+            if key > min.0 {
+                *min = Reverse(key);
+            }
+        }
+        if self.heap.len() == self.k {
+            self.floor = self.heap.peek().map_or(f32::NEG_INFINITY, |m| m.0 .0 .0);
+        }
+    }
+
+    /// Append the winners to `out`, sorted by neuron id.
+    fn finish(self, out: &mut Vec<u32>) {
+        let start = out.len();
+        out.extend(self.heap.into_iter().map(|Reverse((_, _, n))| n));
+        out[start..].sort_unstable();
+    }
 }
 
 /// Temporal coincidence detectors over token n-grams.
@@ -361,6 +425,7 @@ impl Encoder for NGramEncoder {
         out.truncate(w);
         Ok(())
     }
+
 }
 
 #[cfg(test)]
