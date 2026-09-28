@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use snn_memory::{ContextConfig, ContextMemory, KvConfig, KvPrecision, Probe, Verdict};
 
 use crate::data::{Episodes, TaskStream};
-use crate::model::{Config, MemBatch, Model, State, Trunk};
+use crate::model::{BlockRows, Config, MemBatch, Model, State, Trunk};
 
 #[derive(Clone, Debug)]
 pub struct TrainConfig {
@@ -41,6 +41,10 @@ pub struct TrainConfig {
     pub seed: u64,
     /// Stop after this many seconds (0 = no limit).
     pub time_limit: u64,
+    /// Warm start from this checkpoint (tensors absent there keep their init).
+    pub init: Option<PathBuf>,
+    /// Streams jump to a random document of the whole corpus after each one.
+    pub jump: bool,
 }
 
 impl Default for TrainConfig {
@@ -61,6 +65,8 @@ impl Default for TrainConfig {
             out: PathBuf::from("/home/user/data/run"),
             seed: 1,
             time_limit: 0,
+            init: None,
+            jump: true,
         }
     }
 }
@@ -98,7 +104,7 @@ impl StreamMemory {
         dim: usize,
         top_k: usize,
         rows: usize,
-    ) -> Vec<(Vec<f32>, Vec<f32>, u32)> {
+    ) -> Vec<BlockRows> {
         let ctx: Vec<u32> = self.history.iter().chain(x).copied().collect();
         let off = self.history.len();
         (0..x.len() / block)
@@ -108,12 +114,25 @@ impl StreamMemory {
                 let tokens = &ctx[probe_end.saturating_sub(block)..probe_end];
                 let key = &q[s * dim..(s + 1) * dim];
                 match self.mem.retrieve_rows(Probe::Both(tokens, key), top_k, rows) {
-                    Ok(r) if !r.positions.is_empty() => (r.keys, r.values, verdict_index(r.verdict)),
-                    Ok(r) => (Vec::new(), Vec::new(), verdict_index(r.verdict)),
-                    Err(_) => (Vec::new(), Vec::new(), 1),
+                    Ok(r) if !r.positions.is_empty() => {
+                        let next = r.positions.iter().map(|&p| self.next_token(p, x[0])).collect();
+                        (r.keys, r.values, verdict_index(r.verdict), next)
+                    }
+                    Ok(r) => (Vec::new(), Vec::new(), verdict_index(r.verdict), Vec::new()),
+                    Err(_) => (Vec::new(), Vec::new(), 1, Vec::new()),
                 }
             })
             .collect()
+    }
+
+    /// The token that followed memory position `p`; the memory's last
+    /// position is followed by the current window's first token.
+    fn next_token(&self, p: u64, first: u32) -> u32 {
+        if p + 1 == self.mem.position() {
+            first
+        } else {
+            self.mem.tokens(p + 1, p + 2).map_or(u32::MAX, |t| t[0])
+        }
     }
 
     fn write(&mut self, x: &[u32], k: &[f32], v: &[f32], block: usize) {
@@ -138,6 +157,12 @@ pub struct Runner {
 /// Result of one window.
 pub struct WindowOut {
     pub logits: Tensor,
+    /// Pointer attention `(B, T, T + M + 1)` and copy gate `(B, T)`.
+    pub point: Tensor,
+    pub gate: Tensor,
+    /// Token after each memory row `(B, nb, M)` and `M`.
+    pub far_next: Vec<u32>,
+    pub m: usize,
     pub trunk: Trunk,
     pub known: usize,
     pub blocks: usize,
@@ -169,7 +194,7 @@ impl Runner {
         let (mem, known, mem_rows) = if self.use_memory {
             let q = trunk.q.flatten_all()?.to_vec1::<f32>()?;
             let (top_k, rows) = (self.top_k, self.rows);
-            let per: Vec<Vec<(Vec<f32>, Vec<f32>, u32)>> = self
+            let per: Vec<Vec<BlockRows>> = self
                 .memories
                 .par_iter_mut()
                 .enumerate()
@@ -183,8 +208,104 @@ impl Runner {
         } else {
             (MemBatch::empty(b, nb, dim, device)?, 0, 0)
         };
-        let logits = self.model.head(&trunk, &mem)?;
-        Ok((WindowOut { logits, trunk, known, blocks: b * nb, mem_rows }, next))
+        let h = self.model.head(&trunk, &mem)?;
+        let out = WindowOut {
+            logits: h.logits,
+            point: h.point,
+            gate: h.gate,
+            far_next: mem.next,
+            m: mem.m,
+            trunk,
+            known,
+            blocks: b * nb,
+            mem_rows,
+        };
+        Ok((out, next))
+    }
+
+    /// Token each pointer column would copy: `(B, L)` for the window part
+    /// (`x[j + 1]`) and `(B, T, M)` for the memory rows via their block.
+    fn column_token(&self, out: &WindowOut, x: &[u32], t: usize, bi: usize, ti: usize, col: usize) -> u32 {
+        let block = self.model.cfg.block;
+        let nb = t / block;
+        if col < t {
+            if col + 1 < t {
+                x[bi * t + col + 1]
+            } else {
+                u32::MAX
+            }
+        } else if col < t + out.m {
+            out.far_next[(bi * nb + ti / block) * out.m + (col - t)]
+        } else {
+            u32::MAX
+        }
+    }
+
+    /// Per-token loss of the mixture `(1 − g)·p_vocab + g·p_copy`, `(B·T,)`.
+    pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
+        let (b, t, l) = out.point.dims3()?;
+        let mut hit = vec![0f32; b * t * l];
+        for bi in 0..b {
+            for ti in 0..t {
+                let target = y[bi * t + ti];
+                for col in 0..l {
+                    if self.column_token(out, x, t, bi, ti, col) == target {
+                        hit[(bi * t + ti) * l + col] = 1.0;
+                    }
+                }
+            }
+        }
+        let hit = Tensor::from_vec(hit, (b, t, l), out.point.device())?;
+        let copy = (&out.point * hit)?.sum(2)?.flatten_all()?;
+        let ce = token_losses(&out.logits, y)?;
+        let g = out.gate.flatten_all()?;
+        // −ln((1 − g)·e^−ce + g·c), as a log-sum-exp of the two branches.
+        let a = ((1.0 - &g)?.log()? - ce)?;
+        let c = (g.log()? + (copy + 1e-9)?.log()?)?;
+        let both = Tensor::stack(&[&a, &c], 1)?;
+        let mx = both.max_keepdim(1)?.detach();
+        let lse = (both.broadcast_sub(&mx)?.exp()?.sum_keepdim(1)?.log()? + mx)?;
+        lse.flatten_all()?.neg()
+    }
+
+    /// Top-1 token of the mixture for every position, `(B·T)`.
+    pub fn predict(&self, out: &WindowOut, x: &[u32]) -> Result<Vec<u32>> {
+        let (b, t, l) = out.point.dims3()?;
+        let v = out.logits.dim(2)?;
+        let logits = out.logits.flatten_all()?.to_vec1::<f32>()?;
+        let point = out.point.flatten_all()?.to_vec1::<f32>()?;
+        let gate = out.gate.flatten_all()?.to_vec1::<f32>()?;
+        let mut pred = Vec::with_capacity(b * t);
+        for bi in 0..b {
+            for ti in 0..t {
+                let r = bi * t + ti;
+                let row = &logits[r * v..(r + 1) * v];
+                let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let z: f32 = row.iter().map(|&x| (x - mx).exp()).sum();
+                let g = gate[r];
+                let mut copy: std::collections::HashMap<u32, f32> = Default::default();
+                for col in 0..l {
+                    let a = point[r * l + col];
+                    let tok = self.column_token(out, x, t, bi, ti, col);
+                    if a > 0.0 && (tok as usize) < v {
+                        *copy.entry(tok).or_default() += a;
+                    }
+                }
+                let best_vocab = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+                let score = |tok: usize| {
+                    (1.0 - g) * (row[tok] - mx).exp() / z + g * copy.get(&(tok as u32)).copied().unwrap_or(0.0)
+                };
+                let mut best = (best_vocab, score(best_vocab));
+                for &tok in copy.keys() {
+                    let sc = score(tok as usize);
+                    if sc > best.1 {
+                        best = (tok as usize, sc);
+                    }
+                }
+                pred.push(best.0 as u32);
+            }
+        }
+        Ok(pred)
     }
 
     /// Commit a window: carry the state and write it to the memories.
@@ -262,6 +383,18 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         start_step =
             std::fs::read_to_string(cfg.out.join("step")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
         println!("resumed from step {start_step}");
+    } else if let Some(init) = &cfg.init {
+        // Warm start: every tensor the old checkpoint has; new ones keep their init.
+        let old = candle_core::safetensors::load(init, &device)?;
+        let data = varmap.data().lock().expect("varmap lock");
+        let mut n = 0;
+        for (name, var) in data.iter() {
+            if let Some(t) = old.get(name) {
+                var.set(t)?;
+                n += 1;
+            }
+        }
+        println!("warm start from {}: {n}/{} tensors", init.display(), data.len());
     }
     let vars = varmap.all_vars();
     println!("parameters: {}", Model::n_params(&vars));
@@ -276,6 +409,9 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     let region = tokens.len() / b;
     let mut streams: Vec<TaskStream> =
         (0..b).map(|i| TaskStream::new(i * region, region, cfg.seed * 1000 + i as u64)).collect();
+    for s in &mut streams {
+        s.jump = cfg.jump;
+    }
     // Resuming fast-forwards the streams, so data is not repeated.
     for s in &mut streams {
         for _ in 0..start_step {
@@ -301,7 +437,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         }
         let t0 = Instant::now();
         let (out, next) = runner.forward(&x, t, &device)?;
-        let losses = token_losses(&out.logits, &y)?;
+        let losses = runner.losses(&out, &x, &y)?;
         let loss = losses.mean_all()?;
         let t1 = Instant::now();
         let loss_value = loss.to_scalar::<f32>()?;

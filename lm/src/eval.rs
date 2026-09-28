@@ -6,7 +6,7 @@ use snn_memory::KvPrecision;
 
 use crate::data::Episodes;
 use crate::model::Model;
-use crate::train::{token_losses, Runner};
+use crate::train::Runner;
 
 /// Mean loss (nats/token) over `windows` windows of `batch` val streams.
 pub fn val_loss(
@@ -49,7 +49,7 @@ pub fn val_loss_detail(
             y.extend(tokens[a + 1..a + t + 1].iter().map(|&v| v as u32));
         }
         let (out, next) = runner.forward(&x, t, &device)?;
-        let l = token_losses(&out.logits, &y)?.to_vec1::<f32>()?;
+        let l = runner.losses(&out, &x, &y)?.to_vec1::<f32>()?;
         sum += l.iter().map(|&v| v as f64).sum::<f64>();
         n += l.len();
         for (i, &v) in l.iter().enumerate() {
@@ -82,8 +82,8 @@ pub fn reread(model: Model, passages: &[Vec<u32>], memory: bool, precision: KvPr
             y.extend_from_slice(&s[pos + 1..pos + t + 1]);
         }
         let (out, next) = runner.forward(&x, t, &device)?;
-        let losses = token_losses(&out.logits, &y)?.to_vec1::<f32>()?;
-        let argmax = out.logits.argmax(2)?.flatten_all()?.to_vec1::<u32>()?;
+        let losses = runner.losses(&out, &x, &y)?.to_vec1::<f32>()?;
+        let argmax = runner.predict(&out, &x)?;
         let phase = usize::from(pos >= len);
         for i in 0..b * t {
             acc[phase].0 += (argmax[i] == y[i]) as u8 as f64;
@@ -166,8 +166,8 @@ pub fn recall(
         let (out, next) = runner.forward(&x, t, &device)?;
         let needs = streams.iter().any(|(_, marks)| marks.iter().any(|&(_, s, n)| s < pos + t + 1 && s + n > pos + 1));
         if needs {
-            let losses = token_losses(&out.logits, &y)?.to_vec1::<f32>()?;
-            let argmax = out.logits.argmax(2)?.flatten_all()?.to_vec1::<u32>()?;
+            let losses = runner.losses(&out, &x, &y)?.to_vec1::<f32>()?;
+            let argmax = runner.predict(&out, &x)?;
             for (b, (seq, marks)) in streams.iter().enumerate() {
                 for &(di, s, n) in marks {
                     for p in s..s + n {
