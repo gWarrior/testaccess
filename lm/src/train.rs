@@ -56,9 +56,10 @@ impl Default for TrainConfig {
             batch: 27,
             window: 243,
             memory: true,
-            top_k: 9,
-            rows: 243,
-            max_tokens: 300_000,
+            top_k: 3,
+            rows: 81,
+            // Short in training so stored keys stay close to current weights.
+            max_tokens: 59_049,
             clip: 1.0,
             log_every: 9,
             ckpt_every: 81,
@@ -111,7 +112,7 @@ impl StreamMemory {
             .map(|j| {
                 let s = j * block;
                 let probe_end = off + s + 1;
-                let tokens = &ctx[probe_end.saturating_sub(block)..probe_end];
+                let tokens = &ctx[probe_end.saturating_sub(crate::model::PROBE)..probe_end];
                 let key = &q[s * dim..(s + 1) * dim];
                 match self.mem.retrieve_rows(Probe::Both(tokens, key), top_k, rows) {
                     Ok(r) if !r.positions.is_empty() => {
@@ -135,9 +136,9 @@ impl StreamMemory {
         }
     }
 
-    fn write(&mut self, x: &[u32], k: &[f32], v: &[f32], block: usize) {
+    fn write(&mut self, x: &[u32], k: &[f32], v: &[f32]) {
         self.mem.append_kv(x, k, v).expect("append");
-        let keep = block - 1;
+        let keep = crate::model::PROBE - 1;
         self.history = x[x.len().saturating_sub(keep)..].to_vec();
     }
 }
@@ -181,7 +182,7 @@ impl Runner {
         let state = model.zero_state(batch, device)?;
         let dim = model.cfg.mem_dim;
         let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
-        Ok(Self { model, state, memories, use_memory, top_k: 9, rows: 243, reset_state: false })
+        Ok(Self { model, state, memories, use_memory, top_k: 3, rows: 81, reset_state: false })
     }
 
     /// Forward one window `x` (`B × T`, row-major) without committing it.
@@ -316,14 +317,8 @@ impl Runner {
             let dim = self.model.cfg.mem_dim;
             let k = out.trunk.k.flatten_all()?.to_vec1::<f32>()?;
             let v = out.trunk.v.flatten_all()?.to_vec1::<f32>()?;
-            let block = self.model.cfg.block;
             self.memories.par_iter_mut().enumerate().for_each(|(bi, m)| {
-                m.write(
-                    &x[bi * t..(bi + 1) * t],
-                    &k[bi * t * dim..(bi + 1) * t * dim],
-                    &v[bi * t * dim..(bi + 1) * t * dim],
-                    block,
-                )
+                m.write(&x[bi * t..(bi + 1) * t], &k[bi * t * dim..(bi + 1) * t * dim], &v[bi * t * dim..(bi + 1) * t * dim])
             });
         }
         Ok(())

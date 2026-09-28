@@ -37,13 +37,14 @@ pub struct Config {
     pub mlp: usize,
     /// Key/value width of the memory head.
     pub mem_dim: usize,
-    /// Tokens per memory read (one SNN retrieval per block).
+    /// Tokens per memory read (one SNN retrieval per block). The probe is
+    /// always the last [`PROBE`] tokens, whatever the block.
     pub block: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { vocab: 6561, d: 256, layers: 3, heads: 4, mlp: 2187, mem_dim: 81, block: 9 }
+        Self { vocab: 6561, d: 256, layers: 3, heads: 4, mlp: 2187, mem_dim: 81, block: 3 }
     }
 }
 
@@ -136,6 +137,9 @@ pub struct Ablation {
     pub no_hadam: bool,
     pub no_retention: bool,
 }
+
+/// Tokens in the lexical probe of a memory read.
+pub const PROBE: usize = 9;
 
 pub struct Model {
     pub cfg: Config,

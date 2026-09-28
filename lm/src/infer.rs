@@ -364,7 +364,7 @@ impl Engine {
         let xn = rms_gain(&x, &self.nm);
         let (q, k, v) = (self.mq.apply(&xn), self.mk.apply(&xn), self.mv.apply(&xn));
         s.recent.push_back(token);
-        if s.recent.len() > self.cfg.block {
+        if s.recent.len() > crate::model::PROBE {
             s.recent.pop_front();
         }
         if s.pos % self.cfg.block as u64 == 0 {
@@ -372,7 +372,7 @@ impl Engine {
             s.verdict = 1;
             if let Some(mem) = &mut s.memory {
                 let probe: Vec<u32> = s.recent.iter().copied().collect();
-                if let Ok(r) = mem.retrieve_rows(Probe::Both(&probe, &q), 9, 243) {
+                if let Ok(r) = mem.retrieve_rows(Probe::Both(&probe, &q), 3, 81) {
                     s.verdict = match r.verdict {
                         Verdict::Known => 0,
                         Verdict::Unknown => 1,
