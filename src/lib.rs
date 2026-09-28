@@ -20,5 +20,6 @@ pub mod encoder;
 mod bank;
 mod dynamics;
 mod index;
+mod working;
 
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
