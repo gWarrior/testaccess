@@ -13,3 +13,6 @@ pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
+pub mod encoder;
+
+pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
