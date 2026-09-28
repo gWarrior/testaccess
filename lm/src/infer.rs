@@ -238,6 +238,53 @@ impl Engine {
         self.advance(s, token, true).expect("logits requested")
     }
 
+    /// Tokens seen so far in this session.
+    pub fn position(&self, s: &Session) -> u64 {
+        s.pos
+    }
+
+    /// Copy head ("induction"): find the longest recent suffix (8 down to 3
+    /// tokens) seen before, in the ring or — only when the SNN memory is
+    /// sure (`Known`) — in the memory, and mix the token that followed it
+    /// into `logits` with weight `lambda`. Occurrences continuing at or
+    /// after `limit` are skipped, so a reply never copies itself. Returns
+    /// the copied token and the suffix length, or `None` ("не знаю").
+    pub fn copy(&self, s: &mut Session, logits: &mut [f32], lambda: f32, limit: u64) -> Option<(u32, usize)> {
+        let ring: Vec<u32> = s.ring.iter().map(|e| e.0).collect();
+        let ring_start = s.pos - ring.len() as u64;
+        let found = (3..=8usize).rev().filter(|&n| n < ring.len()).find_map(|n| {
+            let suffix = &ring[ring.len() - n..];
+            // The ring first: exact and cheap.
+            let local = (0..ring.len() - n)
+                .rev()
+                .find(|&i| &ring[i..i + n] == suffix && ring_start + ((i + n) as u64) < limit)
+                .map(|i| ring[i + n]);
+            local
+                .or_else(|| {
+                    let mem = s.memory.as_mut()?;
+                    let located = mem.locate(suffix).ok()?;
+                    if located.verdict != Verdict::Known {
+                        return None;
+                    }
+                    let end = mem.position();
+                    located.positions.iter().rev().find_map(|&p| {
+                        let from = p + n as u64;
+                        (from < limit && from < end).then(|| mem.tokens(from, from + 1)).flatten().map(|t| t[0])
+                    })
+                })
+                .map(|t| (t, n))
+        });
+        let (token, n) = found?;
+        // p' = (1 − λ)·p + λ·[token], written back as log-probabilities.
+        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
+        for (i, l) in logits.iter_mut().enumerate() {
+            let p = (1.0 - lambda) * (*l - mx).exp() / z + if i == token as usize { lambda } else { 0.0 };
+            *l = p.max(f32::MIN_POSITIVE).ln();
+        }
+        Some((token, n))
+    }
+
     /// Feed many tokens (e.g. a document into memory); returns the logits
     /// after the last one. Skips the output projection for the others.
     pub fn feed(&self, s: &mut Session, tokens: &[u32]) -> Option<Vec<f32>> {

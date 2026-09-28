@@ -234,6 +234,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let top_k: usize = arg(args, "--top-k", "27").parse().expect("--top-k");
     let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
     let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
+    let copy: f32 = arg(args, "--copy", "0.5").parse().expect("--copy");
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
@@ -296,7 +297,11 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         }
         print!("модель> ");
         let mut out = Vec::new();
+        let reply_start = engine.position(&session);
         for _ in 0..max_new {
+            if copy > 0.0 {
+                engine.copy(&mut session, &mut logits, copy, reply_start);
+            }
             let t = snn_lm::infer::sample(&logits, temperature, top_k, &mut rng);
             if t == snn_lm::tokenizer::DOC {
                 if out.is_empty() {
@@ -462,7 +467,7 @@ fn main() {
                 "       snn-lm ngram [--tokens N] | eval [--run DIR] | recall [--distances a,b,..] [--memory on|off]"
             );
             eprintln!(
-                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16]"
+                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16] [--copy λ]"
             );
             eprintln!("       snn-lm probe --context FILE --probes FILE [--model lm/model]  (memory alone, lines prefix|answer)");
             std::process::exit(2);
