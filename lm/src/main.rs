@@ -269,6 +269,10 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             break;
         }
         let line = line.trim_end();
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            // Scripted session: echo the input so the transcript is complete.
+            println!("{line}");
+        }
         match line.split_whitespace().next() {
             Some("/quit") => break,
             Some("/reset") => {
