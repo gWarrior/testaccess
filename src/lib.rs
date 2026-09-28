@@ -10,6 +10,7 @@
 pub mod attention;
 pub mod clock;
 pub mod config;
+pub mod context;
 pub mod encoder;
 pub mod kv;
 pub mod memory;
@@ -25,6 +26,9 @@ mod working;
 
 pub use attention::{attend, Attended};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use context::{
+    Chunk, ContextConfig, ContextMemory, ContextStats, KvConfig, Located, Probe, ReadOut, RetrievedSpan, Retrieval,
+};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
 pub use kv::{KvPrecision, KvStore};
