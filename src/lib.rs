@@ -7,6 +7,7 @@
 //! ensembles, recalled associatively from partial cues through LIF attractor
 //! dynamics, and forgotten selectively without disturbing other memories.
 
+pub mod attention;
 pub mod clock;
 pub mod config;
 pub mod encoder;
@@ -22,6 +23,7 @@ mod dynamics;
 mod index;
 mod working;
 
+pub use attention::{attend, Attended};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
