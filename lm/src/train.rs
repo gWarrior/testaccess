@@ -80,10 +80,10 @@ pub struct StreamMemory {
 }
 
 impl StreamMemory {
-    pub fn new(dim: usize, max_tokens: usize) -> Self {
+    pub fn new(dim: usize, max_tokens: usize, precision: KvPrecision) -> Self {
         let cfg = ContextConfig {
             max_tokens,
-            kv: Some(KvConfig { precision: KvPrecision::F16, ..KvConfig::new(dim, dim) }),
+            kv: Some(KvConfig { precision, ..KvConfig::new(dim, dim) }),
             ..Default::default()
         };
         Self { mem: ContextMemory::new(cfg).expect("valid memory config"), history: Vec::new() }
@@ -143,10 +143,17 @@ pub struct WindowOut {
 }
 
 impl Runner {
-    pub fn new(model: Model, batch: usize, use_memory: bool, max_tokens: usize, device: &Device) -> Result<Self> {
+    pub fn new(
+        model: Model,
+        batch: usize,
+        use_memory: bool,
+        max_tokens: usize,
+        precision: KvPrecision,
+        device: &Device,
+    ) -> Result<Self> {
         let state = model.zero_state(batch, device)?;
         let dim = model.cfg.mem_dim;
-        let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens)).collect();
+        let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
         Ok(Self { model, state, memories, use_memory, top_k: 9, rows: 243 })
     }
 
@@ -258,7 +265,8 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     let mut opt = AdamW::new(vars.clone(), ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
 
     let (b, t) = (cfg.batch, cfg.window);
-    let mut runner = Runner::new(model, b, cfg.memory, cfg.max_tokens, &device)?;
+    // Training keeps the memory's K/V in f16.
+    let mut runner = Runner::new(model, b, cfg.memory, cfg.max_tokens, KvPrecision::F16, &device)?;
     runner.top_k = cfg.top_k;
     runner.rows = cfg.rows;
     let ep = Episodes::new(tok);

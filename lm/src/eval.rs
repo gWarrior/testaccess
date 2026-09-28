@@ -2,16 +2,24 @@
 //! long-range recall ("secret word") accuracy at increasing distances.
 
 use candle_core::{Device, Result};
+use snn_memory::KvPrecision;
 
 use crate::data::Episodes;
 use crate::model::Model;
 use crate::train::{token_losses, Runner};
 
 /// Mean loss (nats/token) over `windows` windows of `batch` val streams.
-pub fn val_loss(model: Model, tokens: &[u16], batch: usize, windows: usize, memory: bool) -> Result<f64> {
+pub fn val_loss(
+    model: Model,
+    tokens: &[u16],
+    batch: usize,
+    windows: usize,
+    memory: bool,
+    precision: KvPrecision,
+) -> Result<f64> {
     let device = Device::Cpu;
     let t = 243;
-    let mut runner = Runner::new(model, batch, memory, 300_000, &device)?;
+    let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
     let region = tokens.len() / batch;
     let (mut sum, mut n) = (0f64, 0usize);
     for w in 0..windows {
@@ -53,6 +61,7 @@ pub fn recall(
     distances: &[usize],
     batch: usize,
     memory: bool,
+    precision: KvPrecision,
     seed: u64,
 ) -> Result<Vec<Recall>> {
     let device = Device::Cpu;
@@ -88,7 +97,7 @@ pub fn recall(
         streams.push((seq, marks));
     }
     let len = streams.iter().map(|s| s.0.len()).min().unwrap_or(0);
-    let mut runner = Runner::new(model, batch, memory, 300_000, &device)?;
+    let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
     let mut res: Vec<Recall> =
         distances.iter().map(|&d| Recall { distance: d, exact: 0, episodes: batch, loss: 0.0 }).collect();
     let mut hits: Vec<Vec<(usize, bool, f64)>> = vec![Vec::new(); batch];

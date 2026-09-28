@@ -142,6 +142,14 @@ fn ngram(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn kv_precision(args: &[String]) -> snn_memory::KvPrecision {
+    match arg(args, "--kv", "ternary").as_str() {
+        "f16" => snn_memory::KvPrecision::F16,
+        "f32" => snn_memory::KvPrecision::F32,
+        _ => snn_memory::KvPrecision::Ternary,
+    }
+}
+
 fn load_model(dir: &std::path::Path) -> snn_lm::model::Model {
     snn_lm::train::load_model(dir, snn_lm::model::Config::default(), &candle_core::Device::Cpu).expect("checkpoint")
 }
@@ -153,7 +161,7 @@ fn eval(args: &[String]) -> std::io::Result<()> {
     let val = load_tokens(&data, "val.bin");
     for memory in [true, false] {
         let t = Instant::now();
-        let loss = snn_lm::eval::val_loss(load_model(&run), &val.tokens, 27, windows, memory)
+        let loss = snn_lm::eval::val_loss(load_model(&run), &val.tokens, 27, windows, memory, kv_precision(args))
             .map_err(std::io::Error::other)?;
         println!(
             "val loss (memory {}): {:.4} nats, ppl {:.1} ({:.0}s)",
@@ -178,8 +186,9 @@ fn recall(args: &[String]) -> std::io::Result<()> {
     let val = load_tokens(&data, "val.bin");
     let ep = snn_lm::data::Episodes::new(&load_tokenizer(&data));
     let t = Instant::now();
-    let res = snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, &distances, batch, memory, 7)
-        .map_err(std::io::Error::other)?;
+    let res =
+        snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, &distances, batch, memory, kv_precision(args), 7)
+            .map_err(std::io::Error::other)?;
     for r in res {
         println!(
             "memory {} distance {:>7}: exact {}/{}  answer loss {:.3}",
@@ -229,7 +238,8 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
     let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
-    let mut session = engine.session(memory_tokens);
+    let precision = kv_precision(args);
+    let mut session = engine.session_with(memory_tokens, precision);
     let mut rng = snn_memory::rng::SplitMix64::new(Instant::now().elapsed().as_nanos() as u64 ^ 0x5EED);
     let mut logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
     println!("snn-lm: тернарная HadamRNN ~8M параметров + SNN-память на {memory_tokens} токенов.");
@@ -246,7 +256,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         match line.split_whitespace().next() {
             Some("/quit") => break,
             Some("/reset") => {
-                session = engine.session(memory_tokens);
+                session = engine.session_with(memory_tokens, precision);
                 logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
                 println!("(новый диалог)");
                 continue;
@@ -303,7 +313,7 @@ fn main() {
                 "       snn-lm ngram [--tokens N] | eval [--run DIR] | recall [--distances a,b,..] [--memory on|off]"
             );
             eprintln!(
-                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N]"
+                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16]"
             );
             std::process::exit(2);
         }

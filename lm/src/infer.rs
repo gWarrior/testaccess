@@ -203,14 +203,20 @@ impl Engine {
         })
     }
 
-    /// A fresh session; `memory_tokens = 0` disables the SNN memory.
+    /// A fresh session with ternary K/V memory (~115 MB at 300k tokens);
+    /// `memory_tokens = 0` disables the SNN memory.
     pub fn session(&self, memory_tokens: usize) -> Session {
+        self.session_with(memory_tokens, KvPrecision::Ternary)
+    }
+
+    /// A fresh session with the given K/V precision.
+    pub fn session_with(&self, memory_tokens: usize, precision: KvPrecision) -> Session {
         let (d, hd) = (self.cfg.d, self.cfg.d / self.cfg.heads);
         let memory = (memory_tokens > 0).then(|| {
             let m = self.cfg.mem_dim;
             ContextMemory::new(ContextConfig {
                 max_tokens: memory_tokens,
-                kv: Some(KvConfig { precision: KvPrecision::F16, ..KvConfig::new(m, m) }),
+                kv: Some(KvConfig { precision, ..KvConfig::new(m, m) }),
                 ..Default::default()
             })
             .expect("valid memory config")
