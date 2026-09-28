@@ -235,6 +235,20 @@ impl Engine {
 
     /// Feed one token; returns next-token logits.
     pub fn step(&self, s: &mut Session, token: u32) -> Vec<f32> {
+        self.advance(s, token, true).expect("logits requested")
+    }
+
+    /// Feed many tokens (e.g. a document into memory); returns the logits
+    /// after the last one. Skips the output projection for the others.
+    pub fn feed(&self, s: &mut Session, tokens: &[u32]) -> Option<Vec<f32>> {
+        let mut last = None;
+        for (i, &t) in tokens.iter().enumerate() {
+            last = self.advance(s, t, i + 1 == tokens.len());
+        }
+        last
+    }
+
+    fn advance(&self, s: &mut Session, token: u32, want_logits: bool) -> Option<Vec<f32>> {
         let (d, heads) = (self.cfg.d, self.cfg.heads);
         let hd = d / heads;
         let mut x = self.emb.dense_row(token as usize);
@@ -345,9 +359,12 @@ impl Engine {
             }
         }
         s.pos += 1;
+        if !want_logits {
+            return None;
+        }
         let mut xo = rms_gain(&x, &self.nout);
         rms(&mut xo);
-        self.emb.apply(&xo)
+        Some(self.emb.apply(&xo))
     }
 }
 

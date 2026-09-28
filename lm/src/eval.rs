@@ -17,17 +17,33 @@ pub fn val_loss(
     memory: bool,
     precision: KvPrecision,
 ) -> Result<f64> {
+    Ok(val_loss_detail(model, tokens, batch, windows, memory, precision, false)?.0)
+}
+
+/// Mean loss and mean loss by position inside the window (in 9 buckets of
+/// 27 positions), optionally dropping the recurrent state between windows.
+pub fn val_loss_detail(
+    model: Model,
+    tokens: &[u16],
+    batch: usize,
+    windows: usize,
+    memory: bool,
+    precision: KvPrecision,
+    reset_state: bool,
+) -> Result<(f64, Vec<f64>)> {
     let device = Device::Cpu;
     let t = 243;
     let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
+    runner.reset_state = reset_state;
     let region = tokens.len() / batch;
     let (mut sum, mut n) = (0f64, 0usize);
+    let mut by_pos = vec![(0f64, 0usize); 9];
     for w in 0..windows {
         let (mut x, mut y) = (Vec::new(), Vec::new());
         for b in 0..batch {
             let a = b * region + w * t;
             if a + t + 1 > (b + 1) * region {
-                return Ok(sum / n.max(1) as f64);
+                return Ok((sum / n.max(1) as f64, by_pos.iter().map(|(s, c)| s / (*c).max(1) as f64).collect()));
             }
             x.extend(tokens[a..a + t].iter().map(|&v| v as u32));
             y.extend(tokens[a + 1..a + t + 1].iter().map(|&v| v as u32));
@@ -36,9 +52,48 @@ pub fn val_loss(
         let l = token_losses(&out.logits, &y)?.to_vec1::<f32>()?;
         sum += l.iter().map(|&v| v as f64).sum::<f64>();
         n += l.len();
+        for (i, &v) in l.iter().enumerate() {
+            let bucket = &mut by_pos[(i % t) / 27];
+            bucket.0 += v as f64;
+            bucket.1 += 1;
+        }
         runner.commit(&x, t, &out, next)?;
     }
-    Ok(sum / n.max(1) as f64)
+    Ok((sum / n.max(1) as f64, by_pos.iter().map(|(s, c)| s / (*c).max(1) as f64).collect()))
+}
+
+/// Re-reading test: every stream reads a passage of `len` tokens, then the
+/// same passage again. Returns (top-1 accuracy, loss) on the first and the
+/// second reading. The second reading is far beyond the local window, so a
+/// gain there measures what the model recovers from its SNN memory.
+pub fn reread(model: Model, passages: &[Vec<u32>], memory: bool, precision: KvPrecision) -> Result<[(f64, f64); 2]> {
+    let device = Device::Cpu;
+    let t = 243;
+    let b = passages.len();
+    let len = passages.iter().map(Vec::len).min().unwrap_or(0) / t * t;
+    let seqs: Vec<Vec<u32>> = passages.iter().map(|p| [&p[..len], &p[..len], &p[..t + 1]].concat()).collect();
+    let mut runner = Runner::new(model, b, memory, 300_000, precision, &device)?;
+    let mut acc = [(0f64, 0f64, 0usize); 2];
+    let mut pos = 0;
+    while pos + t < 2 * len + 1 {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for s in &seqs {
+            x.extend_from_slice(&s[pos..pos + t]);
+            y.extend_from_slice(&s[pos + 1..pos + t + 1]);
+        }
+        let (out, next) = runner.forward(&x, t, &device)?;
+        let losses = token_losses(&out.logits, &y)?.to_vec1::<f32>()?;
+        let argmax = out.logits.argmax(2)?.flatten_all()?.to_vec1::<u32>()?;
+        let phase = usize::from(pos >= len);
+        for i in 0..b * t {
+            acc[phase].0 += (argmax[i] == y[i]) as u8 as f64;
+            acc[phase].1 += losses[i] as f64;
+            acc[phase].2 += 1;
+        }
+        runner.commit(&x, t, &out, next)?;
+        pos += t;
+    }
+    Ok(acc.map(|(a, l, n)| (a / n.max(1) as f64, l / n.max(1) as f64)))
 }
 
 /// Recall result at one distance.

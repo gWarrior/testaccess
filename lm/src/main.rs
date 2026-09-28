@@ -242,6 +242,16 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let mut session = engine.session_with(memory_tokens, precision);
     let mut rng = snn_memory::rng::SplitMix64::new(Instant::now().elapsed().as_nanos() as u64 ^ 0x5EED);
     let mut logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
+    let context = arg(args, "--context", "");
+    if !context.is_empty() {
+        let limit: usize = arg(args, "--context-tokens", "300000").parse().expect("--context-tokens");
+        let text = std::fs::read_to_string(&context)?;
+        let mut ids = tok.encode(&text);
+        ids.truncate(limit);
+        let t = Instant::now();
+        logits = engine.feed(&mut session, &ids).unwrap_or(logits);
+        println!("(в контекст загружено {} токенов из {context} за {:.0}s)", ids.len(), t.elapsed().as_secs_f64());
+    }
     println!("snn-lm: тернарная HadamRNN ~8M параметров + SNN-память на {memory_tokens} токенов.");
     println!("Команды: /reset — новый диалог, /temp X — температура, /quit — выход.\n");
     let stdin = std::io::stdin();
@@ -296,6 +306,64 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn ablate(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let run = PathBuf::from(arg(args, "--run", "/home/user/data/run"));
+    let windows: usize = arg(args, "--windows", "27").parse().expect("--windows");
+    let val = load_tokens(&data, "val.bin");
+    let kv = kv_precision(args);
+    let cases: [(&str, bool, bool, bool, bool); 5] = [
+        ("full model", true, false, false, false),
+        ("no SNN memory", false, false, false, false),
+        ("no state between windows", true, true, false, false),
+        ("no HadamRNN", true, false, true, false),
+        ("no retention", true, false, false, true),
+    ];
+    for (name, memory, reset, no_hadam, no_ret) in cases {
+        let mut model = load_model(&run);
+        model.ablation = snn_lm::model::Ablation { no_hadam, no_retention: no_ret };
+        let t = Instant::now();
+        let (loss, by_pos) = snn_lm::eval::val_loss_detail(model, &val.tokens, 27, windows, memory, kv, reset)
+            .map_err(std::io::Error::other)?;
+        let curve: Vec<String> = by_pos.iter().map(|l| format!("{l:.2}")).collect();
+        println!(
+            "{name:26} loss {loss:.4} ppl {:7.1} | by position (27-token buckets): {} ({:.0}s)",
+            loss.exp(),
+            curve.join(" "),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+fn reread(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let run = PathBuf::from(arg(args, "--run", "/home/user/data/run"));
+    let file = PathBuf::from(arg(args, "--file", "/home/user/data/taiga/extra/amber.txt"));
+    let len: usize = arg(args, "--len", "2187").parse().expect("--len");
+    let n: usize = arg(args, "--passages", "9").parse().expect("--passages");
+    let tok = load_tokenizer(&data);
+    let text = std::fs::read_to_string(&file)?;
+    let ids = tok.encode(&text);
+    let stride = ids.len() / n;
+    let passages: Vec<Vec<u32>> = (0..n).map(|i| ids[i * stride..i * stride + len].to_vec()).collect();
+    for memory in [true, false] {
+        let t = Instant::now();
+        let r = snn_lm::eval::reread(load_model(&run), &passages, memory, kv_precision(args))
+            .map_err(std::io::Error::other)?;
+        println!(
+            "memory {}: 1st reading acc {:.3} loss {:.3} | 2nd reading acc {:.3} loss {:.3} ({:.0}s)",
+            if memory { "on " } else { "off" },
+            r[0].0,
+            r[0].1,
+            r[1].0,
+            r[1].1,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
@@ -306,6 +374,8 @@ fn main() {
         Some("recall") => recall(&args),
         Some("export") => export(&args),
         Some("chat") => chat(&args),
+        Some("ablate") => ablate(&args),
+        Some("reread") => reread(&args),
         _ => {
             eprintln!("usage: snn-lm prepare [--src DIR] [--out DIR] [--vocab N] [--sample-mb N]");
             eprintln!("       snn-lm train [--steps N] [--hours H] [--memory on|off] [--out DIR] [--lr X] [--batch N]");

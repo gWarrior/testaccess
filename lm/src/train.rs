@@ -126,6 +126,8 @@ impl StreamMemory {
 /// Everything needed to run the model over parallel streams.
 pub struct Runner {
     pub model: Model,
+    /// Drop the recurrent state between windows (ablation).
+    pub reset_state: bool,
     pub state: State,
     pub memories: Vec<StreamMemory>,
     pub use_memory: bool,
@@ -154,7 +156,7 @@ impl Runner {
         let state = model.zero_state(batch, device)?;
         let dim = model.cfg.mem_dim;
         let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
-        Ok(Self { model, state, memories, use_memory, top_k: 9, rows: 243 })
+        Ok(Self { model, state, memories, use_memory, top_k: 9, rows: 243, reset_state: false })
     }
 
     /// Forward one window `x` (`B × T`, row-major) without committing it.
@@ -187,7 +189,8 @@ impl Runner {
 
     /// Commit a window: carry the state and write it to the memories.
     pub fn commit(&mut self, x: &[u32], t: usize, out: &WindowOut, next: State) -> Result<()> {
-        self.state = next;
+        self.state =
+            if self.reset_state { self.model.zero_state(self.memories.len(), out.logits.device())? } else { next };
         if self.use_memory {
             let dim = self.model.cfg.mem_dim;
             let k = out.trunk.k.flatten_all()?.to_vec1::<f32>()?;

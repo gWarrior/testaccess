@@ -109,8 +109,16 @@ impl MemBatch {
     }
 }
 
+/// Components switched off for ablation studies.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ablation {
+    pub no_hadam: bool,
+    pub no_retention: bool,
+}
+
 pub struct Model {
     pub cfg: Config,
+    pub ablation: Ablation,
     emb: Tensor,
     layers: Vec<Layer>,
     nm: RmsNorm,
@@ -151,6 +159,7 @@ impl Model {
             mo: TLinear::new(vb.clone(), "mo", m, d)?,
             verdict: vb.get_with_hints((3, d), "verdict", Init::Const(0.0))?,
             nout: RmsNorm::new(vb, "nout", d)?,
+            ablation: Ablation::default(),
             cfg,
         })
     }
@@ -173,9 +182,13 @@ impl Model {
         let mut next = State { h: Vec::new(), s: Vec::new() };
         for (i, l) in self.layers.iter().enumerate() {
             let (y, h) = l.cell.forward(&l.n1.forward(&x)?, &state.h[i])?;
-            x = (x + y)?;
+            if !self.ablation.no_hadam {
+                x = (x + y)?;
+            }
             let (y, s) = l.ret.forward(&l.n2.forward(&x)?, &state.s[i])?;
-            x = (x + y)?;
+            if !self.ablation.no_retention {
+                x = (x + y)?;
+            }
             x = (&x + l.mlp.forward(&l.n3.forward(&x)?)?)?;
             next.h.push(h.detach());
             next.s.push(s.detach());
