@@ -100,6 +100,9 @@ fn train(args: &[String]) -> std::io::Result<()> {
         out: PathBuf::from(arg(args, "--out", d.out.to_str().unwrap())),
         time_limit: (arg(args, "--hours", "0").parse::<f64>().expect("--hours") * 3600.0) as u64,
         log_every: arg(args, "--log-every", &d.log_every.to_string()).parse().expect("--log-every"),
+        warmup: arg(args, "--warmup", &d.warmup.to_string()).parse().expect("--warmup"),
+        init: args.iter().any(|a| a == "--init").then(|| PathBuf::from(arg(args, "--init", ""))),
+        jump: arg(args, "--jump", "on") == "on",
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");

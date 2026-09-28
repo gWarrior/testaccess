@@ -139,6 +139,11 @@ pub struct Engine {
     verdict: Vec<f32>,
     nout: Vec<f32>,
     decays: Vec<f32>,
+    /// Pointer query and copy gate (see [`crate::model`]).
+    pq: ShiftLinear,
+    gate_w: Vec<f32>,
+    gate_b: f32,
+    gate_verdict: Vec<f32>,
 }
 
 /// Recurrent state of one conversation.
@@ -148,7 +153,8 @@ pub struct Session {
     ring: VecDeque<(u32, Vec<f32>, Vec<f32>)>,
     pub memory: Option<ContextMemory>,
     recent: VecDeque<u32>,
-    rows: (Vec<f32>, Vec<f32>, usize),
+    /// Retrieved keys, values, count and the token after each row.
+    rows: (Vec<f32>, Vec<f32>, usize, Vec<u32>),
     verdict: usize,
     pos: u64,
 }
@@ -200,6 +206,10 @@ impl Engine {
             verdict: vec("verdict")?,
             nout: vec("nout")?,
             decays,
+            pq: mat("pq")?,
+            gate_w: vec("gate_w")?,
+            gate_b: vec("gate_b")?[0],
+            gate_verdict: vec("gate_verdict")?,
         })
     }
 
@@ -227,7 +237,7 @@ impl Engine {
             ring: VecDeque::new(),
             memory,
             recent: VecDeque::new(),
-            rows: (Vec::new(), Vec::new(), 0),
+            rows: (Vec::new(), Vec::new(), 0, Vec::new()),
             verdict: 1,
             pos: 0,
         }
@@ -358,7 +368,7 @@ impl Engine {
             s.recent.pop_front();
         }
         if s.pos % self.cfg.block as u64 == 0 {
-            s.rows = (Vec::new(), Vec::new(), 0);
+            s.rows = (Vec::new(), Vec::new(), 0, Vec::new());
             s.verdict = 1;
             if let Some(mem) = &mut s.memory {
                 let probe: Vec<u32> = s.recent.iter().copied().collect();
@@ -369,7 +379,17 @@ impl Engine {
                         Verdict::Absent => 2,
                     };
                     let n = r.positions.len();
-                    s.rows = (r.keys, r.values, n);
+                    // The memory's last position is followed by the ring's first token.
+                    let first = s.ring.front().map_or(u32::MAX, |e| e.0);
+                    let end = mem.position();
+                    let next = r
+                        .positions
+                        .iter()
+                        .map(
+                            |&p| if p + 1 == end { first } else { mem.tokens(p + 1, p + 2).map_or(u32::MAX, |t| t[0]) },
+                        )
+                        .collect();
+                    s.rows = (r.keys, r.values, n, next);
                 }
             }
         }
@@ -398,6 +418,24 @@ impl Engine {
         for j in 0..d {
             x[j] += mo[j] + vr[j];
         }
+        // Pointer over strictly earlier ring positions and the memory rows:
+        // each column copies the token that followed it.
+        let mut copy: Vec<(u32, f32)> = Vec::new();
+        let mut gate = 0f32;
+        if want_logits {
+            let pq = self.pq.apply(&xn);
+            let n_ring = s.ring.len() - 1;
+            let mut sc: Vec<(u32, f32)> = (0..n_ring).map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1))).collect();
+            sc.extend((0..s.rows.2).map(|i| (s.rows.3[i], dot(&pq, &s.rows.0[i * m..(i + 1) * m]))));
+            sc.push((u32::MAX, 0.0));
+            let mx = sc.iter().map(|e| e.1).fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = sc.iter().map(|e| (e.1 - mx).exp()).sum();
+            copy = sc.into_iter().filter(|e| e.0 != u32::MAX).map(|(t, v)| (t, (v - mx).exp() / z)).collect();
+            let g: f32 = xn.iter().zip(&self.gate_w).map(|(a, b)| a * b).sum::<f32>()
+                + self.gate_b
+                + self.gate_verdict[s.verdict];
+            gate = sigmoid(g);
+        }
         // Tokens leave the local ring into the SNN memory.
         if s.ring.len() > RING {
             let (t, k, v) = s.ring.pop_front().expect("ring is not empty");
@@ -411,7 +449,17 @@ impl Engine {
         }
         let mut xo = rms_gain(&x, &self.nout);
         rms(&mut xo);
-        Some(self.emb.apply(&xo))
+        let logits = self.emb.apply(&xo);
+        // Mixture (1 − g)·p_vocab + g·p_copy, returned as log-probabilities.
+        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
+        let mut p: Vec<f32> = logits.iter().map(|l| (1.0 - gate) * (l - mx).exp() / z).collect();
+        for (t, a) in copy {
+            if let Some(pt) = p.get_mut(t as usize) {
+                *pt += gate * a;
+            }
+        }
+        Some(p.into_iter().map(|v| v.max(f32::MIN_POSITIVE).ln()).collect())
     }
 }
 
@@ -452,15 +500,35 @@ mod tests {
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
         // Non-trivial gains/signs/verdict so every path is exercised.
         for (name, var) in vm.data().lock().unwrap().iter() {
-            if name.ends_with("gain") || name == "verdict" || name.ends_with(".n1") || name == "nout" {
+            if name.ends_with("gain")
+                || name == "verdict"
+                || name.ends_with(".n1")
+                || name == "nout"
+                || name.starts_with("gate")
+            {
                 var.set(&Tensor::randn(0f32, 1.0, var.as_tensor().shape(), &dev).unwrap()).unwrap();
             }
         }
         let tokens: Vec<u32> = (0..9).map(|i| (i * 7 + 3) % 81).collect();
         let ids = Tensor::from_vec(tokens.clone(), (1, 9), &dev).unwrap();
         let (tr, _) = model.trunk(&ids, &model.zero_state(1, &dev).unwrap()).unwrap();
-        let reference = model.head(&tr, &MemBatch::empty(1, 3, 9, &dev).unwrap()).unwrap();
-        let reference = reference.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let head = model.head(&tr, &MemBatch::empty(1, 3, 9, &dev).unwrap()).unwrap();
+        let logits = head.logits.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let point = head.point.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let gate = head.gate.squeeze(0).unwrap().to_vec1::<f32>().unwrap();
+        // Reference mixture log-probabilities; window column j copies token j + 1.
+        let reference: Vec<Vec<f32>> = (0..9)
+            .map(|t| {
+                let row = &logits[t];
+                let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let z: f32 = row.iter().map(|l| (l - mx).exp()).sum();
+                let mut p: Vec<f32> = row.iter().map(|l| (1.0 - gate[t]) * (l - mx).exp() / z).collect();
+                for j in 0..8 {
+                    p[tokens[j + 1] as usize] += gate[t] * point[t][j];
+                }
+                p.into_iter().map(|v| v.ln()).collect()
+            })
+            .collect();
 
         let packed = crate::pack::pack_checkpoint(&vm, cfg).unwrap();
         let engine = Engine::from_packed(&packed).unwrap();
