@@ -321,7 +321,7 @@ impl ContextMemory {
     }
 
     fn census_hash(&self, window: &[u32]) -> u64 {
-        window.iter().fold(mix64(self.cfg.seed ^ 0xCE45_05), |h, &t| mix64(h ^ t as u64 ^ 0x9E37_79B9))
+        window.iter().fold(mix64(self.cfg.seed ^ 0x00CE_4505), |h, &t| mix64(h ^ t as u64 ^ 0x9E37_79B9))
     }
 
     fn append_tokens(&mut self, new: &[u32]) -> Result<usize, MemoryError> {

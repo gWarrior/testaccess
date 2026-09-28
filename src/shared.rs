@@ -37,12 +37,10 @@ impl<P: Clone + Send + 'static> SharedMemory<P> {
         let memory = self.clone();
         let thread = std::thread::Builder::new()
             .name("snn-memory-maintenance".into())
-            .spawn(move || loop {
-                match rx.recv_timeout(interval) {
-                    Err(RecvTimeoutError::Timeout) => {
-                        memory.lock().maintain();
-                    }
-                    _ => break,
+            .spawn(move || {
+                // Runs until the handle's sender is dropped (disconnect).
+                while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(interval) {
+                    memory.lock().maintain();
                 }
             })
             .expect("failed to spawn maintenance thread");

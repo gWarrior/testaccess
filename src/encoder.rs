@@ -428,7 +428,7 @@ impl Encoder for NGramEncoder {
     }
 
     fn fingerprint(&self) -> u64 {
-        let mut h = fold(0x6_4A3, self.seed);
+        let mut h = fold(0x64A3, self.seed);
         for x in [self.n_neurons as u64, self.per_feature as u64] {
             h = fold(h, x);
         }
