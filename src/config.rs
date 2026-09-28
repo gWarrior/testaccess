@@ -21,7 +21,7 @@ pub struct DynamicsConfig {
     /// Rate trace above which an engram counts as active: it drives
     /// completion and the inhibitory interneuron.
     pub completion_min_rate: f32,
-    /// Synapses weaker than this (relative, mean 1) do not complete.
+    /// Synapses below this state do not complete (`0.5` = excitatory only).
     pub completion_min_weight: f32,
 }
 
@@ -40,24 +40,24 @@ impl Default for DynamicsConfig {
     }
 }
 
-/// Local plasticity applied when an existing memory is reinforced.
+/// Discrete plasticity of ternary synapses, applied when an existing memory
+/// is reinforced. Transitions are probabilistic (bounded-synapse model), so
+/// a single atypical presentation cannot rewrite a memory.
 #[derive(Clone, Debug)]
 pub struct PlasticityConfig {
-    /// LTP rate for co-active pre/post pairs (soft-bounded by `w_max`).
-    pub a_plus: f32,
-    /// LTD rate for synapses whose presynaptic neuron stayed silent.
-    pub a_minus: f32,
-    /// Soft upper bound of a relative synaptic weight.
-    pub w_max: f32,
-    /// Synapses weaker than this may be replaced by new ones (turnover).
-    pub turnover_below: f32,
+    /// Probability that a co-active synapse steps up (`-1 → 0 → +1`) and that
+    /// a newly active input gets wired in.
+    pub p_potentiate: f32,
+    /// Probability that an excitatory synapse whose input stayed silent
+    /// becomes silent (`+1 → 0`).
+    pub p_depress: f32,
     /// Maximum synapses created per reinforcement.
-    pub max_turnover: usize,
+    pub max_new_synapses: usize,
 }
 
 impl Default for PlasticityConfig {
     fn default() -> Self {
-        Self { a_plus: 0.3, a_minus: 0.2, w_max: 3.0, turnover_below: 0.35, max_turnover: 8 }
+        Self { p_potentiate: 1.0, p_depress: 0.35, max_new_synapses: 8 }
     }
 }
 
@@ -83,7 +83,7 @@ impl Default for StpConfig {
 /// Top-level configuration.
 #[derive(Clone, Debug)]
 pub struct MemoryConfig {
-    /// Maximum neurons in one engram ensemble.
+    /// Maximum synapses of one engram (at most 256).
     pub max_ensemble: usize,
     /// Candidates passed from the index to the spiking stage.
     pub max_candidates: usize,
@@ -136,8 +136,8 @@ impl Default for MemoryConfig {
 impl MemoryConfig {
     pub fn validate(&self) -> Result<(), MemoryError> {
         let bad = |m: &str| Err(MemoryError::InvalidConfig(m.to_string()));
-        if self.max_ensemble == 0 || self.max_ensemble > u16::MAX as usize {
-            return bad("max_ensemble must be in 1..=65535");
+        if self.max_ensemble == 0 || self.max_ensemble > crate::index::MAX_WIDTH {
+            return bad("max_ensemble must be in 1..=256");
         }
         if self.max_candidates == 0 {
             return bad("max_candidates must be > 0");
@@ -163,8 +163,8 @@ impl MemoryConfig {
             return bad("dynamics: steps > 0, tau_m > 0, rate_decay in [0,1), inhibition >= 0");
         }
         let p = &self.plasticity;
-        if p.a_plus < 0.0 || !(0.0..1.0).contains(&p.a_minus) || p.w_max <= 1.0 {
-            return bad("plasticity: a_plus >= 0, a_minus in [0,1), w_max > 1");
+        if !(0.0..=1.0).contains(&p.p_potentiate) || !(0.0..=1.0).contains(&p.p_depress) {
+            return bad("plasticity: probabilities must be in [0, 1]");
         }
         if self.stp.tau <= 0.0 || !(0.0..=1.0).contains(&self.stp.utilization) {
             return bad("stp: tau > 0, utilization in [0,1]");

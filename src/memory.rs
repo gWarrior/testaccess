@@ -187,7 +187,9 @@ pub struct MemoryRecord<'a, P> {
     pub prev: Option<MemoryId>,
     pub next: Option<MemoryId>,
     pub pattern: &'a [u32],
-    pub weights: Vec<f32>,
+    /// Ternary synapse states (`+1` excitatory, `0` silent, `-1` inhibitory),
+    /// aligned with `pattern`.
+    pub states: Vec<i8>,
     pub payload: Option<&'a P>,
 }
 
@@ -499,12 +501,16 @@ impl<P: Clone> SnnMemory<P> {
             strength: 1.0,
             recalls: 0,
             pinned: opts.pin,
+            polarity: 1,
             prev: NO_ID,
             next: NO_ID,
             len: code.len() as u32,
         };
-        let weights = vec![1.0; code.len()];
-        let slot = self.bank_mut(tier).insert(Engram { code, weights, meta, payload: opts.payload });
+        if self.bank(tier).is_full() {
+            return Err(MemoryError::CapacityExceeded);
+        }
+        let states = vec![1; code.len()];
+        let slot = self.bank_mut(tier).insert(Engram { code, states, meta, payload: opts.payload });
         self.loc.insert(id, Loc { tier, slot });
         if let Some(prev) = opts.after {
             self.link(prev, id, now);
@@ -530,8 +536,8 @@ impl<P: Clone> SnnMemory<P> {
                 if score < 0.5 * thr * gsum {
                     continue;
                 }
-                let (cov, comp) = dynamics::similarity(code, &gains, bank.code(slot), &bank.weights(slot));
-                let sym = cov.min(comp);
+                let m = dynamics::similarity(code, &gains, bank.code(slot), &bank.weights(slot));
+                let sym = m.coverage.min(m.completeness);
                 if sym >= thr && best.map_or(true, |(s, _)| sym > s) {
                     best = Some((sym, Loc { tier, slot }));
                 }
@@ -550,7 +556,7 @@ impl<P: Clone> SnnMemory<P> {
         let pcfg = self.cfg.plasticity.clone();
         let deadline = self.deadline(opts.ttl, now);
         let bank = self.bank_mut(l.tier);
-        bank.reinforce(l.slot, code, &pcfg, l.tier == Tier::Fast);
+        bank.reinforce(l.slot, code, &pcfg);
         if let Some(p) = opts.payload {
             bank.set_payload(l.slot, p);
         }
@@ -853,7 +859,7 @@ impl<P: Clone> SnnMemory<P> {
             prev: opt(m.prev),
             next: opt(m.next),
             pattern: bank.code(l.slot),
-            weights: bank.weights(l.slot),
+            states: bank.states(l.slot),
             payload: bank.payload(l.slot),
         })
     }

@@ -8,10 +8,11 @@
 //!   The drive of engram `j` is the gain-weighted fraction of the currently
 //!   active ensemble explained by its synapses (divisive normalisation):
 //!
-//!   `x_j = Σ_{i ∈ A ∩ E_j} g_i ŵ_ij / Σ_{i ∈ A} g_i`
+//!   `x_j = Σ_{i ∈ A ∩ E_j} g_i w_ij / Σ_{i ∈ A} g_i`
 //!
-//!   `g_i` is the homeostatic gain of neuron `i` and `ŵ_ij` the relative
-//!   synaptic weight.
+//!   `g_i` is the homeostatic gain of neuron `i` and `w_ij ∈ {-1, 0, +1}`
+//!   the ternary synapse: excitatory inputs are evidence for the memory,
+//!   inhibitory inputs are evidence against it.
 //! * **Inhibitory interneuron** — driven by the strongest engram that is in
 //!   its attractor (fired recently), it inhibits all engrams equally
 //!   (winner competition, concept §9). With inhibition `h`, a competitor
@@ -30,7 +31,7 @@ use crate::config::DynamicsConfig;
 /// A candidate engram handed to the dynamics.
 pub(crate) struct Cand {
     pub code: Vec<u32>,
-    /// Relative synaptic weights (mean 1), aligned with `code`.
+    /// Ternary synaptic states as weights, aligned with `code`.
     pub w: Vec<f32>,
     /// Short-term facilitation gain (>= 1).
     pub gain: f32,
@@ -38,9 +39,12 @@ pub(crate) struct Cand {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Outcome {
-    /// Feed-forward similarity at `t = 0`: fraction of the cue explained.
+    /// Feed-forward similarity at `t = 0`: signed fraction of the cue
+    /// explained (inhibitory synapses count against).
     pub similarity: f32,
-    /// Fraction of the engram's synaptic weight present in the cue.
+    /// Same, counting excitatory synapses only.
+    pub excitatory: f32,
+    /// Fraction of the engram's excitatory synapses present in the cue.
     pub completeness: f32,
     pub spikes: u32,
     pub first_spike: Option<u32>,
@@ -54,20 +58,32 @@ pub(crate) struct Settled {
     pub active: Vec<u32>,
 }
 
-/// Coverage (fraction of the cue explained) and completeness of one engram.
-pub(crate) fn similarity(cue: &[u32], gains: &[f32], code: &[u32], w: &[f32]) -> (f32, f32) {
+/// Feed-forward match of one engram against a cue.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Match {
+    pub coverage: f32,
+    pub excitatory: f32,
+    pub completeness: f32,
+}
+
+/// Match of one engram (`code`, ternary `w`) against a sorted cue.
+pub(crate) fn similarity(cue: &[u32], gains: &[f32], code: &[u32], w: &[f32]) -> Match {
     let gsum: f32 = gains.iter().sum();
-    let wsum: f32 = w.iter().sum();
-    let (mut num_g, mut num_w) = (0.0f32, 0.0f32);
+    let wsum: f32 = w.iter().map(|&w| w.max(0.0)).sum();
+    let (mut signed, mut exc, mut hit) = (0.0f32, 0.0f32, 0.0f32);
     for (n, &wi) in code.iter().zip(w) {
         if let Ok(p) = cue.binary_search(n) {
-            num_g += gains[p] * wi;
-            num_w += wi;
+            signed += gains[p] * wi;
+            exc += gains[p] * wi.max(0.0);
+            hit += wi.max(0.0);
         }
     }
-    let cov = if gsum > 0.0 { (num_g / gsum).min(1.0) } else { 0.0 };
-    let comp = if wsum > 0.0 { num_w / wsum } else { 0.0 };
-    (cov, comp)
+    let frac = |x: f32| if gsum > 0.0 { (x / gsum).clamp(-1.0, 1.0) } else { 0.0 };
+    Match {
+        coverage: frac(signed),
+        excitatory: frac(exc),
+        completeness: if wsum > 0.0 { hit / wsum } else { 0.0 },
+    }
 }
 
 /// Firing threshold such that a constant drive of exactly `threshold`
@@ -111,22 +127,22 @@ pub(crate) fn settle(
                     .filter(|(&i, _)| active[i as usize])
                     .map(|(&i, &w)| g[i as usize] * w)
                     .sum();
-                if denom > 0.0 { (num / denom).min(1.0) } else { 0.0 }
+                if denom > 0.0 { (num / denom).clamp(-1.0, 1.0) } else { 0.0 }
             })
             .collect()
     };
 
     let sim0 = drive(&active);
+    let cue_gains: Vec<f32> = cue.iter().map(|n| g[to_local(n) as usize]).collect();
     let mut outcomes: Vec<Outcome> = cands
         .iter()
-        .zip(&cl)
         .zip(&sim0)
-        .map(|((c, idx), &similarity)| {
-            let wsum: f32 = c.w.iter().sum();
-            let hit: f32 = idx.iter().zip(&c.w).filter(|(&i, _)| cue_active[i as usize]).map(|(_, &w)| w).sum();
+        .map(|(c, &similarity)| {
+            let m = self::similarity(cue, &cue_gains, &c.code, &c.w);
             Outcome {
                 similarity,
-                completeness: if wsum > 0.0 { hit / wsum } else { 0.0 },
+                excitatory: m.excitatory,
+                completeness: m.completeness,
                 spikes: 0,
                 first_spike: None,
             }
@@ -256,11 +272,24 @@ mod tests {
         let a: Vec<u32> = vec![1, 3, 5, 7];
         let cue = vec![1, 2, 3];
         let gains = vec![2.0, 1.0, 1.0];
-        let (cov, comp) = similarity(&cue, &gains, &a, &[1.0; 4]);
-        assert!((cov - 0.75).abs() < 1e-6);
-        assert!((comp - 0.5).abs() < 1e-6);
+        let m = similarity(&cue, &gains, &a, &[1.0; 4]);
+        assert!((m.coverage - 0.75).abs() < 1e-6);
+        assert!((m.completeness - 0.5).abs() < 1e-6);
         let g = |n: u32| if n == 1 { 2.0 } else { 1.0 };
         let s = settle(&cue, &[cand(&a)], &g, 0.3, &DynamicsConfig::default());
-        assert!((s.outcomes[0].similarity - cov).abs() < 1e-6);
+        assert!((s.outcomes[0].similarity - m.coverage).abs() < 1e-6);
+    }
+
+    #[test]
+    fn inhibitory_synapses_veto_a_match() {
+        // A explains the whole cue, but two cue neurons are inhibitory
+        // inputs of A: the evidence against it cancels the evidence for it.
+        let a = Cand { code: vec![1, 2, 3, 4, 5, 6], w: vec![1.0, 1.0, 1.0, 1.0, -1.0, -1.0], gain: 1.0 };
+        let cue = vec![1, 2, 5, 6];
+        let m = similarity(&cue, &[1.0; 4], &a.code, &a.w);
+        assert_eq!((m.coverage, m.excitatory), (0.0, 0.5));
+        let s = settle(&cue, &[a], &|_| 1.0, 0.3, &DynamicsConfig::default());
+        assert_eq!(s.outcomes[0].spikes, 0);
+        assert_eq!(s.outcomes[0].excitatory, 0.5);
     }
 }

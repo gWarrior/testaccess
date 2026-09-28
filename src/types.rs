@@ -54,6 +54,8 @@ pub enum MemoryError {
     UnknownMemory(MemoryId),
     /// The context id was never registered.
     UnknownContext(ContextId),
+    /// The engram bank has no free slots left.
+    CapacityExceeded,
     /// Invalid configuration value.
     InvalidConfig(String),
 }
@@ -74,6 +76,7 @@ impl fmt::Display for MemoryError {
             }
             Self::UnknownMemory(id) => write!(f, "unknown memory #{id}"),
             Self::UnknownContext(ctx) => write!(f, "unknown context {}", ctx.0),
+            Self::CapacityExceeded => write!(f, "engram bank capacity exceeded"),
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
         }
     }
