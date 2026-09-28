@@ -1,0 +1,18 @@
+[package]
+name = "snn-memory"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Fast spiking-neural-network memory: one-shot learn, associative recall, selective forget. Designed as exact long-context memory for recurrent LLMs."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+opt-level = 2
