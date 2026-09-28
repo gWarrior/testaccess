@@ -108,14 +108,197 @@ fn train(args: &[String]) -> std::io::Result<()> {
     snn_lm::train::train(&cfg, snn_lm::model::Config::default(), &tokens.tokens, &tok).map_err(std::io::Error::other)
 }
 
+fn ngram(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let n: usize = arg(args, "--tokens", "6000000").parse().expect("--tokens");
+    let nv: usize = arg(args, "--val-tokens", "1000000").parse().expect("--val-tokens");
+    let train = load_tokens(&data, "train.bin");
+    let val = load_tokens(&data, "val.bin");
+    let t = Instant::now();
+    // Same data a model sees: the first `n / 27` tokens of each of 27 streams.
+    let region = train.len() / 27;
+    let per = n / 27;
+    let mut sample = Vec::with_capacity(n);
+    for b in 0..27 {
+        sample.extend_from_slice(&train.tokens[b * region..b * region + per]);
+    }
+    let m = snn_lm::ngram::NGram::train(&sample, 6561);
+    let (bi, tri) = m.evaluate(&val.tokens[..nv.min(val.len())]);
+    println!(
+        "n-gram on {} tokens ({:.1}s): bigram {:.4} nats (ppl {:.1}), trigram {:.4} nats (ppl {:.1})",
+        sample.len(),
+        t.elapsed().as_secs_f64(),
+        bi,
+        bi.exp(),
+        tri,
+        tri.exp()
+    );
+    Ok(())
+}
+
+fn load_model(dir: &std::path::Path) -> snn_lm::model::Model {
+    snn_lm::train::load_model(dir, snn_lm::model::Config::default(), &candle_core::Device::Cpu).expect("checkpoint")
+}
+
+fn eval(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let run = PathBuf::from(arg(args, "--run", "/home/user/data/run"));
+    let windows: usize = arg(args, "--windows", "27").parse().expect("--windows");
+    let val = load_tokens(&data, "val.bin");
+    for memory in [true, false] {
+        let t = Instant::now();
+        let loss = snn_lm::eval::val_loss(load_model(&run), &val.tokens, 27, windows, memory)
+            .map_err(std::io::Error::other)?;
+        println!(
+            "val loss (memory {}): {:.4} nats, ppl {:.1} ({:.0}s)",
+            if memory { "on " } else { "off" },
+            loss,
+            loss.exp(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+fn recall(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let run = PathBuf::from(arg(args, "--run", "/home/user/data/run"));
+    let batch: usize = arg(args, "--batch", "9").parse().expect("--batch");
+    let distances: Vec<usize> = arg(args, "--distances", "243,2187,19683,177147,300000")
+        .split(',')
+        .map(|x| x.parse().expect("distance"))
+        .collect();
+    let memory = arg(args, "--memory", "on") == "on";
+    let val = load_tokens(&data, "val.bin");
+    let ep = snn_lm::data::Episodes::new(&load_tokenizer(&data));
+    let t = Instant::now();
+    let res = snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, &distances, batch, memory, 7)
+        .map_err(std::io::Error::other)?;
+    for r in res {
+        println!(
+            "memory {} distance {:>7}: exact {}/{}  answer loss {:.3}",
+            if memory { "on " } else { "off" },
+            r.distance,
+            r.exact,
+            r.episodes,
+            r.loss
+        );
+    }
+    println!("({:.0}s)", t.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn export(args: &[String]) -> std::io::Result<()> {
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let run = PathBuf::from(arg(args, "--run", "/home/user/data/run"));
+    let out = PathBuf::from(arg(args, "--out", "lm/model"));
+    std::fs::create_dir_all(&out)?;
+    let mut varmap = candle_nn::VarMap::new();
+    let _ = snn_lm::model::Model::new(
+        candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &candle_core::Device::Cpu),
+        snn_lm::model::Config::default(),
+    )
+    .map_err(std::io::Error::other)?;
+    varmap.load(run.join("model.safetensors")).map_err(std::io::Error::other)?;
+    let packed =
+        snn_lm::pack::pack_checkpoint(&varmap, snn_lm::model::Config::default()).map_err(std::io::Error::other)?;
+    packed.save(std::io::BufWriter::new(std::fs::File::create(out.join("model.snnt"))?))?;
+    std::fs::copy(data.join("tokenizer.bpe"), out.join("tokenizer.bpe"))?;
+    println!(
+        "exported {} ({} bytes)",
+        out.join("model.snnt").display(),
+        std::fs::metadata(out.join("model.snnt"))?.len()
+    );
+    Ok(())
+}
+
+fn chat(args: &[String]) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+    let dir = PathBuf::from(arg(args, "--model", "lm/model"));
+    let mut temperature: f32 = arg(args, "--temp", "0.8").parse().expect("--temp");
+    let top_k: usize = arg(args, "--top-k", "27").parse().expect("--top-k");
+    let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
+    let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
+    let packed =
+        snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
+    let tok = load_tokenizer(&dir);
+    let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    let mut session = engine.session(memory_tokens);
+    let mut rng = snn_memory::rng::SplitMix64::new(Instant::now().elapsed().as_nanos() as u64 ^ 0x5EED);
+    let mut logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
+    println!("snn-lm: тернарная HadamRNN ~8M параметров + SNN-память на {memory_tokens} токенов.");
+    println!("Команды: /reset — новый диалог, /temp X — температура, /quit — выход.\n");
+    let stdin = std::io::stdin();
+    loop {
+        print!("вы> ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        match line.split_whitespace().next() {
+            Some("/quit") => break,
+            Some("/reset") => {
+                session = engine.session(memory_tokens);
+                logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
+                println!("(новый диалог)");
+                continue;
+            }
+            Some("/temp") => {
+                temperature = line[5..].trim().parse().unwrap_or(temperature);
+                println!("(температура {temperature})");
+                continue;
+            }
+            _ => {}
+        }
+        for t in tok.encode(&format!("{line}\n")) {
+            logits = engine.step(&mut session, t);
+        }
+        print!("модель> ");
+        let mut out = Vec::new();
+        for _ in 0..max_new {
+            let t = snn_lm::infer::sample(&logits, temperature, top_k, &mut rng);
+            if t == snn_lm::tokenizer::DOC {
+                break;
+            }
+            out.push(t);
+            let text = tok.decode(&out);
+            logits = engine.step(&mut session, t);
+            if text.ends_with('\n') {
+                break;
+            }
+        }
+        println!("{}", tok.decode(&out).trim_end());
+        // Close the turn so the model sees a clean line break.
+        if !tok.decode(&out).ends_with('\n') {
+            for t in tok.encode("\n") {
+                logits = engine.step(&mut session, t);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args),
         Some("train") => train(&args),
+        Some("ngram") => ngram(&args),
+        Some("eval") => eval(&args),
+        Some("recall") => recall(&args),
+        Some("export") => export(&args),
+        Some("chat") => chat(&args),
         _ => {
             eprintln!("usage: snn-lm prepare [--src DIR] [--out DIR] [--vocab N] [--sample-mb N]");
             eprintln!("       snn-lm train [--steps N] [--hours H] [--memory on|off] [--out DIR] [--lr X] [--batch N]");
+            eprintln!(
+                "       snn-lm ngram [--tokens N] | eval [--run DIR] | recall [--distances a,b,..] [--memory on|off]"
+            );
+            eprintln!(
+                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N]"
+            );
             std::process::exit(2);
         }
     };

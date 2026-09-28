@@ -23,9 +23,19 @@ use crate::model::Config;
 
 pub enum Packed {
     /// `levels` in `−4..=4`, row-major `(rows, cols)`, step `2^exp[row]`.
-    Matrix { rows: usize, cols: usize, levels: Vec<i8>, exps: Vec<i8> },
-    F32 { dims: Vec<usize>, data: Vec<f32> },
-    Signs { data: Vec<i8> },
+    Matrix {
+        rows: usize,
+        cols: usize,
+        levels: Vec<i8>,
+        exps: Vec<i8>,
+    },
+    F32 {
+        dims: Vec<usize>,
+        data: Vec<f32>,
+    },
+    Signs {
+        data: Vec<i8>,
+    },
 }
 
 pub struct PackedModel {
@@ -144,7 +154,8 @@ impl PackedModel {
                 }
                 1 => {
                     let n: usize = dims.iter().product();
-                    let data = (0..n).map(|_| Ok(f32::from_le_bytes(read_exact::<4>(&mut r)?))).collect::<io::Result<_>>()?;
+                    let data =
+                        (0..n).map(|_| Ok(f32::from_le_bytes(read_exact::<4>(&mut r)?))).collect::<io::Result<_>>()?;
                     Packed::F32 { dims, data }
                 }
                 2 => {

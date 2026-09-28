@@ -1,4 +1,5 @@
 pub mod data;
+pub mod eval;
 pub mod infer;
 pub mod layers;
 pub mod model;
