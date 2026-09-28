@@ -421,20 +421,21 @@ impl Engine {
         // Pointer over strictly earlier ring positions and the memory rows:
         // each column copies the token that followed it.
         let mut copy: Vec<(u32, f32)> = Vec::new();
-        let mut gate = 0f32;
+        let mut gate = 1f32;
         if want_logits {
             let pq = self.pq.apply(&xn);
             let n_ring = s.ring.len() - 1;
             let mut sc: Vec<(u32, f32)> = (0..n_ring).map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1))).collect();
             sc.extend((0..s.rows.2).map(|i| (s.rows.3[i], dot(&pq, &s.rows.0[i * m..(i + 1) * m]))));
-            sc.push((u32::MAX, 0.0));
-            let mx = sc.iter().map(|e| e.1).fold(f32::NEG_INFINITY, f32::max);
-            let z: f32 = sc.iter().map(|e| (e.1 - mx).exp()).sum();
-            copy = sc.into_iter().filter(|e| e.0 != u32::MAX).map(|(t, v)| (t, (v - mx).exp() / z)).collect();
-            let g: f32 = xn.iter().zip(&self.gate_w).map(|(a, b)| a * b).sum::<f32>()
+            // The null column's weight is the vocabulary's share.
+            let null: f32 = xn.iter().zip(&self.gate_w).map(|(a, b)| a * b).sum::<f32>()
                 + self.gate_b
                 + self.gate_verdict[s.verdict];
-            gate = sigmoid(g);
+            sc.push((u32::MAX, null));
+            let mx = sc.iter().map(|e| e.1).fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = sc.iter().map(|e| (e.1 - mx).exp()).sum();
+            gate = (null - mx).exp() / z;
+            copy = sc.into_iter().filter(|e| e.0 != u32::MAX).map(|(t, v)| (t, (v - mx).exp() / z)).collect();
         }
         // Tokens leave the local ring into the SNN memory.
         if s.ring.len() > RING {
@@ -450,13 +451,13 @@ impl Engine {
         let mut xo = rms_gain(&x, &self.nout);
         rms(&mut xo);
         let logits = self.emb.apply(&xo);
-        // Mixture (1 − g)·p_vocab + g·p_copy, returned as log-probabilities.
+        // Mixture a_null·p_vocab + Σ a·[next], returned as log-probabilities.
         let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
-        let mut p: Vec<f32> = logits.iter().map(|l| (1.0 - gate) * (l - mx).exp() / z).collect();
+        let mut p: Vec<f32> = logits.iter().map(|l| gate * (l - mx).exp() / z).collect();
         for (t, a) in copy {
             if let Some(pt) = p.get_mut(t as usize) {
-                *pt += gate * a;
+                *pt += a;
             }
         }
         Some(p.into_iter().map(|v| v.max(f32::MIN_POSITIVE).ln()).collect())
@@ -522,9 +523,9 @@ mod tests {
                 let row = &logits[t];
                 let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let z: f32 = row.iter().map(|l| (l - mx).exp()).sum();
-                let mut p: Vec<f32> = row.iter().map(|l| (1.0 - gate[t]) * (l - mx).exp() / z).collect();
+                let mut p: Vec<f32> = row.iter().map(|l| gate[t] * (l - mx).exp() / z).collect();
                 for j in 0..8 {
-                    p[tokens[j + 1] as usize] += gate[t] * point[t][j];
+                    p[tokens[j + 1] as usize] += point[t][j];
                 }
                 p.into_iter().map(|v| v.ln()).collect()
             })

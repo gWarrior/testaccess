@@ -8,12 +8,14 @@
 //!             · the tokens the SNN memory retrieved from the past 300k
 //!          + embedding of the memory's ternary verdict
 //!        → tied output embedding
-//!        → pointer (copy) mix: p = (1 − g)·p_vocab + g·Σⱼ aⱼ·[token after j]
+//!        → pointer (copy) mix: p = a_null·p_vocab + Σⱼ aⱼ·[token after j]
 //! ```
 //!
 //! The pointer attends over the window's earlier positions and the rows the
 //! SNN memory retrieved, and copies the token that *followed* the attended
-//! position. The gate `g` sees the state and the memory's ternary verdict.
+//! position. Its null column is the gate: its logit sees the state and the
+//! memory's ternary verdict, and it competes with the matches themselves,
+//! so copying wins exactly where the pointer found a confident match.
 //! Unlike the value read, whose values only predict the next token, the
 //! pointer copies the real one — the direct path for exact recall.
 //!
@@ -150,7 +152,7 @@ pub struct Model {
     /// Pointer query (keys are the memory keys `mk`, so the SNN memory's
     /// stored rows serve both the value read and the pointer).
     pq: TLinear,
-    /// Copy gate: `g = σ(xn·gate_w + gate_b + gate_verdict[verdict])`.
+    /// Null-column logit of the pointer: `xn·gate_w + gate_b + gate_verdict[verdict]`.
     gate_w: Tensor,
     gate_b: Tensor,
     gate_verdict: Tensor,
@@ -163,7 +165,7 @@ pub struct HeadOut {
     /// Pointer attention `(B, T, L)` over `L = T + M + 1` columns: the
     /// window (strictly earlier positions), the block's memory rows, a null.
     pub point: Tensor,
-    /// Copy gate `(B, T)`.
+    /// Weight of the vocabulary distribution, the null column `(B, T)`.
     pub gate: Tensor,
 }
 
@@ -198,7 +200,7 @@ impl Model {
             nout: RmsNorm::new(vb.clone(), "nout", d)?,
             pq: TLinear::new(vb.clone(), "pq", d, m)?,
             gate_w: vb.get_with_hints(d, "gate_w", Init::Const(0.0))?,
-            gate_b: vb.get_with_hints(1, "gate_b", Init::Const(-3.0))?,
+            gate_b: vb.get_with_hints(1, "gate_b", Init::Const(8.0))?,
             gate_verdict: vb.get_with_hints(3, "gate_verdict", Init::Const(0.0))?,
             ablation: Ablation::default(),
             cfg,
@@ -256,7 +258,8 @@ impl Model {
             .broadcast_add(&mem.mask.unsqueeze(2)?)?;
         let mm = far.dim(D::Minus1)?;
         let far = far.reshape((b, t, mm))?;
-        let att = candle_nn::ops::softmax_last_dim(&Tensor::cat(&[&local, &far], 2)?)?;
+        // `softmax_last_dim` has no backward in candle 0.9: use the composite.
+        let att = candle_nn::ops::softmax(&Tensor::cat(&[&local, &far], 2)?, D::Minus1)?;
         let o_local = att.narrow(2, 0, t)?.matmul(&tr.v)?;
         let o_far = att.narrow(2, t, mm)?.reshape((b, nb, blk, mm))?.matmul(&mem.values)?.reshape((b, t, m))?;
         let o = self.mo.forward(&(o_local + o_far)?)?;
@@ -278,12 +281,12 @@ impl Model {
             .affine(scale, 0.0)?
             .broadcast_add(&mem.mask.unsqueeze(2)?)?
             .reshape((b, t, mm))?;
-        let null = Tensor::zeros((b, t, 1), DType::F32, device)?;
-        let point = candle_nn::ops::softmax_last_dim(&Tensor::cat(&[&p_local, &p_far, &null], 2)?)?;
         let gv = self.gate_verdict.index_select(&mem.verdict.flatten_all()?, 0)?.reshape((b, nb, 1))?;
         let gv = gv.broadcast_as((b, nb, blk))?.reshape((b, t))?;
-        let g = tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)?;
-        let gate = candle_nn::ops::sigmoid(&(g + gv)?)?;
+        let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + gv)?;
+        let point =
+            candle_nn::ops::softmax(&Tensor::cat(&[&p_local, &p_far, &null.unsqueeze(2)?], 2)?, D::Minus1)?;
+        let gate = point.narrow(2, t + mm, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
     }
 
@@ -308,6 +311,28 @@ mod tests {
         let _ = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), Config::default()).unwrap();
         let n = Model::n_params(&vm.all_vars());
         assert!((7_500_000..8_500_000).contains(&n), "{n} parameters");
+    }
+
+    #[test]
+    fn memory_and_pointer_projections_receive_gradients() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), small()).unwrap();
+        let ids = Tensor::from_vec((0..18u32).map(|i| i % 5).collect::<Vec<_>>(), (2, 9), &dev).unwrap();
+        let (tr, _) = model.trunk(&ids, &model.zero_state(2, &dev).unwrap()).unwrap();
+        let mut rows = vec![vec![(Vec::new(), Vec::new(), 1u32, Vec::new()); 3]; 2];
+        rows[0][1] = (vec![0.5; 9], vec![1.0; 9], 0, vec![3]);
+        let h = model.head(&tr, &MemBatch::from_rows(&rows, 9, &dev).unwrap()).unwrap();
+        let loss = (h.logits.sqr().unwrap().mean_all().unwrap()
+            + h.point.narrow(2, 0, 9).unwrap().sum_all().unwrap())
+        .unwrap();
+        let grads = loss.backward().unwrap();
+        for (name, var) in vm.data().lock().unwrap().iter() {
+            if ["mq", "mk", "pq", "gate_w"].iter().any(|p| name.starts_with(p)) {
+                let g = grads.get(var.as_tensor()).map(|g| g.abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap());
+                assert!(g.is_some_and(|g| g > 0.0), "{name}: no gradient ({g:?})");
+            }
+        }
     }
 
     #[test]

@@ -157,7 +157,7 @@ pub struct Runner {
 /// Result of one window.
 pub struct WindowOut {
     pub logits: Tensor,
-    /// Pointer attention `(B, T, T + M + 1)` and copy gate `(B, T)`.
+    /// Pointer attention `(B, T, T + M + 1)` and its null column `(B, T)`.
     pub point: Tensor,
     pub gate: Tensor,
     /// Token after each memory row `(B, nb, M)` and `M`.
@@ -241,7 +241,7 @@ impl Runner {
         }
     }
 
-    /// Per-token loss of the mixture `(1 − g)·p_vocab + g·p_copy`, `(B·T,)`.
+    /// Per-token loss of the mixture `a_null·p_vocab + Σ a·[next]`, `(B·T,)`.
     pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
         let (b, t, l) = out.point.dims3()?;
         let mut hit = vec![0f32; b * t * l];
@@ -259,9 +259,9 @@ impl Runner {
         let copy = (&out.point * hit)?.sum(2)?.flatten_all()?;
         let ce = token_losses(&out.logits, y)?;
         let g = out.gate.flatten_all()?;
-        // −ln((1 − g)·e^−ce + g·c), as a log-sum-exp of the two branches.
-        let a = ((1.0 - &g)?.log()? - ce)?;
-        let c = (g.log()? + (copy + 1e-9)?.log()?)?;
+        // −ln(a_null·e^−ce + c), as a log-sum-exp of the two branches.
+        let a = ((g + 1e-9)?.log()? - ce)?;
+        let c = (copy + 1e-9)?.log()?;
         let both = Tensor::stack(&[&a, &c], 1)?;
         let mx = both.max_keepdim(1)?.detach();
         let lse = (both.broadcast_sub(&mx)?.exp()?.sum_keepdim(1)?.log()? + mx)?;
@@ -293,7 +293,7 @@ impl Runner {
                 }
                 let best_vocab = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
                 let score = |tok: usize| {
-                    (1.0 - g) * (row[tok] - mx).exp() / z + g * copy.get(&(tok as u32)).copied().unwrap_or(0.0)
+                    g * (row[tok] - mx).exp() / z + copy.get(&(tok as u32)).copied().unwrap_or(0.0)
                 };
                 let mut best = (best_vocab, score(best_vocab));
                 for &tok in copy.keys() {
