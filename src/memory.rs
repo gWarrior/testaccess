@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::bank::{Engram, EngramBank, Gathered, SlotMeta, SlotStatus, NO_ID};
+use crate::bank::{Engram, EngramBank, SlotMeta, SlotStatus, NO_ID};
 use crate::clock::{Clock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::dynamics::{self, Cand};
@@ -449,7 +449,7 @@ impl<P: Clone> SnnMemory<P> {
         if !self.cfg.homeostasis {
             return 1.0;
         }
-        let fan_out = self.fast.postings.len(neuron) + self.long.postings.len(neuron);
+        let fan_out = self.fast.fan_out(neuron) + self.long.fan_out(neuron);
         let total = self.fast.n_active() + self.long.n_active();
         (1.0 + (total as f32 + 1.0) / (fan_out as f32 + 1.0)).ln()
     }
@@ -462,7 +462,7 @@ impl<P: Clone> SnnMemory<P> {
     /// Returns the selected neurons, their gains and the total gain of the
     /// neurons left out (possible evidence the index did not look at).
     fn scan_plan(&self, cue: &[u32], gains: &[f32]) -> (Vec<u32>, Vec<f32>, f32) {
-        let fan_out = |n: u32| self.fast.postings.len(n) + self.long.postings.len(n);
+        let fan_out = |n: u32| self.fast.fan_out(n) + self.long.fan_out(n);
         let mut order: Vec<usize> = (0..cue.len()).collect();
         order.sort_by_key(|&i| fan_out(cue[i]));
         let (mut neurons, mut sel_gains, mut unscanned, mut spent) = (Vec::new(), Vec::new(), 0f32, 0usize);
@@ -621,24 +621,55 @@ impl<P: Clone> SnnMemory<P> {
         let gains = self.gains(code);
         let gsum: f32 = gains.iter().sum();
         let (scan, scan_gains, unscanned) = self.scan_plan(code, &gains);
-        let mut best: Option<(f32, Loc)> = None;
+        let mut pool: Vec<(f32, Loc)> = Vec::new();
         let mut found = Vec::new();
         for tier in TIERS {
             found.clear();
-            self.bank_mut(tier).gather(&scan, &scan_gains, now, Some(ctx), &mut found);
-            let bank = self.bank(tier);
-            for &Gathered { score, slot, .. } in &found {
-                if score + unscanned < 0.5 * thr * gsum {
-                    continue;
-                }
-                let m = dynamics::similarity(code, &gains, &bank.code(slot), &bank.weights(slot));
-                let sym = m.coverage.min(m.completeness);
-                if sym >= thr && best.map_or(true, |(s, _)| sym > s) {
-                    best = Some((sym, Loc { tier, slot }));
-                }
+            self.bank_mut(tier).gather(&scan, &scan_gains, &mut found);
+            pool.extend(
+                found
+                    .iter()
+                    .filter(|g| g.score + unscanned >= 0.5 * thr * gsum)
+                    .map(|g| (g.score, Loc { tier, slot: g.slot })),
+            );
+        }
+        let mut best: Option<(f32, Loc)> = None;
+        for (_, l) in self.select_live(&mut pool, now, Some(ctx), self.cfg.max_candidates) {
+            let bank = self.bank(l.tier);
+            let m = dynamics::similarity(code, &gains, &bank.code(l.slot), &bank.weights(l.slot));
+            let sym = m.coverage.min(m.completeness);
+            if sym >= thr && best.map_or(true, |(s, _)| sym > s) {
+                best = Some((sym, l));
             }
         }
         best.map(|(_, l)| l)
+    }
+
+    /// Up to `limit` live candidates (in `ctx`, if given) with the highest
+    /// index scores. Liveness is only checked for the best-scored slots,
+    /// widening the search window by 3x while too few are live.
+    fn select_live(&self, pool: &mut [(f32, Loc)], now: f64, ctx: Option<ContextId>, limit: usize) -> Vec<(f32, Loc)> {
+        let mut out = Vec::with_capacity(limit);
+        let (mut start, mut window) = (0, 3 * limit.max(1));
+        while out.len() < limit && start < pool.len() {
+            let rest = &mut pool[start..];
+            let w = window.min(rest.len());
+            if w < rest.len() {
+                rest.select_nth_unstable_by(w - 1, |a, b| b.0.total_cmp(&a.0));
+            }
+            rest[..w].sort_by(|a, b| b.0.total_cmp(&a.0));
+            for &(score, l) in &rest[..w] {
+                if out.len() == limit {
+                    break;
+                }
+                if self.bank(l.tier).accepts(l.slot, now, ctx) {
+                    out.push((score, l));
+                }
+            }
+            start += w;
+            window *= 3;
+        }
+        out
     }
 
     fn reinforce(
@@ -711,10 +742,17 @@ impl<P: Clone> SnnMemory<P> {
         let (mut best_exc, mut vetoed) = (0f32, false);
         for tier in TIERS {
             found.clear();
-            self.bank_mut(tier).gather(&scan, &scan_gains, now, opts.context, &mut found);
+            self.bank_mut(tier).gather(&scan, &scan_gains, &mut found);
+            let bank = self.bank(tier);
             for f in &found {
-                best_exc = best_exc.max(f.excitatory);
-                vetoed |= f.excitatory >= thr * gsum && f.score < thr * gsum;
+                // Only a running maximum is checked for liveness, so this
+                // costs O(log touched) metadata reads on average.
+                if f.excitatory > best_exc && bank.accepts(f.slot, now, opts.context) {
+                    best_exc = f.excitatory;
+                }
+                vetoed |= f.excitatory >= thr * gsum
+                    && f.score < thr * gsum
+                    && bank.accepts(f.slot, now, opts.context);
                 pool.push((f.score, Loc { tier, slot: f.slot }));
             }
         }
@@ -731,11 +769,7 @@ impl<P: Clone> SnnMemory<P> {
 
         let min_score = gsum * thr * self.cfg.prefilter - unscanned;
         pool.retain(|c| c.0 >= min_score);
-        let max_c = self.cfg.max_candidates;
-        if pool.len() > max_c {
-            pool.select_nth_unstable_by(max_c - 1, |a, b| b.0.total_cmp(&a.0));
-            pool.truncate(max_c);
-        }
+        let pool = self.select_live(&mut pool, now, opts.context, self.cfg.max_candidates);
         if pool.is_empty() {
             let (verdict, basis) = judge_miss(vetoed);
             return RecallResult::miss(cue.len(), verdict, basis, evidence);
@@ -1063,8 +1097,8 @@ impl<P: Clone> SnnMemory<P> {
             free_slots: self.fast.free_slots() + self.long.free_slots(),
             slots: self.fast.slots() + self.long.slots(),
             contexts: self.contexts.len(),
-            synapses: self.fast.postings.entries() + self.long.postings.entries(),
-            max_fan_out: self.fast.postings.max_len().max(self.long.postings.max_len()),
+            synapses: self.fast.synapses() + self.long.synapses(),
+            max_fan_out: self.fast.max_fan_out().max(self.long.max_fan_out()),
             working_traces: self.working.len(),
             learns: c.learns,
             recalls: c.recalls,

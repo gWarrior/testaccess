@@ -18,7 +18,7 @@
 //! bounded synapses) rather than a real-valued update.
 
 use crate::config::PlasticityConfig;
-use crate::index::{entry, entry_pos, entry_slot, PostingIndex, MAX_SLOTS};
+use crate::index::{entry, entry_slot, PostingIndex, MAX_SLOTS};
 use crate::rng::SplitMix64;
 use crate::trit::TritVec;
 use crate::types::{ContextId, MemoryId, Tier};
@@ -79,6 +79,15 @@ pub(crate) struct Engram<P> {
     pub payload: Option<P>,
 }
 
+/// Per-slot accumulator of the index stage (one cache line access per
+/// synapse visited).
+#[derive(Clone, Copy, Debug, Default)]
+struct Acc {
+    score: f32,
+    exc: f32,
+    stamp: u32,
+}
+
 /// Evidence one engram receives from a cue through its synapses.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Gathered {
@@ -100,11 +109,13 @@ pub(crate) struct EngramBank<P> {
     payload: Vec<Option<P>>,
     free: Vec<u32>,
     pending: Vec<u32>,
-    pub postings: PostingIndex,
+    /// Index of excitatory synapses by presynaptic neuron.
+    exc: PostingIndex,
+    /// Index of inhibitory synapses. Silent synapses are not indexed, so
+    /// the index stage never has to read a synapse state.
+    inh: PostingIndex,
     n_active: usize,
-    score: Vec<f32>,
-    exc: Vec<f32>,
-    stamp: Vec<u32>,
+    acc: Vec<Acc>,
     epoch: u32,
     touched: Vec<u32>,
     rng: SplitMix64,
@@ -121,11 +132,10 @@ impl<P> EngramBank<P> {
             payload: Vec::new(),
             free: Vec::new(),
             pending: Vec::new(),
-            postings: PostingIndex::new(n_neurons),
+            exc: PostingIndex::new(n_neurons),
+            inh: PostingIndex::new(n_neurons),
             n_active: 0,
-            score: Vec::new(),
-            exc: Vec::new(),
-            stamp: Vec::new(),
+            acc: Vec::new(),
             epoch: 0,
             touched: Vec::new(),
             rng: SplitMix64::new(0x5EED ^ width as u64),
@@ -164,9 +174,7 @@ impl<P> EngramBank<P> {
                 self.payload.push(None);
                 self.ens.extend(std::iter::repeat(NO_NEURON).take(self.width));
                 self.syn.extend_zeros(2 * self.width);
-                self.score.push(0.0);
-                self.exc.push(0.0);
-                self.stamp.push(0);
+                self.acc.push(Acc::default());
                 s
             }
         };
@@ -182,9 +190,42 @@ impl<P> EngramBank<P> {
         }
         self.meta[s] = SlotMeta { status: SlotStatus::Active, len: len as u32, ..e.meta };
         self.payload[s] = e.payload;
-        self.postings.add_engram(slot, &e.code);
+        for (pos, (&n, &t)) in e.code.iter().zip(&e.states).enumerate() {
+            self.index_add(n, slot, pos, t);
+        }
         self.n_active += 1;
         slot
+    }
+
+    fn index_add(&mut self, neuron: u32, slot: u32, pos: usize, state: i8) {
+        match state {
+            1 => self.exc.add(neuron, entry(slot, pos)),
+            -1 => self.inh.add(neuron, entry(slot, pos)),
+            _ => {}
+        }
+    }
+
+    fn index_remove(&mut self, neuron: u32, slot: u32, pos: usize, state: i8) {
+        match state {
+            1 => self.exc.remove(neuron, entry(slot, pos)),
+            -1 => self.inh.remove(neuron, entry(slot, pos)),
+            _ => true,
+        };
+    }
+
+    /// Synapses (excitatory + inhibitory) leaving `neuron`.
+    #[inline]
+    pub fn fan_out(&self, neuron: u32) -> usize {
+        self.exc.len(neuron) + self.inh.len(neuron)
+    }
+
+    /// Indexed (non-silent) synapses.
+    pub fn synapses(&self) -> usize {
+        self.exc.entries() + self.inh.entries()
+    }
+
+    pub fn max_fan_out(&self) -> usize {
+        self.exc.max_len().max(self.inh.max_len())
     }
 
     #[inline]
@@ -281,7 +322,9 @@ impl<P> EngramBank<P> {
         neurons.sort_unstable();
         neurons.dedup();
         let meta = &self.meta;
-        self.postings.purge(&neurons, |s| meta[s as usize].status == SlotStatus::Deleted);
+        let dead = |s: u32| meta[s as usize].status == SlotStatus::Deleted;
+        self.exc.purge(&neurons, dead);
+        self.inh.purge(&neurons, dead);
 
         let n = self.pending.len();
         for slot in std::mem::take(&mut self.pending) {
@@ -296,66 +339,81 @@ impl<P> EngramBank<P> {
 
     /// Drop everything (O(neurons + slots)).
     pub fn clear(&mut self) {
-        *self = Self::new(self.tier, self.postings.n_neurons(), self.width);
+        *self = Self::new(self.tier, self.exc.n_neurons(), self.width);
     }
 
-    /// Clear the fast component of every synapse.
+    /// Clear the fast component of every synapse and re-index.
     pub fn reset_fast_weights(&mut self) {
         for i in 0..self.syn.len() / 2 {
             self.syn.set(2 * i + 1, 0);
         }
+        let n = self.exc.n_neurons();
+        self.exc = PostingIndex::new(n);
+        self.inh = PostingIndex::new(n);
+        let slots: Vec<u32> = self.active_slots().collect();
+        for slot in slots {
+            let base = slot as usize * self.width;
+            for pos in 0..self.meta[slot as usize].len as usize {
+                let (neuron, state) = (self.ens[base + pos] as u32, Self::eff(&self.syn, base + pos));
+                self.index_add(neuron, slot, pos, state);
+            }
+        }
     }
 
-    /// Index stage: accumulate the signed, gain-weighted input every live
-    /// engram receives from the cue through its synapses, for live engrams
-    /// passing the context filter.
-    pub fn gather(
-        &mut self,
-        cue: &[u32],
-        gains: &[f32],
-        now: f64,
-        ctx: Option<ContextId>,
-        out: &mut Vec<Gathered>,
-    ) {
+    /// Whether `slot` is live and belongs to `ctx` (if given).
+    #[inline]
+    pub fn accepts(&self, slot: u32, now: f64, ctx: Option<ContextId>) -> bool {
+        let m = &self.meta[slot as usize];
+        m.status == SlotStatus::Active && m.expires > now && ctx.map_or(true, |c| c == m.ctx)
+    }
+
+    /// Index stage: accumulate the signed, gain-weighted input every engram
+    /// receives from the cue through its excitatory and inhibitory synapses.
+    /// Appends every touched slot; liveness is checked later, and only for
+    /// the few best candidates (see [`accepts`](Self::accepts)).
+    pub fn gather(&mut self, cue: &[u32], gains: &[f32], out: &mut Vec<Gathered>) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            self.stamp.fill(0);
+            self.acc.iter_mut().for_each(|a| a.stamp = 0);
             self.epoch = 1;
         }
-        let Self { postings, score, exc, stamp, epoch, touched, meta, syn, width, .. } = self;
+        let Self { exc, inh, acc, epoch, touched, .. } = self;
+        let mut visit = |list: &[u32], dscore: f32, dexc: f32| {
+            for &e in list {
+                let s = entry_slot(e);
+                let a = &mut acc[s as usize];
+                if a.stamp != *epoch {
+                    *a = Acc { score: 0.0, exc: 0.0, stamp: *epoch };
+                    touched.push(s);
+                }
+                a.score += dscore;
+                a.exc += dexc;
+            }
+        };
         for (&n, &g) in cue.iter().zip(gains) {
-            for &e in postings.list(n) {
-                let s = entry_slot(e) as usize;
-                let w = Self::eff(syn, s * *width + entry_pos(e));
-                if w == 0 {
-                    continue;
-                }
-                if stamp[s] != *epoch {
-                    stamp[s] = *epoch;
-                    score[s] = 0.0;
-                    exc[s] = 0.0;
-                    touched.push(s as u32);
-                }
-                score[s] += g * w as f32;
-                if w > 0 {
-                    exc[s] += g;
-                }
-            }
+            visit(exc.list(n), g, g);
+            visit(inh.list(n), -g, 0.0);
         }
-        for &s in touched.iter() {
-            let m = &meta[s as usize];
-            if m.status == SlotStatus::Active && m.expires > now && ctx.map_or(true, |c| c == m.ctx) {
-                out.push(Gathered { score: score[s as usize], excitatory: exc[s as usize], slot: s });
-            }
-        }
+        out.extend(touched.iter().map(|&s| {
+            let a = acc[s as usize];
+            Gathered { score: a.score, excitatory: a.exc, slot: s }
+        }));
         touched.clear();
     }
 
-    /// Move the effective state of position `idx` to `target` by changing
-    /// the fast component only.
-    fn set_effective(&mut self, idx: usize, target: i8) {
+    /// Move the effective state of `pos` in `slot` towards `target` by
+    /// changing the fast component only, keeping the index in sync.
+    fn set_state(&mut self, slot: u32, pos: usize, target: i8) {
+        let idx = slot as usize * self.width + pos;
+        let old = Self::eff(&self.syn, idx);
         let slow = self.syn.get(2 * idx);
         self.syn.set(2 * idx + 1, (target - slow).clamp(-1, 1));
+        let new = Self::eff(&self.syn, idx);
+        if new != old {
+            let neuron = self.ens[idx] as u32;
+            self.index_remove(neuron, slot, pos, old);
+            self.index_add(neuron, slot, pos, new);
+        }
     }
 
     /// A free position, or else the first silent synapse, if any. Silent
@@ -371,14 +429,15 @@ impl<P> EngramBank<P> {
         let base = slot as usize * self.width;
         let len = self.meta[slot as usize].len as usize;
         if pos < len {
-            self.postings.remove(self.ens[base + pos] as u32, entry(slot, pos));
+            let old = Self::eff(&self.syn, base + pos);
+            self.index_remove(self.ens[base + pos] as u32, slot, pos, old);
         } else {
             self.meta[slot as usize].len += 1;
         }
         self.ens[base + pos] = n as u16;
         self.syn.set(2 * (base + pos), 0);
-        self.set_effective(base + pos, target);
-        self.postings.add(n, entry(slot, pos));
+        self.syn.set(2 * (base + pos) + 1, target);
+        self.index_add(n, slot, pos, target);
     }
 
     /// Reinforce an existing engram with a new presentation `cue` (sorted).
@@ -399,9 +458,9 @@ impl<P> EngramBank<P> {
             let w = Self::eff(&self.syn, idx);
             let active = cue.binary_search(&(self.ens[idx] as u32)).is_ok();
             if active && w < 1 && self.chance(cfg.p_potentiate) {
-                self.set_effective(idx, w + 1);
+                self.set_state(slot, i, w + 1);
             } else if !active && w == 1 && self.chance(cfg.p_depress) {
-                self.set_effective(idx, 0);
+                self.set_state(slot, i, 0);
             }
         }
         let mut present = self.code(slot);
@@ -432,7 +491,7 @@ impl<P> EngramBank<P> {
             match (0..len).find(|&i| self.ens[base + i] as u32 == n) {
                 Some(i) if Self::eff(&self.syn, base + i) == 1 => {}
                 Some(i) if Self::eff(&self.syn, base + i) == 0 => {
-                    self.set_effective(base + i, -1);
+                    self.set_state(slot, i, -1);
                     changed += 1;
                 }
                 Some(_) => {}
@@ -454,10 +513,11 @@ impl<P> EngramBank<P> {
     pub fn bytes(&self) -> usize {
         self.ens.capacity() * 2
             + self.syn.bytes()
-            + (self.score.capacity() + self.exc.capacity() + self.stamp.capacity()) * 4
+            + self.acc.capacity() * std::mem::size_of::<Acc>()
             + self.meta.capacity() * std::mem::size_of::<SlotMeta>()
             + self.payload.capacity() * std::mem::size_of::<Option<P>>()
-            + self.postings.bytes()
+            + self.exc.bytes()
+            + self.inh.bytes()
     }
 }
 
@@ -471,7 +531,8 @@ mod tests {
 
     fn gather(bank: &mut EngramBank<&'static str>, cue: &[u32]) -> Vec<(f32, u32)> {
         let mut out = Vec::new();
-        bank.gather(cue, &vec![1.0; cue.len()], 0.0, None, &mut out);
+        bank.gather(cue, &vec![1.0; cue.len()], &mut out);
+        out.retain(|g| bank.accepts(g.slot, 0.0, None));
         let mut v: Vec<(f32, u32)> = out.iter().map(|g| (g.score, g.slot)).collect();
         v.sort_by_key(|&(_, s)| s);
         v
@@ -494,7 +555,7 @@ mod tests {
         assert_eq!(b.payload(a), None);
 
         assert_eq!(b.cleanup(), 1);
-        assert_eq!(b.postings.entries(), 4);
+        assert_eq!(b.synapses(), 4);
         let d = b.insert(engram(3, &[7, 8]));
         assert_eq!(d, a, "freed slot is reused");
         assert_eq!(b.code(c), &[3, 4, 5, 6], "other engram untouched");
@@ -514,7 +575,7 @@ mod tests {
         let code = b.code(s).to_vec();
         assert!(code.contains(&10) && code.contains(&11) && code.contains(&12), "{code:?}");
         assert_eq!(b.states(s).iter().filter(|&&w| w == 1).count(), 6);
-        assert!(b.postings.list(3).is_empty() && b.postings.list(4).is_empty());
+        assert_eq!(b.fan_out(3) + b.fan_out(4), 0, "replaced synapses are unindexed");
     }
 
     #[test]

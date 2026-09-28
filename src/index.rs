@@ -2,7 +2,7 @@
 //!
 //! `lists[n]` holds one entry per synapse leaving neuron `n`. An entry packs
 //! the target engram slot and the synapse's position inside that engram's
-//! ensemble (`slot << 8 | pos`), so the synapse state can be read in O(1).
+//! ensemble (`slot << 8 | pos`).
 //! The store doubles as the fast candidate index (concept §10): a query only
 //! touches the synapses of its own active neurons, so retrieval cost scales
 //! with their fan-out, not with the number of memories.
@@ -23,7 +23,7 @@ pub(crate) fn entry_slot(e: u32) -> u32 {
     e >> 8
 }
 
-#[inline]
+#[cfg(test)]
 pub(crate) fn entry_pos(e: u32) -> usize {
     (e & 0xFF) as usize
 }
@@ -40,13 +40,6 @@ impl PostingIndex {
 
     pub fn n_neurons(&self) -> u32 {
         self.lists.len() as u32
-    }
-
-    /// Connect neuron `code[i]` to position `i` of `slot`.
-    pub fn add_engram(&mut self, slot: u32, code: &[u32]) {
-        for (pos, &n) in code.iter().enumerate() {
-            self.add(n, entry(slot, pos));
-        }
     }
 
     pub fn add(&mut self, neuron: u32, e: u32) {
@@ -119,9 +112,11 @@ mod tests {
     #[test]
     fn add_remove_purge() {
         let mut idx = PostingIndex::new(27);
-        idx.add_engram(0, &[1, 2, 3]);
-        idx.add_engram(1, &[2, 3, 4]);
-        idx.add_engram(2, &[3]);
+        for (slot, code) in [(0, &[1, 2, 3][..]), (1, &[2, 3, 4]), (2, &[3])] {
+            for (pos, &n) in code.iter().enumerate() {
+                idx.add(n, entry(slot, pos));
+            }
+        }
         assert_eq!(idx.entries(), 7);
         let slots: Vec<u32> = idx.list(3).iter().map(|&e| entry_slot(e)).collect();
         assert_eq!(slots, vec![0, 1, 2]);
