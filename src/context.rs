@@ -519,7 +519,8 @@ impl ContextMemory {
         //    one chunk; candidates are verified exactly.
         let probe_len = l.min(self.cfg.chunk_size - self.cfg.stride + 1);
         let mut snn_verdict = Verdict::Unknown;
-        for offset in [0, l - probe_len] {
+        let offsets = if probe_len == l { vec![0] } else { vec![0, l - probe_len] };
+        for offset in offsets {
             let probe = &fragment[offset..offset + probe_len];
             let r = self.retrieve(Probe::Tokens(probe), self.cfg.top_k)?;
             snn_verdict = r.verdict;
