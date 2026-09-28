@@ -343,7 +343,9 @@ fn lr_at(cfg: &TrainConfig, step: usize, elapsed: f64) -> f64 {
     } else {
         (step - cfg.warmup) as f64 / (cfg.steps - cfg.warmup).max(1) as f64
     };
-    cfg.lr * (0.1 + 0.9 * 0.5 * (1.0 + (std::f64::consts::PI * p.min(1.0)).cos()))
+    // The floor stays high: with 2-trit weights and a straight-through
+    // estimator a small lr freezes the levels.
+    cfg.lr * (0.4 + 0.6 * 0.5 * (1.0 + (std::f64::consts::PI * p.min(1.0)).cos()))
 }
 
 /// Scale gradients so that their global norm is at most `max`.
