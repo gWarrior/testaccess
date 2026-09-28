@@ -133,6 +133,31 @@ impl TritVec {
         }
     }
 
+    /// A copy of trits `start..end`.
+    pub fn slice(&self, start: usize, end: usize) -> Self {
+        assert!(start <= end && end <= self.len);
+        let len = end - start;
+        if start % TRITS_PER_BYTE == 0 {
+            let b = start / TRITS_PER_BYTE;
+            let mut bytes = self.bytes[b..b + len.div_ceil(TRITS_PER_BYTE)].to_vec();
+            // Zero the unused trits of the last byte.
+            let tail = len % TRITS_PER_BYTE;
+            if let (Some(last), true) = (bytes.last_mut(), tail != 0) {
+                let mut v = *last as i16;
+                for k in tail..TRITS_PER_BYTE {
+                    v -= DECODE[*last as usize][k] as i16 * POW3[k] as i16;
+                }
+                *last = v as u8;
+            }
+            return Self { bytes, len };
+        }
+        let mut out = Self::zeros(len);
+        for i in 0..len {
+            out.set(i, self.get(start + i));
+        }
+        out
+    }
+
     /// The packed storage as 64-bit words of 40 trits each.
     pub fn words(&self) -> Vec<u64> {
         self.bytes
@@ -211,6 +236,15 @@ mod tests {
         let words = v.words();
         assert_eq!(words.len(), n.div_ceil(TRITS_PER_WORD));
         assert_eq!(TritVec::from_words(&words, n).unwrap(), v);
+
+        for (a, b) in [(0, n), (5, 500), (3, 777), (10, 11), (995, 1000)] {
+            let sl = v.slice(a, b);
+            assert_eq!(sl.len(), b - a);
+            assert!((a..b).all(|i| sl.get(i - a) == model[i]), "slice {a}..{b}");
+            let mut grown = sl.clone();
+            grown.extend_zeros(9);
+            assert!((b - a..b - a + 9).all(|i| grown.get(i) == 0), "tail must be zero after {a}..{b}");
+        }
 
         v.extend_zeros(7);
         assert_eq!(v.get(n + 6), 0);
