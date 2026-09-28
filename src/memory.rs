@@ -1081,9 +1081,10 @@ impl<P: Clone> SnnMemory<P> {
         &self.working.last_state
     }
 
-    /// Recently activated memories, newest first.
+    /// Recently activated live memories, newest first.
     pub fn recent(&self) -> Vec<MemoryId> {
-        self.working.recent().collect()
+        let mut seen = std::collections::HashSet::new();
+        self.working.recent().filter(|&id| self.contains(id) && seen.insert(id)).collect()
     }
 
     pub fn stats(&self) -> Stats {

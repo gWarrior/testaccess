@@ -64,9 +64,10 @@ impl WorkingMemory {
         }
     }
 
+    /// O(1): the id may linger in [`recent`](Self::recent); callers filter
+    /// out memories that no longer exist.
     pub fn forget(&mut self, id: MemoryId) {
         self.traces.remove(&id);
-        self.recent.retain(|&r| r != id);
     }
 
     pub fn clear(&mut self) {
