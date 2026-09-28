@@ -18,7 +18,8 @@ pub struct DynamicsConfig {
     pub rate_decay: f32,
     /// Let active engrams reinstate their full ensemble (pattern completion).
     pub completion: bool,
-    /// Rate trace above which an engram drives completion.
+    /// Rate trace above which an engram counts as active: it drives
+    /// completion and the inhibitory interneuron.
     pub completion_min_rate: f32,
     /// Synapses weaker than this (relative, mean 1) do not complete.
     pub completion_min_weight: f32,
@@ -30,10 +31,10 @@ impl Default for DynamicsConfig {
             enabled: true,
             steps: 12,
             tau_m: 4.0,
-            inhibition: 0.3,
-            rate_decay: 0.7,
+            inhibition: 0.5,
+            rate_decay: 0.8,
             completion: true,
-            completion_min_rate: 0.25,
+            completion_min_rate: 0.05,
             completion_min_weight: 0.5,
         }
     }
