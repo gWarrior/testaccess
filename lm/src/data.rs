@@ -236,6 +236,9 @@ pub struct TaskStream {
     /// Probability of starting an episode at a token.
     pub p_episode: f64,
     pub distance: (usize, usize),
+    /// After each document, jump to a random document of the whole corpus
+    /// (every topic of the corpus, not only this stream's region).
+    pub jump: bool,
 }
 
 impl TaskStream {
@@ -250,6 +253,7 @@ impl TaskStream {
             carry: None,
             p_episode: 1.0 / 2187.0,
             distance: (243, 19_683),
+            jump: false,
         }
     }
 
@@ -276,6 +280,14 @@ impl TaskStream {
         }
         let t = tokens[self.start + self.pos % self.len] as u32;
         self.pos += 1;
+        if self.jump && t == crate::tokenizer::DOC {
+            // Land on the start of a random document.
+            let mut p = self.rng.below(tokens.len() as u64) as usize;
+            while p < tokens.len() && tokens[p] as u32 != crate::tokenizer::DOC {
+                p += 1;
+            }
+            (self.start, self.len, self.pos) = (0, tokens.len(), (p + 1) % tokens.len());
+        }
         (t, false)
     }
 
