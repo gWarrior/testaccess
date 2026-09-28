@@ -71,6 +71,32 @@ impl SplitMix64 {
     }
 }
 
+/// Zipf-distributed ranks `0..n` (`P(r) ∝ 1 / (r + 1)^s`), a stand-in for
+/// natural-language token frequencies in tests and benchmarks.
+#[derive(Clone, Debug)]
+pub struct Zipf {
+    cdf: Vec<f64>,
+}
+
+impl Zipf {
+    pub fn new(n: usize, s: f64) -> Self {
+        let mut acc = 0.0;
+        let mut cdf: Vec<f64> = (0..n)
+            .map(|r| {
+                acc += 1.0 / ((r + 1) as f64).powf(s);
+                acc
+            })
+            .collect();
+        cdf.iter_mut().for_each(|c| *c /= acc);
+        Self { cdf }
+    }
+
+    pub fn sample(&self, rng: &mut SplitMix64) -> usize {
+        let u = rng.next_f64();
+        self.cdf.partition_point(|&c| c < u).min(self.cdf.len() - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +110,21 @@ mod tests {
             assert!(a.below(10) < 10);
             b.below(10);
         }
+    }
+
+    #[test]
+    fn zipf_prefers_low_ranks() {
+        let z = Zipf::new(729, 1.0);
+        let mut r = SplitMix64::new(2);
+        let mut counts = [0usize; 3];
+        for _ in 0..6561 {
+            let k = z.sample(&mut r);
+            assert!(k < 729);
+            if k < 3 {
+                counts[k] += 1;
+            }
+        }
+        assert!(counts[0] > counts[1] && counts[1] > counts[2]);
     }
 
     #[test]
