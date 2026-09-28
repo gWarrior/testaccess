@@ -9,17 +9,21 @@
 
 pub mod clock;
 pub mod config;
+pub mod encoder;
+pub mod memory;
 pub mod rng;
 pub mod types;
-
-pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
-pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
-pub mod encoder;
 
 mod bank;
 mod dynamics;
 mod index;
 mod working;
 
+pub use clock::{Clock, ManualClock, SystemClock};
+pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
+pub use memory::{
+    BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult, SnnMemory,
+    Stats,
+};
+pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
