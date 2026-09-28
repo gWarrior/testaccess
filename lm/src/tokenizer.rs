@@ -185,11 +185,8 @@ impl Tokenizer {
     fn encode_word(&self, word: &str, out: &mut Vec<u32>) {
         let mut syms: Vec<u32> = word.bytes().map(u32::from).collect();
         loop {
-            let best = syms
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, p)| self.ranks.get(&(p[0], p[1])).map(|&r| (r, i)))
-                .min();
+            let best =
+                syms.windows(2).enumerate().filter_map(|(i, p)| self.ranks.get(&(p[0], p[1])).map(|&r| (r, i))).min();
             let Some((r, i)) = best else { break };
             syms[i] = N_BYTES + N_SPECIAL + r;
             syms.remove(i + 1);
@@ -247,7 +244,10 @@ impl Tokenizer {
         let merges = (0..n)
             .map(|i| {
                 let o = 8 + i * 8;
-                (u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()), u32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()))
+                (
+                    u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()),
+                    u32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()),
+                )
             })
             .collect();
         Ok(Self::from_merges(merges))
@@ -258,7 +258,8 @@ impl Tokenizer {
 mod tests {
     use super::*;
 
-    const TEXT: &str = "Жила-была кошка. Кошка любила молоко, а молоко любило кошку!\nВ 2024 году кошка ушла.\n\nКонец.";
+    const TEXT: &str =
+        "Жила-была кошка. Кошка любила молоко, а молоко любило кошку!\nВ 2024 году кошка ушла.\n\nКонец.";
 
     #[test]
     fn pretokenize_is_lossless() {

@@ -12,19 +12,47 @@ use candle_nn::{Init, VarBuilder};
 /// Largest magnitude of a two-trit weight (balanced ternary `±(3 + 1)`).
 pub const LEVELS: f64 = 4.0;
 
-/// Quantize to two trits per weight (per-row scale), with STE.
+/// Quantization step relative to the row's mean |w|. For Gaussian weights
+/// a 9-level uniform quantizer has minimal squared error at a step of about
+/// 0.55 σ = 0.69 · mean|w|: coarser steps round too many weights to zero,
+/// finer ones clip too many at ±4.
+const STEP: f64 = 0.69;
+
+/// Per-row step, rounded to a power of two so dequantization is a shift.
+/// Clamped far from f32 underflow.
+fn row_step(w: &Tensor) -> Result<Tensor> {
+    let s = w.abs()?.mean_keepdim(D::Minus1)?.affine(STEP, 0.0)?.clamp(1e-30, f64::MAX)?;
+    let e = (s.log()? / std::f64::consts::LN_2)?.round()?;
+    (e * std::f64::consts::LN_2)?.exp()
+}
+
+/// Quantize to two trits per weight (power-of-two row step), with STE.
 pub fn quant2(w: &Tensor) -> Result<Tensor> {
-    let scale = w.abs()?.mean_keepdim(D::Minus1)?.clamp(1e-8, f64::MAX)?;
-    let q = w.broadcast_div(&scale)?.round()?.clamp(-LEVELS, LEVELS)?.broadcast_mul(&scale)?;
+    let step = row_step(w)?;
+    let q = w.broadcast_div(&step)?.round()?.clamp(-LEVELS, LEVELS)?.broadcast_mul(&step)?;
     w + (q - w)?.detach()
 }
 
-/// Integer levels and per-row scales of a weight matrix, for export.
+/// Integer levels and per-row power-of-two steps of a weight matrix.
 pub fn quant2_levels(w: &Tensor) -> Result<(Vec<i8>, Vec<f32>)> {
-    let scale = w.abs()?.mean_keepdim(D::Minus1)?.clamp(1e-8, f64::MAX)?;
-    let q = w.broadcast_div(&scale)?.round()?.clamp(-LEVELS, LEVELS)?;
+    let step = row_step(w)?;
+    let q = w.broadcast_div(&step)?.round()?.clamp(-LEVELS, LEVELS)?;
     let levels = q.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|x| x as i8).collect();
-    Ok((levels, scale.flatten_all()?.to_vec1::<f32>()?))
+    Ok((levels, step.flatten_all()?.to_vec1::<f32>()?))
+}
+
+/// Fractions of weights rounded to zero and clipped at ±4, and the relative
+/// quantization error ‖q − w‖ / ‖w‖.
+pub fn quant2_health(w: &Tensor) -> Result<(f64, f64, f64)> {
+    let step = row_step(w)?;
+    let x = w.broadcast_div(&step)?;
+    let n = w.elem_count() as f64;
+    let zero = x.abs()?.lt(0.5)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64 / n;
+    let clip = x.abs()?.gt(LEVELS + 0.5)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64 / n;
+    let q = x.round()?.clamp(-LEVELS, LEVELS)?.broadcast_mul(&step)?;
+    let err = (q - w)?.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+    let norm = w.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+    Ok((zero, clip, (err / norm.max(1e-30)).sqrt()))
 }
 
 /// Binary sign with STE (used for the Hadamard recurrence).
@@ -45,8 +73,58 @@ impl TLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        x.broadcast_matmul(&quant2(&self.w)?.t()?)
+        linear(x, &quant2(&self.w)?)
     }
+}
+
+/// `x · wᵀ` for `x` of any rank and `w: (out, in)`, as one autograd node
+/// whose backward uses contiguous operands (`candle`'s generic matmul
+/// backward multiplies strided transposes, which is ~10× slower on CPU).
+pub fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let k = *dims.last().expect("rank >= 1");
+    let y = x.reshape((x.elem_count() / k, k))?.contiguous()?.apply_op2(&w.contiguous()?, MatMulNT)?;
+    let mut out = dims;
+    *out.last_mut().expect("rank >= 1") = w.dim(0)?;
+    y.reshape(out)
+}
+
+struct MatMulNT;
+
+impl candle_core::CustomOp2 for MatMulNT {
+    fn name(&self) -> &'static str {
+        "matmul-nt"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &candle_core::CpuStorage,
+        l1: &candle_core::Layout,
+        s2: &candle_core::CpuStorage,
+        l2: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let y = cpu_tensor(s1, l1)?.matmul(&cpu_tensor(s2, l2)?.t()?.contiguous()?)?;
+        Ok((candle_core::CpuStorage::F32(y.flatten_all()?.to_vec1()?), y.shape().clone()))
+    }
+
+    fn bwd(&self, x: &Tensor, w: &Tensor, _res: &Tensor, g: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let (x, w, g) = (x.detach(), w.detach(), g.detach().contiguous()?);
+        let dx = g.matmul(&w)?;
+        let dw = g.t()?.contiguous()?.matmul(&x)?;
+        Ok((Some(dx), Some(dw)))
+    }
+}
+
+/// `x · w` for `x` of any rank, as a single 2-D matrix product (a batched
+/// broadcast matmul would expand `w` per batch in the backward pass).
+pub fn matmul_2d(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let k = *dims.last().expect("rank >= 1");
+    let rows = x.elem_count() / k;
+    let y = x.reshape((rows, k))?.matmul(w)?;
+    let mut out = dims;
+    *out.last_mut().expect("rank >= 1") = w.dim(1)?;
+    y.reshape(out)
 }
 
 /// Root-mean-square normalisation with a learned gain.
@@ -120,23 +198,90 @@ impl HadamCell {
         })
     }
 
+    fn recurrence(&self) -> Result<Tensor> {
+        self.h
+            .broadcast_mul(&ste_sign(&self.sign)?.unsqueeze(1)?)?
+            .broadcast_mul(&candle_nn::ops::sigmoid(&self.gain)?.unsqueeze(0)?)?
+            .contiguous()
+    }
+
     /// `x`: `(B, T, d)`, `h0`: `(B, d)`. Returns outputs and the last state.
     pub fn forward(&self, x: &Tensor, h0: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, t, _) = x.dims3()?;
-        let u = self.wu.forward(x)?;
+        let u = self.wu.forward(x)?.contiguous()?;
         let z = candle_nn::ops::sigmoid(&self.wz.forward(x)?)?;
-        let rec = self
-            .h
-            .broadcast_mul(&ste_sign(&self.sign)?.unsqueeze(1)?)?
-            .broadcast_mul(&candle_nn::ops::sigmoid(&self.gain)?.unsqueeze(0)?)?;
-        let mut h = h0.clone();
-        let mut hs = Vec::with_capacity(t);
-        for i in 0..t {
-            h = (h.matmul(&rec)? + u.narrow(1, i, 1)?.squeeze(1)?)?.tanh()?;
-            hs.push(h.clone());
+        let hs = u.apply_op2(&self.recurrence()?, HadamScan { h0: h0.detach() })?;
+        let last = hs.narrow(1, t - 1, 1)?.squeeze(1)?;
+        Ok(((hs * z)?, last))
+    }
+}
+
+/// `H = scan(U, R)`: `h_t = tanh(h_{t-1} R + u_t)` over a window, as one
+/// autograd node with hand-written back-propagation through time.
+///
+/// Expressing the loop with ordinary tensor ops makes every step's
+/// backward allocate a gradient the size of the whole window; here the
+/// backward pass runs one reverse loop for `dA_t = (dH_t + dA_{t+1} Rᵀ) ⊙
+/// (1 − h_t²)` and gets `dU = dA` and `dR = H_prevᵀ dA` from a single
+/// matrix product.
+struct HadamScan {
+    h0: Tensor,
+}
+
+fn cpu_tensor(s: &candle_core::CpuStorage, l: &candle_core::Layout) -> Result<Tensor> {
+    let (a, b) =
+        l.contiguous_offsets().ok_or_else(|| candle_core::Error::Msg("hadam-scan needs contiguous inputs".into()))?;
+    Tensor::from_slice(&s.as_slice::<f32>()?[a..b], l.shape(), &Device::Cpu)
+}
+
+fn scan(u: &Tensor, r: &Tensor, h0: &Tensor) -> Result<Tensor> {
+    let (_, t, _) = u.dims3()?;
+    let ut = u.transpose(0, 1)?.contiguous()?;
+    let mut h = h0.clone();
+    let mut hs = Vec::with_capacity(t);
+    for i in 0..t {
+        h = (h.matmul(r)? + ut.get(i)?)?.tanh()?;
+        hs.push(h.clone());
+    }
+    Tensor::stack(&hs, 1)
+}
+
+impl candle_core::CustomOp2 for HadamScan {
+    fn name(&self) -> &'static str {
+        "hadam-scan"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &candle_core::CpuStorage,
+        l1: &candle_core::Layout,
+        s2: &candle_core::CpuStorage,
+        l2: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let hs = scan(&cpu_tensor(s1, l1)?, &cpu_tensor(s2, l2)?, &self.h0)?;
+        Ok((candle_core::CpuStorage::F32(hs.flatten_all()?.to_vec1()?), hs.shape().clone()))
+    }
+
+    fn bwd(&self, _u: &Tensor, r: &Tensor, res: &Tensor, grad: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let (b, t, d) = res.dims3()?;
+        let (res, grad) = (res.detach(), grad.detach());
+        let rt = r.detach().t()?.contiguous()?;
+        let hs = res.transpose(0, 1)?.contiguous()?;
+        let gs = grad.transpose(0, 1)?.contiguous()?;
+        let mut da_next = Tensor::zeros((b, d), DType::F32, res.device())?;
+        let mut das = Vec::with_capacity(t);
+        for i in (0..t).rev() {
+            let h = hs.get(i)?;
+            let dh = (gs.get(i)? + da_next.matmul(&rt)?)?;
+            let da = (dh * (1.0 - h.sqr()?)?)?;
+            das.push(da.clone());
+            da_next = da;
         }
-        let out = (Tensor::stack(&hs, 1)? * z)?;
-        Ok((out, h))
+        das.reverse();
+        let da = Tensor::stack(&das, 1)?;
+        let prev = Tensor::cat(&[self.h0.unsqueeze(1)?, res.narrow(1, 0, t - 1)?], 1)?;
+        let dr = prev.reshape((b * t, d))?.t()?.matmul(&da.reshape((b * t, d))?)?;
+        Ok((Some(da), Some(dr)))
     }
 }
 
@@ -170,7 +315,8 @@ impl Retention {
 
     fn masks(&self, t: usize, device: &Device) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let h = self.heads;
-        let (mut mask, mut cross, mut upd, mut total) = (vec![0f32; h * t * t], vec![0f32; h * t], vec![0f32; h * t], vec![0f32; h]);
+        let (mut mask, mut cross, mut upd, mut total) =
+            (vec![0f32; h * t * t], vec![0f32; h * t], vec![0f32; h * t], vec![0f32; h]);
         for (hi, &g) in self.decays.iter().enumerate() {
             for i in 0..t {
                 for j in 0..=i {
@@ -251,6 +397,36 @@ mod tests {
     }
 
     #[test]
+    fn quantization_neither_zeroes_nor_clips_too_much() {
+        let w = Tensor::randn(0f32, 0.05, (243, 729), &Device::Cpu).unwrap();
+        let (zero, clip, err) = quant2_health(&w).unwrap();
+        assert!(zero < 0.45 && clip < 0.02, "zero {zero:.3} clip {clip:.3}");
+        assert!(err < 0.2, "relative error {err:.3}");
+        let (_, steps) = quant2_levels(&w).unwrap();
+        assert!(steps.iter().all(|s| s.log2().fract() == 0.0), "steps are powers of two");
+        // Tiny weights are neither flushed to zero nor overflow.
+        let tiny = Tensor::randn(0f32, 1e-20, (3, 81), &Device::Cpu).unwrap();
+        let (zero, _, err) = quant2_health(&tiny).unwrap();
+        assert!(zero < 0.45 && err < 0.2, "tiny weights keep precision: zero {zero} err {err}");
+    }
+
+    #[test]
+    fn linear_matches_matmul_with_gradients() {
+        let dev = Device::Cpu;
+        let x = candle_core::Var::randn(0f32, 1.0, (2, 3, 9), &dev).unwrap();
+        let w = candle_core::Var::randn(0f32, 1.0, (4, 9), &dev).unwrap();
+        let a = linear(x.as_tensor(), w.as_tensor()).unwrap();
+        let b = x.as_tensor().broadcast_matmul(&w.as_tensor().t().unwrap()).unwrap();
+        let ga = a.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+        let gb = b.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+        let max = |t: Tensor| t.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(max((&a - &b).unwrap()) < 1e-4);
+        for v in [&x, &w] {
+            assert!(max((ga.get(v.as_tensor()).unwrap() - gb.get(v.as_tensor()).unwrap()).unwrap()) < 1e-3);
+        }
+    }
+
+    #[test]
     fn hadamard_is_orthonormal() {
         let h = hadamard(256, &Device::Cpu).unwrap();
         let eye = h.matmul(&h.t().unwrap()).unwrap();
@@ -280,6 +456,38 @@ mod tests {
     }
 
     #[test]
+    fn hadam_scan_gradients_match_autograd_loop() {
+        let dev = Device::Cpu;
+        let u = candle_core::Var::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
+        let r = candle_core::Var::randn(0f32, 0.3, (8, 8), &dev).unwrap();
+        let h0 = Tensor::randn(0f32, 0.5, (2, 8), &dev).unwrap();
+        let w = Tensor::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
+
+        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone() }).unwrap();
+        let g1 = (&fast * &w).unwrap().sum_all().unwrap().backward().unwrap();
+
+        let mut h = h0.clone();
+        let mut hs = Vec::new();
+        for i in 0..5 {
+            h = (h.matmul(r.as_tensor()).unwrap() + u.as_tensor().narrow(1, i, 1).unwrap().squeeze(1).unwrap())
+                .unwrap()
+                .tanh()
+                .unwrap();
+            hs.push(h.clone());
+        }
+        let slow = Tensor::stack(&hs, 1).unwrap();
+        let g2 = (&slow * &w).unwrap().sum_all().unwrap().backward().unwrap();
+
+        let max_diff =
+            |a: &Tensor, b: &Tensor| (a - b).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_diff(&fast, &slow) < 1e-5);
+        for v in [&u, &r] {
+            let d = max_diff(g1.get(v.as_tensor()).unwrap(), g2.get(v.as_tensor()).unwrap());
+            assert!(d < 1e-4, "gradient mismatch {d}");
+        }
+    }
+
+    #[test]
     fn hadam_cell_gradients_flow() {
         let dev = Device::Cpu;
         let vm = VarMap::new();
@@ -292,5 +500,78 @@ mod tests {
             let g = grads.get(v.as_tensor()).expect("every parameter gets a gradient");
             assert!(g.abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap() > 0.0);
         }
+    }
+}
+
+/// Fused softmax cross-entropy: per-row loss of `logits (N, V)` against
+/// `targets`, with the analytic gradient `softmax − onehot`.
+pub struct CrossEntropy {
+    pub targets: std::sync::Arc<Vec<u32>>,
+}
+
+impl candle_core::CustomOp1 for CrossEntropy {
+    fn name(&self) -> &'static str {
+        "cross-entropy"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s: &candle_core::CpuStorage,
+        l: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        use rayon::prelude::*;
+        let x = cpu_tensor(s, l)?;
+        let (n, v) = x.dims2()?;
+        let data = x.flatten_all()?.to_vec1::<f32>()?;
+        let losses: Vec<f32> = data
+            .par_chunks(v)
+            .zip(self.targets.par_iter())
+            .map(|(row, &t)| {
+                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let z: f32 = row.iter().map(|&a| (a - m).exp()).sum();
+                m + z.ln() - row[t as usize]
+            })
+            .collect();
+        debug_assert_eq!(losses.len(), n);
+        Ok((candle_core::CpuStorage::F32(losses), candle_core::Shape::from(n)))
+    }
+
+    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad: &Tensor) -> Result<Option<Tensor>> {
+        use rayon::prelude::*;
+        let (n, v) = arg.dims2()?;
+        let data = arg.detach().flatten_all()?.to_vec1::<f32>()?;
+        let g = grad.detach().to_vec1::<f32>()?;
+        let mut out = vec![0f32; n * v];
+        out.par_chunks_mut(v).zip(data.par_chunks(v)).enumerate().for_each(|(i, (o, row))| {
+            let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = row.iter().map(|&a| (a - m).exp()).sum();
+            for (oj, &a) in o.iter_mut().zip(row) {
+                *oj = (a - m).exp() / z * g[i];
+            }
+            o[self.targets[i] as usize] -= g[i];
+        });
+        Ok(Some(Tensor::from_vec(out, (n, v), arg.device())?))
+    }
+}
+
+#[cfg(test)]
+mod ce_tests {
+    use super::*;
+
+    #[test]
+    fn fused_cross_entropy_matches_log_softmax() {
+        let dev = Device::Cpu;
+        let x = candle_core::Var::randn(0f32, 2.0, (5, 9), &dev).unwrap();
+        let t = vec![0u32, 3, 8, 1, 1];
+        let fused = x.as_tensor().apply_op1(CrossEntropy { targets: std::sync::Arc::new(t.clone()) }).unwrap();
+        let g1 = fused.mean_all().unwrap().backward().unwrap();
+        let lp = candle_nn::ops::log_softmax(x.as_tensor(), 1).unwrap();
+        let idx = Tensor::from_vec(t, (5, 1), &dev).unwrap();
+        let slow = lp.gather(&idx, 1).unwrap().squeeze(1).unwrap().neg().unwrap();
+        let g2 = slow.mean_all().unwrap().backward().unwrap();
+        let d = (fused - slow).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(d < 1e-5);
+        let dg = (g1.get(x.as_tensor()).unwrap() - g2.get(x.as_tensor()).unwrap()).unwrap().abs().unwrap();
+        assert!(dg.max_all().unwrap().to_scalar::<f32>().unwrap() < 1e-5);
     }
 }

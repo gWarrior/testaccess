@@ -103,7 +103,9 @@ impl RowStore {
         debug_assert_eq!(row.len(), self.dim);
         match &mut self.rows {
             Rows::F32(v) => v.extend_from_slice(row),
-            Rows::F16(v) => v.extend(row.iter().map(|&x| f32_to_f16(x))),
+            // Clamp to the f16 range so large values saturate instead of
+            // becoming infinities.
+            Rows::F16(v) => v.extend(row.iter().map(|&x| f32_to_f16(x.clamp(-65_504.0, 65_504.0)))),
             Rows::Ternary { trits, scales } => {
                 let scale = row.iter().map(|x| x.abs()).sum::<f32>() / self.dim as f32;
                 let start = trits.len();

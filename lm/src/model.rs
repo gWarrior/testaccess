@@ -125,7 +125,8 @@ pub struct Model {
 impl Model {
     pub fn new(vb: VarBuilder, cfg: Config) -> Result<Self> {
         let d = cfg.d;
-        let emb = vb.get_with_hints((cfg.vocab, d), "emb", Init::Randn { mean: 0.0, stdev: 1.0 / (d as f64).sqrt() })?;
+        let emb =
+            vb.get_with_hints((cfg.vocab, d), "emb", Init::Randn { mean: 0.0, stdev: 1.0 / (d as f64).sqrt() })?;
         let layers = (0..cfg.layers)
             .map(|i| {
                 let vb = vb.pp(format!("l{i}"));
@@ -210,7 +211,7 @@ impl Model {
         let verdict = verdict.broadcast_as((b, nb, blk, self.cfg.d))?.reshape((b, t, self.cfg.d))?;
         let x = ((&tr.x + o)? + verdict)?;
         let emb = quant2(&self.emb)?;
-        rms(&self.nout.forward(&x)?)?.broadcast_matmul(&emb.t()?)
+        crate::layers::linear(&rms(&self.nout.forward(&x)?)?, &emb)
     }
 
     /// Number of trainable parameters.
