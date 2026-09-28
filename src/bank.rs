@@ -109,6 +109,16 @@ pub(crate) struct Engram<P> {
     pub payload: Option<P>,
 }
 
+/// Evidence one engram receives from a cue through its synapses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Gathered {
+    /// Signed gain-weighted input (inhibitory synapses subtract).
+    pub score: f32,
+    /// Gain-weighted input through excitatory synapses only.
+    pub excitatory: f32,
+    pub slot: u32,
+}
+
 pub(crate) struct EngramBank<P> {
     tier: Tier,
     width: usize,
@@ -121,6 +131,7 @@ pub(crate) struct EngramBank<P> {
     pub postings: PostingIndex,
     n_active: usize,
     score: Vec<f32>,
+    exc: Vec<f32>,
     stamp: Vec<u32>,
     epoch: u32,
     touched: Vec<u32>,
@@ -141,6 +152,7 @@ impl<P> EngramBank<P> {
             postings: PostingIndex::new(n_neurons),
             n_active: 0,
             score: Vec::new(),
+            exc: Vec::new(),
             stamp: Vec::new(),
             epoch: 0,
             touched: Vec::new(),
@@ -181,6 +193,7 @@ impl<P> EngramBank<P> {
                 self.ens.extend(std::iter::repeat(NO_NEURON).take(self.width));
                 self.syn.extend(std::iter::repeat(0).take(self.width));
                 self.score.push(0.0);
+                self.exc.push(0.0);
                 self.stamp.push(0);
                 s
             }
@@ -307,8 +320,8 @@ impl<P> EngramBank<P> {
     }
 
     /// Index stage: accumulate the signed, gain-weighted input every live
-    /// engram receives from the cue through its synapses. Appends
-    /// `(score, slot)` for live engrams passing the context filter.
+    /// engram receives from the cue through its synapses, for live engrams
+    /// passing the context filter.
     pub fn gather(
         &mut self,
         cue: &[u32],
@@ -316,14 +329,14 @@ impl<P> EngramBank<P> {
         now: f64,
         ctx: Option<ContextId>,
         max_scan: usize,
-        out: &mut Vec<(f32, u32)>,
+        out: &mut Vec<Gathered>,
     ) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.stamp.fill(0);
             self.epoch = 1;
         }
-        let Self { postings, score, stamp, epoch, touched, meta, syn, width, .. } = self;
+        let Self { postings, score, exc, stamp, epoch, touched, meta, syn, width, .. } = self;
         for (&n, &g) in cue.iter().zip(gains) {
             let list = postings.list(n);
             if list.len() > max_scan {
@@ -338,15 +351,19 @@ impl<P> EngramBank<P> {
                 if stamp[s] != *epoch {
                     stamp[s] = *epoch;
                     score[s] = 0.0;
+                    exc[s] = 0.0;
                     touched.push(s as u32);
                 }
                 score[s] += g * w as f32;
+                if w > 0 {
+                    exc[s] += g;
+                }
             }
         }
         for &s in touched.iter() {
             let m = &meta[s as usize];
             if m.status == SlotStatus::Active && m.expires > now && ctx.map_or(true, |c| c == m.ctx) {
-                out.push((score[s as usize], s));
+                out.push(Gathered { score: score[s as usize], excitatory: exc[s as usize], slot: s });
             }
         }
         touched.clear();
@@ -453,7 +470,7 @@ impl<P> EngramBank<P> {
     pub fn bytes(&self) -> usize {
         self.ens.capacity() * 4
             + self.syn.capacity()
-            + (self.score.capacity() + self.stamp.capacity()) * 4
+            + (self.score.capacity() + self.exc.capacity() + self.stamp.capacity()) * 4
             + self.meta.capacity() * std::mem::size_of::<SlotMeta>()
             + self.payload.capacity() * std::mem::size_of::<Option<P>>()
             + self.postings.bytes()
@@ -471,8 +488,9 @@ mod tests {
     fn gather(bank: &mut EngramBank<&'static str>, cue: &[u32]) -> Vec<(f32, u32)> {
         let mut out = Vec::new();
         bank.gather(cue, &vec![1.0; cue.len()], 0.0, None, usize::MAX, &mut out);
-        out.sort_by_key(|&(_, s)| s);
-        out
+        let mut v: Vec<(f32, u32)> = out.iter().map(|g| (g.score, g.slot)).collect();
+        v.sort_by_key(|&(_, s)| s);
+        v
     }
 
     fn certain() -> PlasticityConfig {

@@ -42,8 +42,6 @@ pub(crate) struct Outcome {
     /// Feed-forward similarity at `t = 0`: signed fraction of the cue
     /// explained (inhibitory synapses count against).
     pub similarity: f32,
-    /// Same, counting excitatory synapses only.
-    pub excitatory: f32,
     /// Fraction of the engram's excitatory synapses present in the cue.
     pub completeness: f32,
     pub spikes: u32,
@@ -139,13 +137,7 @@ pub(crate) fn settle(
         .zip(&sim0)
         .map(|(c, &similarity)| {
             let m = self::similarity(cue, &cue_gains, &c.code, &c.w);
-            Outcome {
-                similarity,
-                excitatory: m.excitatory,
-                completeness: m.completeness,
-                spikes: 0,
-                first_spike: None,
-            }
+            Outcome { similarity, completeness: m.completeness, spikes: 0, first_spike: None }
         })
         .collect();
 
@@ -290,6 +282,5 @@ mod tests {
         assert_eq!((m.coverage, m.excitatory), (0.0, 0.5));
         let s = settle(&cue, &[a], &|_| 1.0, 0.3, &DynamicsConfig::default());
         assert_eq!(s.outcomes[0].spikes, 0);
-        assert_eq!(s.outcomes[0].excitatory, 0.5);
     }
 }

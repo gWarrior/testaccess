@@ -23,7 +23,7 @@ fn ttl_expires_then_cleans_up() {
     clock.advance(9.0);
     assert_eq!(mem.recall(Input::Code(&a), &opts()).unwrap().id(), Some(ia));
     clock.advance(2.0);
-    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_unknown(), "expired memory is silent");
+    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_miss(), "expired memory is silent");
     assert!(!mem.contains(ia));
 
     let report = mem.maintain();
@@ -38,7 +38,7 @@ fn default_ttl_applies() {
     let a = random_code(&mut SplitMix64::new(11));
     mem.learn(Input::Code(&a), LearnOptions::new()).unwrap();
     clock.advance(6.0);
-    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_miss());
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn reset_fast_memory_keeps_long_term() {
     assert!(!mem.consolidate(ic).unwrap());
 
     assert_eq!(mem.reset_fast_memory(), 1);
-    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&a), &opts()).unwrap().is_miss());
     assert!(!mem.contains(ia));
     for (code, id) in [(&b, ib), (&c, ic)] {
         let hit = mem.recall(Input::Code(code), &opts()).unwrap();
@@ -62,7 +62,7 @@ fn reset_fast_memory_keeps_long_term() {
     }
 
     mem.reset_all();
-    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_miss());
     assert!(mem.is_empty());
 }
 

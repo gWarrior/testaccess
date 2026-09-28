@@ -90,6 +90,10 @@ pub struct MemoryConfig {
     /// Minimal similarity (fraction of the cue explained) to recall anything;
     /// below it the answer is UNKNOWN.
     pub recall_threshold: f32,
+    /// Evidence below which the memory answers "definitely not": no stored
+    /// memory explains even this fraction of the cue. Between
+    /// `reject_threshold` and `recall_threshold` the answer is "unknown".
+    pub reject_threshold: f32,
     /// Index-stage pre-filter, as a fraction of `recall_threshold`.
     pub prefilter: f32,
     /// Neurons with more synapses than this are skipped by the index stage
@@ -119,6 +123,7 @@ impl Default for MemoryConfig {
             max_ensemble: 64,
             max_candidates: 32,
             recall_threshold: 0.3,
+            reject_threshold: 0.15,
             prefilter: 0.5,
             max_scan: 100_000,
             homeostasis: true,
@@ -144,6 +149,9 @@ impl MemoryConfig {
         }
         if !(self.recall_threshold > 0.0 && self.recall_threshold <= 1.0) {
             return bad("recall_threshold must be in (0, 1]");
+        }
+        if !(0.0..=self.recall_threshold).contains(&self.reject_threshold) {
+            return bad("reject_threshold must be in [0, recall_threshold]");
         }
         if !(0.0..=1.0).contains(&self.prefilter) {
             return bad("prefilter must be in [0, 1]");

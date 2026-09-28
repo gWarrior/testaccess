@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::bank::{Engram, EngramBank, SlotMeta, SlotStatus, NO_ID};
+use crate::bank::{Engram, EngramBank, Gathered, SlotMeta, SlotStatus, NO_ID};
 use crate::clock::{Clock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::dynamics::{self, Cand};
@@ -32,6 +32,8 @@ pub struct LearnOptions<P> {
     pub ttl: Option<f64>,
     /// Store directly in long-term memory, protected from resets and TTL.
     pub pin: bool,
+    /// Negative knowledge: recalling this memory answers "definitely not".
+    pub negative: bool,
     /// Override the novelty check (`None` = enabled iff configured).
     pub dedupe: Option<bool>,
     /// Link this memory as the successor of `after` (temporal association).
@@ -40,7 +42,15 @@ pub struct LearnOptions<P> {
 
 impl<P> Default for LearnOptions<P> {
     fn default() -> Self {
-        Self { context: ContextId::DEFAULT, payload: None, ttl: None, pin: false, dedupe: None, after: None }
+        Self {
+            context: ContextId::DEFAULT,
+            payload: None,
+            ttl: None,
+            pin: false,
+            negative: false,
+            dedupe: None,
+            after: None,
+        }
     }
 }
 
@@ -62,6 +72,11 @@ impl<P> LearnOptions<P> {
     }
     pub fn pin(mut self) -> Self {
         self.pin = true;
+        self
+    }
+    /// Mark the memory as negative knowledge ("this is false / absent").
+    pub fn negative(mut self) -> Self {
+        self.negative = true;
         self
     }
     pub fn dedupe(mut self, on: bool) -> Self {
@@ -139,6 +154,8 @@ pub struct Hit<P> {
     pub tier: Tier,
     pub created: f64,
     pub strength: f32,
+    /// `+1` ordinary memory, `-1` negative knowledge.
+    pub polarity: i8,
     /// The completed pattern (the engram's full ensemble).
     pub pattern: Vec<u32>,
     pub payload: Option<P>,
@@ -146,9 +163,52 @@ pub struct Hit<P> {
     pub sequence: Vec<MemoryId>,
 }
 
-/// Result of a recall. Empty `hits` means UNKNOWN.
+/// Ternary answer of the memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    /// `+1` — "уверен": a memory settled into its attractor.
+    Known,
+    /// `0` — "не знаю": partial evidence, nothing recalled.
+    Unknown,
+    /// `-1` — "точно нет": evidence of absence.
+    Absent,
+}
+
+impl Verdict {
+    /// The verdict as a trit: `+1`, `0` or `-1`.
+    pub fn trit(self) -> i8 {
+        match self {
+            Verdict::Known => 1,
+            Verdict::Unknown => 0,
+            Verdict::Absent => -1,
+        }
+    }
+}
+
+/// Why the memory answered the way it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Basis {
+    /// A stored memory matched the cue (`Known`).
+    Match,
+    /// The recalled memory is negative knowledge (`Absent`).
+    NegativeKnowledge,
+    /// No stored memory explains even `reject_threshold` of the cue
+    /// (`Absent`). For n-gram codes this proves the fragment is not stored.
+    NoEvidence,
+    /// A memory would match, but its inhibitory synapses veto this cue
+    /// (`Absent`), see [`SnnMemory::suppress`].
+    Inhibited,
+    /// Some memories partially match, none convincingly (`Unknown`).
+    Partial,
+}
+
+/// Result of a recall.
 #[derive(Clone, Debug)]
 pub struct RecallResult<P> {
+    pub verdict: Verdict,
+    pub basis: Basis,
+    /// Upper bound on the fraction of the cue any stored memory explains.
+    pub evidence: f32,
     pub hits: Vec<Hit<P>>,
     /// Candidates the index passed to the spiking stage.
     pub candidates: usize,
@@ -158,8 +218,8 @@ pub struct RecallResult<P> {
 }
 
 impl<P> RecallResult<P> {
-    fn unknown(cue_size: usize) -> Self {
-        Self { hits: Vec::new(), candidates: 0, settle_step: 0, cue_size }
+    fn miss(cue_size: usize, verdict: Verdict, basis: Basis, evidence: f32) -> Self {
+        Self { verdict, basis, evidence, hits: Vec::new(), candidates: 0, settle_step: 0, cue_size }
     }
     pub fn best(&self) -> Option<&Hit<P>> {
         self.hits.first()
@@ -167,8 +227,15 @@ impl<P> RecallResult<P> {
     pub fn id(&self) -> Option<MemoryId> {
         self.best().map(|h| h.id)
     }
-    pub fn is_unknown(&self) -> bool {
+    /// Nothing was recalled (the verdict is `Unknown` or `Absent`).
+    pub fn is_miss(&self) -> bool {
         self.hits.is_empty()
+    }
+    pub fn is_known(&self) -> bool {
+        self.verdict == Verdict::Known
+    }
+    pub fn is_absent(&self) -> bool {
+        self.verdict == Verdict::Absent
     }
 }
 
@@ -184,6 +251,8 @@ pub struct MemoryRecord<'a, P> {
     pub strength: f32,
     pub recalls: u32,
     pub pinned: bool,
+    /// `+1` ordinary memory, `-1` negative knowledge.
+    pub polarity: i8,
     pub prev: Option<MemoryId>,
     pub next: Option<MemoryId>,
     pub pattern: &'a [u32],
@@ -461,6 +530,7 @@ impl<P: Clone> SnnMemory<P> {
                 payload: payloads.as_mut().and_then(Iterator::next),
                 ttl: opts.ttl,
                 pin: false,
+                negative: false,
                 dedupe: opts.dedupe,
                 after: prev,
             };
@@ -501,7 +571,7 @@ impl<P: Clone> SnnMemory<P> {
             strength: 1.0,
             recalls: 0,
             pinned: opts.pin,
-            polarity: 1,
+            polarity: if opts.negative { -1 } else { 1 },
             prev: NO_ID,
             next: NO_ID,
             len: code.len() as u32,
@@ -532,7 +602,7 @@ impl<P: Clone> SnnMemory<P> {
             found.clear();
             self.bank_mut(tier).gather(code, &gains, now, Some(ctx), max_scan, &mut found);
             let bank = self.bank(tier);
-            for &(score, slot) in &found {
+            for &Gathered { score, slot, .. } in &found {
                 if score < 0.5 * thr * gsum {
                     continue;
                 }
@@ -561,6 +631,13 @@ impl<P: Clone> SnnMemory<P> {
             bank.set_payload(l.slot, p);
         }
         let m = &mut bank.meta[l.slot as usize];
+        let polarity = if opts.negative { -1 } else { 1 };
+        if m.polarity != polarity {
+            // Belief revision: the same pattern now carries the opposite
+            // polarity; the newest statement wins and starts over.
+            m.polarity = polarity;
+            m.strength = 0.0;
+        }
         m.strength += 1.0;
         if l.tier == Tier::Fast {
             m.expires = deadline;
@@ -590,22 +667,49 @@ impl<P: Clone> SnnMemory<P> {
 
     fn recall_code(&mut self, cue: &[u32], opts: &RecallOptions) -> RecallResult<P> {
         let now = self.clock.now();
-        let thr = self.cfg.recall_threshold;
-        if opts.top_k == 0 || opts.context.is_some_and(|c| self.check_context(c).is_err()) {
-            return RecallResult::unknown(cue.len());
+        let (thr, reject) = (self.cfg.recall_threshold, self.cfg.reject_threshold);
+        if opts.context.is_some_and(|c| self.check_context(c).is_err()) {
+            return RecallResult::miss(cue.len(), Verdict::Absent, Basis::NoEvidence, 0.0);
+        }
+        if opts.top_k == 0 {
+            return RecallResult::miss(cue.len(), Verdict::Unknown, Basis::Partial, 0.0);
         }
 
-        // Stage 1: index. Gain-weighted overlap through the cue's synapses.
+        // Stage 1: index. Gain-weighted input through the cue's synapses.
         let gains = self.gains(cue);
         let gsum: f32 = gains.iter().sum();
         let max_scan = self.cfg.max_scan;
+        // Saturated neurons are skipped by the index; count them as possible
+        // evidence so that "definitely not" stays sound.
+        let unscanned: f32 = cue
+            .iter()
+            .zip(&gains)
+            .filter(|(&n, _)| self.fast.postings.len(n) > max_scan || self.long.postings.len(n) > max_scan)
+            .map(|(_, g)| g)
+            .sum();
         let mut pool: Vec<(f32, Loc)> = Vec::new();
         let mut found = Vec::new();
+        let (mut best_exc, mut vetoed) = (0f32, false);
         for tier in TIERS {
             found.clear();
             self.bank_mut(tier).gather(cue, &gains, now, opts.context, max_scan, &mut found);
-            pool.extend(found.iter().map(|&(s, slot)| (s, Loc { tier, slot })));
+            for f in &found {
+                best_exc = best_exc.max(f.excitatory);
+                vetoed |= f.excitatory >= thr * gsum && f.score < thr * gsum;
+                pool.push((f.score, Loc { tier, slot: f.slot }));
+            }
         }
+        let evidence = if gsum > 0.0 { ((best_exc + unscanned) / gsum).min(1.0) } else { 0.0 };
+        let judge_miss = |vetoed: bool| {
+            if evidence < reject {
+                (Verdict::Absent, Basis::NoEvidence)
+            } else if vetoed {
+                (Verdict::Absent, Basis::Inhibited)
+            } else {
+                (Verdict::Unknown, Basis::Partial)
+            }
+        };
+
         let min_score = gsum * thr * self.cfg.prefilter;
         pool.retain(|c| c.0 >= min_score);
         let max_c = self.cfg.max_candidates;
@@ -614,7 +718,8 @@ impl<P: Clone> SnnMemory<P> {
             pool.truncate(max_c);
         }
         if pool.is_empty() {
-            return RecallResult::unknown(cue.len());
+            let (verdict, basis) = judge_miss(vetoed);
+            return RecallResult::miss(cue.len(), verdict, basis, evidence);
         }
 
         // Stage 2: spiking dynamics over the candidates.
@@ -668,6 +773,7 @@ impl<P: Clone> SnnMemory<P> {
                     tier: l.tier,
                     created: m.created,
                     strength: m.strength,
+                    polarity: m.polarity,
                     pattern: cands[j].code.clone(),
                     payload: self.bank(l.tier).payload(l.slot).cloned(),
                     sequence: self.successors(m.id, opts.follow, now),
@@ -685,7 +791,20 @@ impl<P: Clone> SnnMemory<P> {
                 self.on_recalled(best.id);
             }
         }
-        RecallResult { hits, candidates: pool.len(), settle_step: settled.settle_step, cue_size: cue.len() }
+        let (verdict, basis) = match hits.first() {
+            Some(h) if h.polarity < 0 => (Verdict::Absent, Basis::NegativeKnowledge),
+            Some(_) => (Verdict::Known, Basis::Match),
+            None => judge_miss(vetoed),
+        };
+        RecallResult {
+            verdict,
+            basis,
+            evidence,
+            hits,
+            candidates: pool.len(),
+            settle_step: settled.settle_step,
+            cue_size: cue.len(),
+        }
     }
 
     fn on_recalled(&mut self, id: MemoryId) {
@@ -724,6 +843,19 @@ impl<P: Clone> SnnMemory<P> {
         self.counters.forgets += 1;
         self.maybe_cleanup();
         true
+    }
+
+    /// Anti-Hebbian correction ("this cue is *not* that memory"): cue
+    /// neurons that are not excitatory inputs of `id` get inhibitory
+    /// synapses, so this cue no longer recalls `id` and is answered with
+    /// `Absent` / `Inhibited` instead. The memory itself stays recallable
+    /// from its own pattern. Returns the number of inhibitory synapses.
+    pub fn suppress(&mut self, id: MemoryId, cue: Input<'_>) -> Result<usize, MemoryError> {
+        let code = self.encode(cue)?;
+        let now = self.clock.now();
+        let l = self.live_loc(id, now).ok_or(MemoryError::UnknownMemory(id))?;
+        let max_new = self.cfg.plasticity.max_new_synapses.max(code.len());
+        Ok(self.bank_mut(l.tier).inhibit(l.slot, &code, max_new))
     }
 
     /// Forget every memory of a context. Long-term memories are kept unless
@@ -856,6 +988,7 @@ impl<P: Clone> SnnMemory<P> {
             strength: m.strength,
             recalls: m.recalls,
             pinned: m.pinned,
+            polarity: m.polarity,
             prev: opt(m.prev),
             next: opt(m.next),
             pattern: bank.code(l.slot),

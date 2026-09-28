@@ -84,14 +84,14 @@ fn test4_selective_forgetting() {
     assert!(!mem.forget(ib), "second forget is a no-op");
 
     assert_eq!(mem.recall(Input::Code(&a), &opts()).unwrap().id(), Some(ia));
-    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_unknown(), "B must be UNKNOWN");
+    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_miss(), "B must be UNKNOWN");
     assert_eq!(mem.recall(Input::Code(&c), &opts()).unwrap().id(), Some(ic));
 
     // Physical cleanup must not change the answers either.
     mem.maintain();
     assert_eq!(mem.stats().pending_cleanup, 0);
     assert_eq!(mem.recall(Input::Code(&a), &opts()).unwrap().id(), Some(ia));
-    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&b), &opts()).unwrap().is_miss());
     assert_eq!(mem.recall(Input::Code(&c), &opts()).unwrap().id(), Some(ic));
 }
 
@@ -108,11 +108,11 @@ fn test5_context_reset() {
     assert_eq!(mem.reset_context(c1, false), 2);
 
     let in1 = RecallOptions::in_context(c1);
-    assert!(mem.recall(Input::Code(&a), &in1).unwrap().is_unknown());
-    assert!(mem.recall(Input::Code(&b), &in1).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&a), &in1).unwrap().is_miss());
+    assert!(mem.recall(Input::Code(&b), &in1).unwrap().is_miss());
     assert_eq!(mem.recall(Input::Code(&c), &RecallOptions::in_context(c2)).unwrap().id(), Some(ic));
     // Context isolation: C is not visible from context 1.
-    assert!(mem.recall(Input::Code(&c), &in1).unwrap().is_unknown());
+    assert!(mem.recall(Input::Code(&c), &in1).unwrap().is_miss());
 }
 
 /// Many similar patterns: families of variants sharing 60% of a prototype.
@@ -156,7 +156,7 @@ fn test6_interference() {
 
     // Unseen random patterns must not be recalled.
     let false_hits = (0..500)
-        .filter(|_| !mem.recall(Input::Code(&random_code(&mut rng)), &opts()).unwrap().is_unknown())
+        .filter(|_| !mem.recall(Input::Code(&random_code(&mut rng)), &opts()).unwrap().is_miss())
         .count();
     assert_eq!(false_hits, 0);
 

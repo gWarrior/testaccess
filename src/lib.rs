@@ -24,8 +24,8 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
 pub use memory::{
-    BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult, SnnMemory,
-    Stats,
+    Basis, BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult,
+    SnnMemory, Stats, Verdict,
 };
 pub use shared::{MaintenanceHandle, SharedMemory};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
