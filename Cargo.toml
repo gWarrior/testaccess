@@ -7,6 +7,9 @@ description = "Fast spiking-neural-network memory: one-shot learn, associative r
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[workspace]
+members = [".", "lm"]
+
 [dependencies]
 rayon = "1.10"
 
