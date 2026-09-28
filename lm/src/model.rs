@@ -288,8 +288,7 @@ impl Model {
         let gv = self.gate_verdict.index_select(&mem.verdict.flatten_all()?, 0)?.reshape((b, nb, 1))?;
         let gv = gv.broadcast_as((b, nb, blk))?.reshape((b, t))?;
         let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + gv)?;
-        let point =
-            candle_nn::ops::softmax(&Tensor::cat(&[&p_local, &p_far, &null.unsqueeze(2)?], 2)?, D::Minus1)?;
+        let point = candle_nn::ops::softmax(&Tensor::cat(&[&p_local, &p_far, &null.unsqueeze(2)?], 2)?, D::Minus1)?;
         let gate = point.narrow(2, t + mm, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
     }
@@ -327,13 +326,13 @@ mod tests {
         let mut rows = vec![vec![(Vec::new(), Vec::new(), 1u32, Vec::new()); 3]; 2];
         rows[0][1] = (vec![0.5; 9], vec![1.0; 9], 0, vec![3]);
         let h = model.head(&tr, &MemBatch::from_rows(&rows, 9, &dev).unwrap()).unwrap();
-        let loss = (h.logits.sqr().unwrap().mean_all().unwrap()
-            + h.point.narrow(2, 0, 9).unwrap().sum_all().unwrap())
-        .unwrap();
+        let loss = (h.logits.sqr().unwrap().mean_all().unwrap() + h.point.narrow(2, 0, 9).unwrap().sum_all().unwrap())
+            .unwrap();
         let grads = loss.backward().unwrap();
         for (name, var) in vm.data().lock().unwrap().iter() {
             if ["mq", "mk", "pq", "gate_w"].iter().any(|p| name.starts_with(p)) {
-                let g = grads.get(var.as_tensor()).map(|g| g.abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap());
+                let g =
+                    grads.get(var.as_tensor()).map(|g| g.abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap());
                 assert!(g.is_some_and(|g| g > 0.0), "{name}: no gradient ({g:?})");
             }
         }

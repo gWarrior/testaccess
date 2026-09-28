@@ -296,9 +296,8 @@ impl Runner {
                     }
                 }
                 let best_vocab = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-                let score = |tok: usize| {
-                    g * (row[tok] - mx).exp() / z + copy.get(&(tok as u32)).copied().unwrap_or(0.0)
-                };
+                let score =
+                    |tok: usize| g * (row[tok] - mx).exp() / z + copy.get(&(tok as u32)).copied().unwrap_or(0.0);
                 let mut best = (best_vocab, score(best_vocab));
                 for &tok in copy.keys() {
                     let sc = score(tok as usize);
@@ -321,7 +320,11 @@ impl Runner {
             let k = out.trunk.k.flatten_all()?.to_vec1::<f32>()?;
             let v = out.trunk.v.flatten_all()?.to_vec1::<f32>()?;
             self.memories.par_iter_mut().enumerate().for_each(|(bi, m)| {
-                m.write(&x[bi * t..(bi + 1) * t], &k[bi * t * dim..(bi + 1) * t * dim], &v[bi * t * dim..(bi + 1) * t * dim])
+                m.write(
+                    &x[bi * t..(bi + 1) * t],
+                    &k[bi * t * dim..(bi + 1) * t * dim],
+                    &v[bi * t * dim..(bi + 1) * t * dim],
+                )
             });
         }
         Ok(())
