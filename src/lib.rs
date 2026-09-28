@@ -8,10 +8,12 @@
 //! dynamics, and forgotten selectively without disturbing other memories.
 
 pub mod clock;
+pub mod config;
 pub mod rng;
 pub mod types;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
 pub mod encoder;
 
