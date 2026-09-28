@@ -133,3 +133,145 @@ mod tests {
         assert!(s.next(&tokens, 9).is_none());
     }
 }
+
+/// Long-range recall episodes woven into a token stream:
+/// `… Секретное слово — X. … (D tokens) … Какое было секретное слово? — X. …`
+/// The answer can only be produced by remembering the key `D` tokens back.
+pub struct Episodes {
+    keys: Vec<Vec<u32>>,
+    intros: Vec<Vec<u32>>,
+    questions: Vec<Vec<u32>>,
+    end: Vec<u32>,
+}
+
+const KEY_WORDS: &[&str] = &[
+    "яблоко", "маяк", "комета", "сова", "якорь", "ландыш", "фонарь", "кит", "гроза", "ключ", "янтарь", "лиса", "мост",
+    "ракета", "колокол", "роза", "пустыня", "дракон", "единорог", "лабиринт", "зеркало", "корона", "мельница",
+    "черника", "вулкан", "парус", "подсолнух", "бархан", "самовар", "метель", "клевер", "жемчуг", "олень", "сфинкс",
+    "компас", "малахит", "водопад", "граната", "бумеранг", "сирень", "айсберг", "фламинго", "кедр", "трамвай",
+    "шахматы", "каштан", "радуга", "полынь", "медведь", "чайник", "кувшин", "туман", "огурец", "барабан", "орёл",
+];
+
+impl Episodes {
+    pub fn new(tok: &crate::tokenizer::Tokenizer) -> Self {
+        let mut keys: Vec<Vec<u32>> = KEY_WORDS.iter().map(|w| tok.encode(&format!(" {w}"))).collect();
+        keys.extend((0..81).map(|i| tok.encode(&format!(" {}", 1000 + (i * 7919) % 9000))));
+        let intros = ["\nСекретное слово —", "\nЗапомни пароль:", "\nКод доступа:"].iter().map(|s| tok.encode(s)).collect();
+        let questions =
+            ["\nКакое было секретное слово? —", "\nКакой был пароль? —", "\nНапомни код доступа:"].iter().map(|s| tok.encode(s)).collect();
+        Self { keys, intros, questions, end: tok.encode(".\n") }
+    }
+
+    /// `(intro tokens, question tokens, answer tokens)` of a random episode.
+    pub fn sample(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let key = &self.keys[rng.below(self.keys.len() as u64) as usize];
+        let kind = rng.below(self.intros.len() as u64) as usize;
+        let intro = [&self.intros[kind][..], key, &self.end].concat();
+        (intro, self.questions[kind].clone(), [&key[..], &self.end].concat())
+    }
+}
+
+/// A token stream over a region of the corpus with recall episodes.
+pub struct TaskStream {
+    start: usize,
+    len: usize,
+    pos: usize,
+    rng: snn_memory::rng::SplitMix64,
+    pending: std::collections::VecDeque<(u32, bool)>,
+    question: Option<(usize, Vec<u32>, Vec<u32>)>,
+    carry: Option<(u32, bool)>,
+    /// Probability of starting an episode at a token.
+    pub p_episode: f64,
+    pub distance: (usize, usize),
+}
+
+impl TaskStream {
+    pub fn new(start: usize, len: usize, seed: u64) -> Self {
+        Self {
+            start,
+            len,
+            pos: 0,
+            rng: snn_memory::rng::SplitMix64::new(seed),
+            pending: Default::default(),
+            question: None,
+            carry: None,
+            p_episode: 1.0 / 2187.0,
+            distance: (243, 19_683),
+        }
+    }
+
+    /// Next token and whether it is an episode answer token.
+    fn next(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, bool) {
+        if let Some(t) = self.pending.pop_front() {
+            return t;
+        }
+        if let Some((left, q, a)) = &mut self.question {
+            if *left == 0 {
+                self.pending.extend(q.iter().map(|&t| (t, false)));
+                self.pending.extend(a.iter().map(|&t| (t, true)));
+                self.question = None;
+                return self.pending.pop_front().expect("question is not empty");
+            }
+            *left -= 1;
+        } else if self.p_episode > 0.0 && self.rng.next_f64() < self.p_episode {
+            let (intro, q, a) = ep.sample(&mut self.rng);
+            let (lo, hi) = self.distance;
+            let d = lo + self.rng.below((hi - lo + 1) as u64) as usize;
+            self.pending.extend(intro.into_iter().map(|t| (t, false)));
+            self.question = Some((d, q, a));
+            return self.pending.pop_front().expect("intro is not empty");
+        }
+        let t = tokens[self.start + self.pos % self.len] as u32;
+        self.pos += 1;
+        (t, false)
+    }
+
+    /// `window + 1` tokens continuing the stream (the first is the last of
+    /// the previous call), with answer flags.
+    pub fn window(&mut self, tokens: &[u16], ep: &Episodes, window: usize) -> (Vec<u32>, Vec<bool>) {
+        let first = self.carry.take().unwrap_or_else(|| self.next(tokens, ep));
+        let mut out = vec![first.0];
+        let mut ans = vec![first.1];
+        for _ in 0..window {
+            let (t, a) = self.next(tokens, ep);
+            out.push(t);
+            ans.push(a);
+        }
+        self.carry = Some((out[window], ans[window]));
+        (out, ans)
+    }
+}
+
+#[cfg(test)]
+mod episode_tests {
+    use super::*;
+    use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn episodes_repeat_the_key_after_the_distance() {
+        let tok = Tokenizer::train(&"Жили-были кот и пёс. Секретное слово — маяк. Код доступа 1234.\n".repeat(30), 400);
+        let ep = Episodes::new(&tok);
+        let filler: Vec<u16> = (0..2000).map(|i| 300 + (i % 50) as u16).collect();
+        let mut s = TaskStream::new(0, filler.len(), 3);
+        s.p_episode = 1.0 / 300.0;
+        s.distance = (243, 243);
+        let (mut all, mut ans) = (Vec::new(), Vec::new());
+        let mut prev_last = None;
+        for _ in 0..27 {
+            let (w, a) = s.window(&filler, &ep, 81);
+            if let Some(p) = prev_last {
+                assert_eq!(w[0], p, "windows overlap by one token");
+            }
+            prev_last = Some(w[81]);
+            all.extend_from_slice(&w[..81]);
+            ans.extend_from_slice(&a[..81]);
+        }
+        let text = tok.decode(&all);
+        let asked = text.matches("?").count() + text.matches("Напомни").count();
+        assert!(asked >= 2, "questions were asked: {text}");
+        assert!(ans.iter().any(|&a| a), "answer tokens are flagged");
+        // Every flagged answer repeats tokens that appeared earlier.
+        let first = ans.iter().position(|&a| a).unwrap();
+        assert!(all[..first].contains(&all[first]));
+    }
+}
