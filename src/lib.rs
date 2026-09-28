@@ -14,6 +14,7 @@ pub mod context;
 pub mod encoder;
 pub mod kv;
 pub mod memory;
+pub mod persist;
 pub mod rng;
 pub mod shared;
 pub mod trit;
@@ -36,6 +37,7 @@ pub use memory::{
     Basis, BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult,
     SnnMemory, Stats, Verdict,
 };
+pub use persist::{Persist, SnapshotScope};
 pub use shared::{MaintenanceHandle, SharedMemory};
 pub use trit::{TritVec, Tryte};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};

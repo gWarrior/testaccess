@@ -25,6 +25,16 @@ pub trait Encoder: Send + Sync {
 
     /// Appends the active neurons for `input` to `out` (sorted, unique).
     fn encode(&self, input: Input<'_>, out: &mut Vec<u32>) -> Result<(), MemoryError>;
+
+    /// Identifies the encoder's configuration. Snapshots store it so that
+    /// memories are only restored under an encoder producing the same codes.
+    fn fingerprint(&self) -> u64 {
+        mix64(0xC0DE ^ self.n_neurons() as u64)
+    }
+}
+
+fn fold(h: u64, x: u64) -> u64 {
+    mix64(h ^ x.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 /// Bit 31 of a FlyHash connectivity word: the weight is `-1`.
@@ -90,6 +100,7 @@ pub struct FlyHashEncoder {
     /// Fixed per-neuron priority used to break activation ties.
     priority: Vec<u32>,
     center: Option<Vec<f32>>,
+    seed: u64,
 }
 
 impl FlyHashEncoder {
@@ -156,6 +167,7 @@ impl FlyHashEncoder {
             inv_sign,
             priority,
             center: None,
+            seed,
         })
     }
 
@@ -272,6 +284,16 @@ impl Encoder for FlyHashEncoder {
         }
     }
 
+    fn fingerprint(&self) -> u64 {
+        let mut h = fold(0xF1A5, self.seed);
+        for x in [self.input_dim as u64, self.n_neurons as u64, self.k as u64, self.fan_in as u64] {
+            h = fold(h, x);
+        }
+        for &c in self.center.iter().flatten() {
+            h = fold(h, c.to_bits() as u64);
+        }
+        h
+    }
 }
 
 /// Streaming k-winners-take-all: keeps the `k` most active neurons seen so
@@ -426,6 +448,16 @@ impl Encoder for NGramEncoder {
         Ok(())
     }
 
+    fn fingerprint(&self) -> u64 {
+        let mut h = fold(0x6_4A3, self.seed);
+        for x in [self.n_neurons as u64, self.per_feature as u64] {
+            h = fold(h, x);
+        }
+        for &n in &self.ngrams {
+            h = fold(h, n as u64);
+        }
+        h
+    }
 }
 
 #[cfg(test)]

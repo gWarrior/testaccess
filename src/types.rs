@@ -56,6 +56,10 @@ pub enum MemoryError {
     UnknownContext(ContextId),
     /// The engram bank has no free slots left.
     CapacityExceeded,
+    /// A snapshot could not be read.
+    Corrupt(String),
+    /// Reading or writing a snapshot failed.
+    Io(String),
     /// Invalid configuration value.
     InvalidConfig(String),
 }
@@ -77,9 +81,17 @@ impl fmt::Display for MemoryError {
             Self::UnknownMemory(id) => write!(f, "unknown memory #{id}"),
             Self::UnknownContext(ctx) => write!(f, "unknown context {}", ctx.0),
             Self::CapacityExceeded => write!(f, "engram bank capacity exceeded"),
+            Self::Corrupt(msg) => write!(f, "corrupt snapshot: {msg}"),
+            Self::Io(msg) => write!(f, "i/o error: {msg}"),
             Self::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }
 
 impl std::error::Error for MemoryError {}
+
+impl From<std::io::Error> for MemoryError {
+    fn from(e: std::io::Error) -> Self {
+        MemoryError::Io(e.to_string())
+    }
+}

@@ -12,7 +12,8 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::dynamics::{self, Cand};
 use crate::encoder::{check_code, Encoder};
-use crate::trit::TRYTE_STATES;
+use crate::persist::{self, Persist, SnapshotScope};
+use crate::trit::{TritVec, TRYTE_STATES};
 use crate::types::{ContextId, Input, MemoryError, MemoryId, Tier};
 use crate::working::WorkingMemory;
 
@@ -1109,5 +1110,179 @@ impl<P: Clone> SnnMemory<P> {
             avg_recall_us: avg(c.recall_ns, c.recalls),
             approx_bytes: self.fast.bytes() + self.long.bytes() + self.loc.capacity() * 32,
         }
+    }
+}
+
+impl<P: Clone + Persist> SnnMemory<P> {
+    /// Serialize memories (see [`crate::persist`] for the format).
+    pub fn save(&self, scope: SnapshotScope) -> Vec<u8> {
+        let now = self.clock.now();
+        let mut out = Vec::new();
+        out.extend_from_slice(persist::MAGIC);
+        out.extend_from_slice(&persist::VERSION.to_le_bytes());
+        out.extend_from_slice(&self.encoder.fingerprint().to_le_bytes());
+        out.extend_from_slice(&self.next_id.to_le_bytes());
+        out.extend_from_slice(&(self.contexts.len() as u32).to_le_bytes());
+        for name in &self.contexts {
+            name.write(&mut out);
+        }
+
+        let mut records = Vec::new();
+        for tier in TIERS {
+            if tier == Tier::Fast && scope == SnapshotScope::LongTerm {
+                continue;
+            }
+            let bank = self.bank(tier);
+            for slot in bank.active_slots().filter(|&s| bank.is_live(s, now)) {
+                records.push((tier, slot));
+            }
+        }
+        out.extend_from_slice(&(records.len() as u64).to_le_bytes());
+        for (tier, slot) in records {
+            let bank = self.bank(tier);
+            let m = &bank.meta[slot as usize];
+            out.extend_from_slice(&m.id.to_le_bytes());
+            out.extend_from_slice(&m.ctx.0.to_le_bytes());
+            out.push((tier == Tier::LongTerm) as u8);
+            out.push(m.pinned as u8);
+            out.push(m.polarity as u8);
+            out.extend_from_slice(&(now - m.created).to_le_bytes());
+            out.extend_from_slice(&(m.expires - now).to_le_bytes());
+            out.extend_from_slice(&m.strength.to_le_bytes());
+            out.extend_from_slice(&m.recalls.to_le_bytes());
+            out.extend_from_slice(&m.prev.to_le_bytes());
+            out.extend_from_slice(&m.next.to_le_bytes());
+
+            let code = bank.code(slot);
+            out.extend_from_slice(&(code.len() as u16).to_le_bytes());
+            for n in &code {
+                out.extend_from_slice(&(*n as u16).to_le_bytes());
+            }
+            let mut trits = TritVec::zeros(code.len());
+            for (i, s) in bank.states(slot).into_iter().enumerate() {
+                trits.set(i, s);
+            }
+            let words = trits.words();
+            out.extend_from_slice(&(words.len() as u16).to_le_bytes());
+            for w in words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+
+            let mut payload = Vec::new();
+            if let Some(p) = bank.payload(slot) {
+                payload.push(1);
+                p.write(&mut payload);
+            } else {
+                payload.push(0);
+            }
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
+        let sum = persist::fnv1a(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Restore a snapshot. The encoder must be configured exactly as when
+    /// the snapshot was saved (checked by fingerprint).
+    pub fn load<E: Encoder + 'static>(encoder: E, cfg: MemoryConfig, bytes: &[u8]) -> Result<Self, MemoryError> {
+        let mut mem = Self::new(encoder, cfg)?;
+        mem.restore(bytes)?;
+        Ok(mem)
+    }
+
+    /// Add the memories of a snapshot to this (empty or not) memory. Ids of
+    /// restored memories are kept; ids already in use are an error.
+    pub fn restore(&mut self, bytes: &[u8]) -> Result<usize, MemoryError> {
+        use persist::{corrupt, read_f32, read_f64, read_i8, read_u16, read_u32, read_u64, read_u8, take};
+        if bytes.len() < 8 {
+            return Err(corrupt("snapshot too short"));
+        }
+        let (body, sum) = bytes.split_at(bytes.len() - 8);
+        if persist::fnv1a(body).to_le_bytes() != sum {
+            return Err(corrupt("checksum mismatch"));
+        }
+        let mut input = body;
+        if take(&mut input, 4)? != persist::MAGIC {
+            return Err(corrupt("not an SNN memory snapshot"));
+        }
+        let version = read_u32(&mut input)?;
+        if version != persist::VERSION {
+            return Err(corrupt(&format!("unsupported snapshot version {version}")));
+        }
+        if read_u64(&mut input)? != self.encoder.fingerprint() {
+            return Err(MemoryError::InvalidConfig("snapshot was written with a different encoder".into()));
+        }
+        let next_id = read_u64(&mut input)?;
+        let n_ctx = read_u32(&mut input)?;
+        let mut ctx_map = Vec::with_capacity(n_ctx as usize);
+        for _ in 0..n_ctx {
+            let name = String::read(&mut input)?;
+            ctx_map.push(self.context(&name));
+        }
+
+        let now = self.clock.now();
+        let count = read_u64(&mut input)?;
+        let mut restored = 0;
+        for _ in 0..count {
+            let id = read_u64(&mut input)?;
+            let ctx = *ctx_map.get(read_u32(&mut input)? as usize).ok_or(corrupt("bad context index"))?;
+            let tier = if read_u8(&mut input)? == 1 { Tier::LongTerm } else { Tier::Fast };
+            let pinned = read_u8(&mut input)? == 1;
+            let polarity = read_i8(&mut input)?;
+            let age = read_f64(&mut input)?;
+            let remaining = read_f64(&mut input)?;
+            let strength = read_f32(&mut input)?;
+            let recalls = read_u32(&mut input)?;
+            let prev = read_u64(&mut input)?;
+            let next = read_u64(&mut input)?;
+
+            let len = read_u16(&mut input)? as usize;
+            let mut code = Vec::with_capacity(len);
+            for _ in 0..len {
+                code.push(read_u16(&mut input)? as u32);
+            }
+            let n_words = read_u16(&mut input)? as usize;
+            let words: Vec<u64> = (0..n_words).map(|_| read_u64(&mut input)).collect::<Result<_, _>>()?;
+            let trits = TritVec::from_words(&words, len).ok_or(corrupt("bad synapse states"))?;
+            let states: Vec<i8> = (0..len).map(|i| trits.get(i)).collect();
+
+            let plen = read_u32(&mut input)? as usize;
+            let mut pbytes = take(&mut input, plen)?;
+            let payload = match read_u8(&mut pbytes)? {
+                0 => None,
+                _ => Some(P::read(&mut pbytes)?),
+            };
+
+            check_code(&code, self.n_neurons)?;
+            if len == 0 || len > self.cfg.max_ensemble {
+                return Err(MemoryError::EnsembleTooLarge { len, max: self.cfg.max_ensemble });
+            }
+            if id == NO_ID || self.loc.contains_key(&id) {
+                return Err(corrupt(&format!("memory id {id} is missing or already in use")));
+            }
+            let meta = SlotMeta {
+                id,
+                ctx,
+                status: SlotStatus::Active,
+                created: now - age,
+                expires: now + remaining,
+                strength,
+                recalls,
+                pinned,
+                polarity,
+                prev,
+                next,
+                len: len as u32,
+            };
+            let slot = self.bank_mut(tier).insert(Engram { code, states, meta, payload });
+            self.loc.insert(id, Loc { tier, slot });
+            restored += 1;
+        }
+        if !input.is_empty() {
+            return Err(corrupt("trailing bytes"));
+        }
+        self.next_id = self.next_id.max(next_id);
+        Ok(restored)
     }
 }
