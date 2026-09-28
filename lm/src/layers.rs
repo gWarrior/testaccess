@@ -21,16 +21,53 @@ const STEP: f64 = 0.69;
 /// Per-row step, rounded to a power of two so dequantization is a shift.
 /// Clamped far from f32 underflow.
 fn row_step(w: &Tensor) -> Result<Tensor> {
-    let s = w.abs()?.mean_keepdim(D::Minus1)?.affine(STEP, 0.0)?.clamp(1e-30, f64::MAX)?;
-    let e = (s.log()? / std::f64::consts::LN_2)?.round()?;
-    (e * std::f64::consts::LN_2)?.exp()
+    let s = w.abs()?.mean_keepdim(D::Minus1)?;
+    let steps: Vec<f32> = s
+        .flatten_all()?
+        .to_vec1::<f32>()?
+        .into_iter()
+        .map(|m| 2f64.powi((m as f64 * STEP).max(1e-30).log2().round() as i32) as f32)
+        .collect();
+    Tensor::from_vec(steps, s.shape(), w.device())
 }
 
 /// Quantize to two trits per weight (power-of-two row step), with STE.
 pub fn quant2(w: &Tensor) -> Result<Tensor> {
-    let step = row_step(w)?;
-    let q = w.broadcast_div(&step)?.round()?.clamp(-LEVELS, LEVELS)?.broadcast_mul(&step)?;
-    w + (q - w)?.detach()
+    w.contiguous()?.apply_op1(Quant2)
+}
+
+/// One parallel pass per row: `step = 2^round(log2(0.69·mean|w|))`,
+/// `q = clamp(round(w / step), ±4) · step`; the gradient passes straight
+/// through. The step is an exact power of two, as in the packed model.
+struct Quant2;
+
+impl candle_core::CustomOp1 for Quant2 {
+    fn name(&self) -> &'static str {
+        "quant2"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s: &candle_core::CpuStorage,
+        l: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        use rayon::prelude::*;
+        let w = cpu_tensor(s, l)?.flatten_all()?.to_vec1::<f32>()?;
+        let cols = *l.shape().dims().last().expect("rank >= 1");
+        let mut out = vec![0f32; w.len()];
+        out.par_chunks_mut(cols).zip(w.par_chunks(cols)).for_each(|(o, row)| {
+            let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / cols as f64;
+            let step = 2f64.powi((mean * STEP).max(1e-30).log2().round() as i32) as f32;
+            for (o, &x) in o.iter_mut().zip(row) {
+                *o = (x / step).round().clamp(-LEVELS as f32, LEVELS as f32) * step;
+            }
+        });
+        Ok((candle_core::CpuStorage::F32(out), l.shape().clone()))
+    }
+
+    fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad: &Tensor) -> Result<Option<Tensor>> {
+        Ok(Some(grad.clone()))
+    }
 }
 
 /// Integer levels and per-row power-of-two steps of a weight matrix.
