@@ -110,8 +110,10 @@ pub struct MemoryConfig {
     pub default_ttl: Option<f64>,
     /// Consolidate a fast memory after this many successful recalls.
     pub consolidate_after: Option<u32>,
-    /// Run physical cleanup once this many deleted engrams are pending
-    /// (`0` = only on explicit `maintain`).
+    /// Run physical cleanup once this many deleted engrams are pending, or a
+    /// ninth of the live memories if that is more (`0` = only on explicit
+    /// `maintain`). Cleanup cost grows with the total number of synapses, so
+    /// the proportional floor keeps its amortised cost per forget constant.
     pub auto_cleanup: usize,
     pub dynamics: DynamicsConfig,
     pub plasticity: PlasticityConfig,

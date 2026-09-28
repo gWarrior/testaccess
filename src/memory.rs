@@ -496,7 +496,8 @@ impl<P: Clone> SnnMemory<P> {
 
     fn maybe_cleanup(&mut self) {
         let limit = self.cfg.auto_cleanup;
-        if limit > 0 && self.fast.pending() + self.long.pending() >= limit {
+        let floor = (self.fast.n_active() + self.long.n_active()) / 9;
+        if limit > 0 && self.fast.pending() + self.long.pending() >= limit.max(floor) {
             self.fast.cleanup();
             self.long.cleanup();
         }
