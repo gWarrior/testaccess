@@ -671,7 +671,8 @@ impl<P: Clone> SnnMemory<P> {
 
         if opts.facilitate {
             self.working.last_state = settled.active;
-            for h in &hits {
+            // Best hit last, so it is the most recent working-memory item.
+            for h in hits.iter().rev() {
                 self.working.facilitate(h.id, now);
             }
             if let Some(best) = hits.first() {
@@ -720,8 +721,11 @@ impl<P: Clone> SnnMemory<P> {
     }
 
     /// Forget every memory of a context. Long-term memories are kept unless
-    /// `include_long_term`; pinned memories are always kept.
+    /// `include_long_term`; pinned memories are always kept. Returns the
+    /// number of live memories removed (expired ones are swept silently).
     pub fn reset_context(&mut self, ctx: ContextId, include_long_term: bool) -> usize {
+        let now = self.clock.now();
+        let mut live = 0;
         let mut victims = Vec::new();
         for tier in TIERS {
             if tier == Tier::LongTerm && !include_long_term {
@@ -731,6 +735,7 @@ impl<P: Clone> SnnMemory<P> {
             for slot in bank.active_slots() {
                 let m = &bank.meta[slot as usize];
                 if m.ctx == ctx && !m.pinned {
+                    live += (m.expires > now) as usize;
                     victims.push((m.id, Loc { tier, slot }));
                 }
             }
@@ -738,9 +743,9 @@ impl<P: Clone> SnnMemory<P> {
         for &(id, l) in &victims {
             self.remove(id, l);
         }
-        self.counters.forgets += victims.len() as u64;
+        self.counters.forgets += live as u64;
         self.maybe_cleanup();
-        victims.len()
+        live
     }
 
     /// Clear all fast memory and working memory and the fast component of
