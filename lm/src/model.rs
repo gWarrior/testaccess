@@ -136,6 +136,8 @@ impl MemBatch {
 pub struct Ablation {
     pub no_hadam: bool,
     pub no_retention: bool,
+    /// All weight on the vocabulary: no copying.
+    pub no_pointer: bool,
 }
 
 /// Tokens in the lexical probe of a memory read.
@@ -289,6 +291,13 @@ impl Model {
         let gv = gv.broadcast_as((b, nb, blk))?.reshape((b, t))?;
         let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + gv)?;
         let point = candle_nn::ops::softmax(&Tensor::cat(&[&p_local, &p_far, &null.unsqueeze(2)?], 2)?, D::Minus1)?;
+        let point = if self.ablation.no_pointer {
+            let l = t + mm + 1;
+            let null: Vec<f32> = (0..b * t * l).map(|i| if i % l == l - 1 { 1.0 } else { 0.0 }).collect();
+            Tensor::from_vec(null, (b, t, l), device)?
+        } else {
+            point
+        };
         let gate = point.narrow(2, t + mm, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
     }

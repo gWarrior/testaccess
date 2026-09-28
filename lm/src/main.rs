@@ -241,7 +241,8 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
-    let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    let mut engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    engine.no_pointer = arg(args, "--pointer", "on") == "off";
     let precision = kv_precision(args);
     let mut session = engine.session_with(memory_tokens, precision);
     let seed: u64 = arg(args, "--seed", "0").parse().expect("--seed");
@@ -338,16 +339,17 @@ fn ablate(args: &[String]) -> std::io::Result<()> {
     let windows: usize = arg(args, "--windows", "27").parse().expect("--windows");
     let val = load_tokens(&data, "val.bin");
     let kv = kv_precision(args);
-    let cases: [(&str, bool, bool, bool, bool); 5] = [
-        ("full model", true, false, false, false),
-        ("no SNN memory", false, false, false, false),
-        ("no state between windows", true, true, false, false),
-        ("no HadamRNN", true, false, true, false),
-        ("no retention", true, false, false, true),
+    let cases: [(&str, bool, bool, bool, bool, bool); 6] = [
+        ("full model", true, false, false, false, false),
+        ("no SNN memory", false, false, false, false, false),
+        ("no pointer (copy)", true, false, false, false, true),
+        ("no state between windows", true, true, false, false, false),
+        ("no HadamRNN", true, false, true, false, false),
+        ("no retention", true, false, false, true, false),
     ];
-    for (name, memory, reset, no_hadam, no_ret) in cases {
+    for (name, memory, reset, no_hadam, no_ret, no_pointer) in cases {
         let mut model = load_model(&run);
-        model.ablation = snn_lm::model::Ablation { no_hadam, no_retention: no_ret };
+        model.ablation = snn_lm::model::Ablation { no_hadam, no_retention: no_ret, no_pointer };
         let t = Instant::now();
         let (loss, by_pos) = snn_lm::eval::val_loss_detail(model, &val.tokens, 27, windows, memory, kv, reset)
             .map_err(std::io::Error::other)?;
@@ -461,7 +463,10 @@ fn copyeval(args: &[String]) -> std::io::Result<()> {
         .collect();
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
-    let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    let mut engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    // "Model alone" is the model with its own pointer head unless --pointer off.
+    engine.no_pointer = arg(args, "--pointer", "on") == "off";
+    println!("pointer head: {}", if engine.no_pointer { "off" } else { "on" });
     let val = snn_lm::data::TokenFile::load(&data.join("val.bin"))?;
     let val: Vec<u32> = val.tokens.iter().map(|&t| t as u32).collect();
     let precision = kv_precision(args);
@@ -517,6 +522,7 @@ fn main() {
                 "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16] [--copy λ]"
             );
             eprintln!("       snn-lm probe --context FILE --probes FILE [--model lm/model]  (memory alone, lines prefix|answer)");
+            eprintln!("       snn-lm copyeval [--copy λ] [--pointer on|off] [--distances a,b,..] [--tokens N]");
             std::process::exit(2);
         }
     };

@@ -144,6 +144,8 @@ pub struct Engine {
     gate_w: Vec<f32>,
     gate_b: f32,
     gate_verdict: Vec<f32>,
+    /// Ablation: all weight on the vocabulary, no copying.
+    pub no_pointer: bool,
 }
 
 /// Recurrent state of one conversation.
@@ -210,6 +212,7 @@ impl Engine {
             gate_w: vec("gate_w")?,
             gate_b: vec("gate_b")?[0],
             gate_verdict: vec("gate_verdict")?,
+            no_pointer: false,
         })
     }
 
@@ -422,7 +425,7 @@ impl Engine {
         // each column copies the token that followed it.
         let mut copy: Vec<(u32, f32)> = Vec::new();
         let mut gate = 1f32;
-        if want_logits {
+        if want_logits && !self.no_pointer {
             let pq = self.pq.apply(&xn);
             let n_ring = s.ring.len() - 1;
             let mut sc: Vec<(u32, f32)> = (0..n_ring).map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1))).collect();
