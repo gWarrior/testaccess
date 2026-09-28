@@ -77,11 +77,7 @@ pub(crate) fn similarity(cue: &[u32], gains: &[f32], code: &[u32], w: &[f32]) ->
         }
     }
     let frac = |x: f32| if gsum > 0.0 { (x / gsum).clamp(-1.0, 1.0) } else { 0.0 };
-    Match {
-        coverage: frac(signed),
-        excitatory: frac(exc),
-        completeness: if wsum > 0.0 { hit / wsum } else { 0.0 },
-    }
+    Match { coverage: frac(signed), excitatory: frac(exc), completeness: if wsum > 0.0 { hit / wsum } else { 0.0 } }
 }
 
 /// Firing threshold such that a constant drive of exactly `threshold`
@@ -119,13 +115,13 @@ pub(crate) fn settle(
         cl.iter()
             .zip(cands)
             .map(|(idx, c)| {
-                let num: f32 = idx
-                    .iter()
-                    .zip(&c.w)
-                    .filter(|(&i, _)| active[i as usize])
-                    .map(|(&i, &w)| g[i as usize] * w)
-                    .sum();
-                if denom > 0.0 { (num / denom).clamp(-1.0, 1.0) } else { 0.0 }
+                let num: f32 =
+                    idx.iter().zip(&c.w).filter(|(&i, _)| active[i as usize]).map(|(&i, &w)| g[i as usize] * w).sum();
+                if denom > 0.0 {
+                    (num / denom).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
             })
             .collect()
     };
@@ -141,9 +137,8 @@ pub(crate) fn settle(
         })
         .collect();
 
-    let collect_active = |active: &[bool]| -> Vec<u32> {
-        local.iter().zip(active).filter(|(_, &a)| a).map(|(&n, _)| n).collect()
-    };
+    let collect_active =
+        |active: &[bool]| -> Vec<u32> { local.iter().zip(active).filter(|(_, &a)| a).map(|(&n, _)| n).collect() };
 
     if !cfg.enabled {
         for o in &mut outcomes {
@@ -184,11 +179,7 @@ pub(crate) fn settle(
         // The interneuron tracks the strongest engram that is currently in
         // its attractor (recently fired) and inhibits every engram equally.
         inh = cfg.inhibition
-            * z.iter()
-                .zip(&x)
-                .filter(|(&z, _)| z >= cfg.completion_min_rate)
-                .map(|(_, &x)| x)
-                .fold(0.0, f32::max);
+            * z.iter().zip(&x).filter(|(&z, _)| z >= cfg.completion_min_rate).map(|(_, &x)| x).fold(0.0, f32::max);
 
         if cfg.completion {
             let mut next = cue_active.clone();

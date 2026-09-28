@@ -167,11 +167,7 @@ pub struct KvStore {
 
 impl KvStore {
     pub fn new(key_dim: usize, value_dim: usize, precision: KvPrecision) -> Self {
-        Self {
-            keys: RowStore::new(key_dim, precision),
-            values: RowStore::new(value_dim, precision),
-            base: 0,
-        }
+        Self { keys: RowStore::new(key_dim, precision), values: RowStore::new(value_dim, precision), base: 0 }
     }
 
     pub fn key_dim(&self) -> usize {

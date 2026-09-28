@@ -92,7 +92,12 @@ impl Default for ContextConfig {
             top_k: 9,
             neighbors: 0,
             kv: None,
-            lexical: MemoryConfig { max_ensemble: 81, recall_threshold: 4.0 / 9.0, reject_threshold: 1.0 / 9.0, ..base.clone() },
+            lexical: MemoryConfig {
+                max_ensemble: 81,
+                recall_threshold: 4.0 / 9.0,
+                reject_threshold: 1.0 / 9.0,
+                ..base.clone()
+            },
             semantic: MemoryConfig { max_ensemble: 81, ..base },
         }
     }
@@ -229,7 +234,8 @@ impl ContextMemory {
             Some(k) => {
                 let semantic = if k.semantic_index {
                     let enc = FlyHashEncoder::new(k.key_dim, cfg.n_neurons, k.dense_k, k.fan_in, cfg.seed ^ 0xD5)?;
-                    let mcfg = MemoryConfig { max_ensemble: k.dense_k.max(cfg.semantic.max_ensemble), ..cfg.semantic.clone() };
+                    let mcfg =
+                        MemoryConfig { max_ensemble: k.dense_k.max(cfg.semantic.max_ensemble), ..cfg.semantic.clone() };
                     Some(SnnMemory::new(enc, mcfg)?)
                 } else {
                     None
@@ -372,7 +378,8 @@ impl ContextMemory {
                     })
                     .collect();
                 let inputs: Vec<Input> = pooled.iter().map(|m| Input::Dense(m)).collect();
-                let opts = BatchOptions { link_sequence: true, after: self.last.and_then(|l| l.1), ..Default::default() };
+                let opts =
+                    BatchOptions { link_sequence: true, after: self.last.and_then(|l| l.1), ..Default::default() };
                 sem.learn_batch(&inputs, Some(chunks), &opts)?.into_iter().map(Some).collect()
             }
             _ => vec![None; starts.len()],

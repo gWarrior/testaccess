@@ -542,8 +542,7 @@ impl<P: Clone> SnnMemory<P> {
             }
         }
         let (enc, n) = (&*self.encoder, self.n_neurons);
-        let codes: Vec<Vec<u32>> =
-            inputs.par_iter().map(|&i| encode_with(enc, n, i)).collect::<Result<_, _>>()?;
+        let codes: Vec<Vec<u32>> = inputs.par_iter().map(|&i| encode_with(enc, n, i)).collect::<Result<_, _>>()?;
         if let Some(c) = codes.iter().find(|c| c.len() > self.cfg.max_ensemble) {
             return Err(MemoryError::EnsembleTooLarge { len: c.len(), max: self.cfg.max_ensemble });
         }
@@ -674,13 +673,7 @@ impl<P: Clone> SnnMemory<P> {
         out
     }
 
-    fn reinforce(
-        &mut self,
-        l: Loc,
-        code: &[u32],
-        opts: LearnOptions<P>,
-        now: f64,
-    ) -> Result<MemoryId, MemoryError> {
+    fn reinforce(&mut self, l: Loc, code: &[u32], opts: LearnOptions<P>, now: f64) -> Result<MemoryId, MemoryError> {
         let pcfg = self.cfg.plasticity.clone();
         let deadline = self.deadline(opts.ttl, now);
         let bank = self.bank_mut(l.tier);
@@ -752,9 +745,7 @@ impl<P: Clone> SnnMemory<P> {
                 if f.excitatory > best_exc && bank.accepts(f.slot, now, opts.context) {
                     best_exc = f.excitatory;
                 }
-                vetoed |= f.excitatory >= thr * gsum
-                    && f.score < thr * gsum
-                    && bank.accepts(f.slot, now, opts.context);
+                vetoed |= f.excitatory >= thr * gsum && f.score < thr * gsum && bank.accepts(f.slot, now, opts.context);
                 pool.push((f.score, Loc { tier, slot: f.slot }));
             }
         }
@@ -782,11 +773,7 @@ impl<P: Clone> SnnMemory<P> {
             .iter()
             .map(|&(_, l)| {
                 let bank = self.bank(l.tier);
-                Cand {
-                    code: bank.code(l.slot),
-                    w: bank.weights(l.slot),
-                    gain: self.working.gain(self.meta(l).id, now),
-                }
+                Cand { code: bank.code(l.slot), w: bank.weights(l.slot), gain: self.working.gain(self.meta(l).id, now) }
             })
             .collect();
         let settled = {

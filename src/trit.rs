@@ -160,10 +160,7 @@ impl TritVec {
 
     /// The packed storage as 64-bit words of 40 trits each.
     pub fn words(&self) -> Vec<u64> {
-        self.bytes
-            .chunks(8)
-            .map(|c| c.iter().rev().fold(0u64, |acc, &b| acc * 243 + b as u64))
-            .collect()
+        self.bytes.chunks(8).map(|c| c.iter().rev().fold(0u64, |acc, &b| acc * 243 + b as u64)).collect()
     }
 
     /// Rebuild from 64-bit words of 40 trits each.

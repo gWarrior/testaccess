@@ -155,9 +155,8 @@ fn test6_interference() {
     assert!((wrong as f32) < 0.02 * n as f32, "false recall {wrong}/{n}");
 
     // Unseen random patterns must not be recalled.
-    let false_hits = (0..729)
-        .filter(|_| !mem.recall(Input::Code(&random_code(&mut rng)), &opts()).unwrap().is_miss())
-        .count();
+    let false_hits =
+        (0..729).filter(|_| !mem.recall(Input::Code(&random_code(&mut rng)), &opts()).unwrap().is_miss()).count();
     assert_eq!(false_hits, 0);
 
     // The first memories are still intact after 2000+ later writes.

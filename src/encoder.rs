@@ -105,13 +105,7 @@ pub struct FlyHashEncoder {
 
 impl FlyHashEncoder {
     /// `k` winners out of `n_neurons`; each neuron samples `fan_in` inputs.
-    pub fn new(
-        input_dim: usize,
-        n_neurons: u32,
-        k: usize,
-        fan_in: usize,
-        seed: u64,
-    ) -> Result<Self, MemoryError> {
+    pub fn new(input_dim: usize, n_neurons: u32, k: usize, fan_in: usize, seed: u64) -> Result<Self, MemoryError> {
         if input_dim == 0 || n_neurons == 0 {
             return Err(MemoryError::InvalidConfig("input_dim and n_neurons must be > 0".into()));
         }
@@ -156,19 +150,7 @@ impl FlyHashEncoder {
             fill[d as usize] += 1;
         }
 
-        Ok(Self {
-            input_dim,
-            n_neurons,
-            k,
-            fan_in,
-            fwd,
-            inv_start,
-            inv_neuron,
-            inv_sign,
-            priority,
-            center: None,
-            seed,
-        })
+        Ok(Self { input_dim, n_neurons, k, fan_in, fwd, inv_start, inv_neuron, inv_sign, priority, center: None, seed })
     }
 
     /// Subtract `mean` from dense inputs before projection. LLM hidden states
@@ -383,10 +365,7 @@ impl NGramEncoder {
 
     /// Upper bound on the code size of a sequence of `n_tokens`.
     pub fn max_code_len(&self, n_tokens: usize) -> usize {
-        self.ngrams
-            .iter()
-            .map(|&n| n_tokens.saturating_sub(n - 1) * self.per_feature as usize)
-            .sum()
+        self.ngrams.iter().map(|&n| n_tokens.saturating_sub(n - 1) * self.per_feature as usize).sum()
     }
 
     pub fn ngrams(&self) -> &[usize] {

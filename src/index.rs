@@ -94,8 +94,7 @@ impl PostingIndex {
 
     /// Approximate heap usage in bytes.
     pub fn bytes(&self) -> usize {
-        self.lists.len() * std::mem::size_of::<Vec<u32>>()
-            + self.lists.iter().map(|l| l.capacity() * 4).sum::<usize>()
+        self.lists.len() * std::mem::size_of::<Vec<u32>>() + self.lists.iter().map(|l| l.capacity() * 4).sum::<usize>()
     }
 }
 

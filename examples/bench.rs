@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use snn_memory::rng::{SplitMix64, Zipf};
 use snn_memory::{
-    ContextConfig, ContextMemory, FlyHashEncoder, Input, KvConfig, KvPrecision, MemoryConfig, Probe,
-    RecallOptions, SnnMemory, Verdict,
+    ContextConfig, ContextMemory, FlyHashEncoder, Input, KvConfig, KvPrecision, MemoryConfig, Probe, RecallOptions,
+    SnnMemory, Verdict,
 };
 
 const CONTEXT: usize = 300_000;
@@ -125,7 +125,8 @@ fn dense() {
     let keys: Vec<Vec<f32>> = (0..n).map(|_| unit(&mut rng, d)).collect();
     for fan_in in [9usize, 27] {
         let enc = FlyHashEncoder::new(d, 19_683, 81, fan_in, 7).unwrap();
-        let cfg = MemoryConfig { max_ensemble: 81, dedupe_threshold: None, consolidate_after: None, ..Default::default() };
+        let cfg =
+            MemoryConfig { max_ensemble: 81, dedupe_threshold: None, consolidate_after: None, ..Default::default() };
         let mut mem: SnnMemory<()> = SnnMemory::new(enc, cfg).unwrap();
 
         let t = Instant::now();
@@ -136,7 +137,13 @@ fn dense() {
         }
         let secs = t.elapsed().as_secs_f64();
         let s = mem.stats();
-        println!("fan-in {fan_in}: learn {:.2} s ({:.0}/s), {} synapses, {}", secs, n as f64 / secs, s.synapses, mb(s.approx_bytes));
+        println!(
+            "fan-in {fan_in}: learn {:.2} s ({:.0}/s), {} synapses, {}",
+            secs,
+            n as f64 / secs,
+            s.synapses,
+            mb(s.approx_bytes)
+        );
 
         let opts = RecallOptions { facilitate: false, ..Default::default() };
         for cos in [0.9f32, 0.8] {

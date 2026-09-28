@@ -156,7 +156,11 @@ fn sequences_link_and_follow() {
     let codes: Vec<Vec<u32>> = (0..5).map(|_| random_code(&mut rng)).collect();
     let inputs: Vec<Input> = codes.iter().map(|c| Input::Code(c)).collect();
     let ids = mem
-        .learn_batch(&inputs, Some(vec!["a", "b", "c", "d", "e"]), &BatchOptions { link_sequence: true, ..Default::default() })
+        .learn_batch(
+            &inputs,
+            Some(vec!["a", "b", "c", "d", "e"]),
+            &BatchOptions { link_sequence: true, ..Default::default() },
+        )
         .unwrap();
 
     let r = mem.recall(Input::Code(&codes[1]), &opts().follow(10)).unwrap();
@@ -197,10 +201,7 @@ fn errors_are_reported() {
         Err(MemoryError::NeuronOutOfRange { .. })
     ));
     assert_eq!(mem.learn(Input::Code(&[]), LearnOptions::new()), Err(MemoryError::EmptyCode));
-    assert!(matches!(
-        mem.learn(Input::Dense(&[1.0]), LearnOptions::new()),
-        Err(MemoryError::UnsupportedInput(_))
-    ));
+    assert!(matches!(mem.learn(Input::Dense(&[1.0]), LearnOptions::new()), Err(MemoryError::UnsupportedInput(_))));
     let bogus = snn_memory::ContextId(99);
     assert_eq!(
         mem.learn(Input::Code(&[1, 2]), LearnOptions::new().context(bogus)),

@@ -277,11 +277,7 @@ impl<P> EngramBank<P> {
 
     /// Slots with `Active` status.
     pub fn active_slots(&self) -> impl Iterator<Item = u32> + '_ {
-        self.meta
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.status == SlotStatus::Active)
-            .map(|(s, _)| s as u32)
+        self.meta.iter().enumerate().filter(|(_, m)| m.status == SlotStatus::Active).map(|(s, _)| s as u32)
     }
 
     /// Logical deletion: O(1). The engram is silenced immediately; its

@@ -27,15 +27,15 @@ mod working;
 
 pub use attention::{attend, Attended};
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use context::{
-    Chunk, ContextConfig, ContextMemory, ContextStats, KvConfig, Located, Probe, ReadOut, RetrievedSpan, Retrieval,
-};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
+pub use context::{
+    Chunk, ContextConfig, ContextMemory, ContextStats, KvConfig, Located, Probe, ReadOut, Retrieval, RetrievedSpan,
+};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
 pub use kv::{KvPrecision, KvStore};
 pub use memory::{
-    Basis, BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult,
-    SnnMemory, Stats, Verdict,
+    Basis, BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult, SnnMemory,
+    Stats, Verdict,
 };
 pub use persist::{Persist, SnapshotScope};
 pub use shared::{MaintenanceHandle, SharedMemory};

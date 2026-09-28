@@ -146,11 +146,13 @@ fn read_head_attends_over_retrieved_tokens() {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         keys.extend(v.iter().map(|x| x / norm));
     }
-    let values: Vec<f32> = (0..n).flat_map(|p| {
-        let mut v = vec![0.0; dv];
-        v[0] = p as f32;
-        v
-    }).collect();
+    let values: Vec<f32> = (0..n)
+        .flat_map(|p| {
+            let mut v = vec![0.0; dv];
+            v[0] = p as f32;
+            v
+        })
+        .collect();
     ctx.append_kv(&tokens, &keys, &values).unwrap();
 
     // Query the key of token 4000, scaled by 3^4 so attention is sharp; probe
@@ -202,4 +204,3 @@ fn pinned_context_is_carried_into_the_next_session() {
     next.append(&text(&mut rng, 81)).unwrap();
     assert_eq!(next.position(), end + 81);
 }
-
