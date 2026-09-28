@@ -6,3 +6,10 @@
 //! in `docs/concept.md`: patterns are written in one shot into sparse engram
 //! ensembles, recalled associatively from partial cues through LIF attractor
 //! dynamics, and forgotten selectively without disturbing other memories.
+
+pub mod clock;
+pub mod rng;
+pub mod types;
+
+pub use clock::{Clock, ManualClock, SystemClock};
+pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
