@@ -458,6 +458,27 @@ impl<P: Clone> SnnMemory<P> {
         cue.iter().map(|&n| self.gain(n)).collect()
     }
 
+    /// Rarest-first selection of the cue neurons the index stage scans.
+    /// Returns the selected neurons, their gains and the total gain of the
+    /// neurons left out (possible evidence the index did not look at).
+    fn scan_plan(&self, cue: &[u32], gains: &[f32]) -> (Vec<u32>, Vec<f32>, f32) {
+        let fan_out = |n: u32| self.fast.postings.len(n) + self.long.postings.len(n);
+        let mut order: Vec<usize> = (0..cue.len()).collect();
+        order.sort_by_key(|&i| fan_out(cue[i]));
+        let (mut neurons, mut sel_gains, mut unscanned, mut spent) = (Vec::new(), Vec::new(), 0f32, 0usize);
+        for i in order {
+            let f = fan_out(cue[i]);
+            if neurons.is_empty() || spent + f <= self.cfg.scan_budget {
+                spent += f;
+                neurons.push(cue[i]);
+                sel_gains.push(gains[i]);
+            } else {
+                unscanned += gains[i];
+            }
+        }
+        (neurons, sel_gains, unscanned)
+    }
+
     fn deadline(&self, ttl: Option<f64>, now: f64) -> f64 {
         match ttl.or(self.cfg.default_ttl) {
             Some(t) => now + t,
@@ -599,15 +620,15 @@ impl<P: Clone> SnnMemory<P> {
     fn find_similar(&mut self, code: &[u32], ctx: ContextId, now: f64, thr: f32) -> Option<Loc> {
         let gains = self.gains(code);
         let gsum: f32 = gains.iter().sum();
-        let max_scan = self.cfg.max_scan;
+        let (scan, scan_gains, unscanned) = self.scan_plan(code, &gains);
         let mut best: Option<(f32, Loc)> = None;
         let mut found = Vec::new();
         for tier in TIERS {
             found.clear();
-            self.bank_mut(tier).gather(code, &gains, now, Some(ctx), max_scan, &mut found);
+            self.bank_mut(tier).gather(&scan, &scan_gains, now, Some(ctx), &mut found);
             let bank = self.bank(tier);
             for &Gathered { score, slot, .. } in &found {
-                if score < 0.5 * thr * gsum {
+                if score + unscanned < 0.5 * thr * gsum {
                     continue;
                 }
                 let m = dynamics::similarity(code, &gains, &bank.code(slot), &bank.weights(slot));
@@ -682,21 +703,15 @@ impl<P: Clone> SnnMemory<P> {
         // Stage 1: index. Gain-weighted input through the cue's synapses.
         let gains = self.gains(cue);
         let gsum: f32 = gains.iter().sum();
-        let max_scan = self.cfg.max_scan;
-        // Saturated neurons are skipped by the index; count them as possible
-        // evidence so that "definitely not" stays sound.
-        let unscanned: f32 = cue
-            .iter()
-            .zip(&gains)
-            .filter(|(&n, _)| self.fast.postings.len(n) > max_scan || self.long.postings.len(n) > max_scan)
-            .map(|(_, g)| g)
-            .sum();
+        // Neurons beyond the scan budget count as possible evidence, so that
+        // "definitely not" stays sound.
+        let (scan, scan_gains, unscanned) = self.scan_plan(cue, &gains);
         let mut pool: Vec<(f32, Loc)> = Vec::new();
         let mut found = Vec::new();
         let (mut best_exc, mut vetoed) = (0f32, false);
         for tier in TIERS {
             found.clear();
-            self.bank_mut(tier).gather(cue, &gains, now, opts.context, max_scan, &mut found);
+            self.bank_mut(tier).gather(&scan, &scan_gains, now, opts.context, &mut found);
             for f in &found {
                 best_exc = best_exc.max(f.excitatory);
                 vetoed |= f.excitatory >= thr * gsum && f.score < thr * gsum;
@@ -714,7 +729,7 @@ impl<P: Clone> SnnMemory<P> {
             }
         };
 
-        let min_score = gsum * thr * self.cfg.prefilter;
+        let min_score = gsum * thr * self.cfg.prefilter - unscanned;
         pool.retain(|c| c.0 >= min_score);
         let max_c = self.cfg.max_candidates;
         if pool.len() > max_c {

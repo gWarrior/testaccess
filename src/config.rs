@@ -96,9 +96,10 @@ pub struct MemoryConfig {
     pub reject_threshold: f32,
     /// Index-stage pre-filter, as a fraction of `recall_threshold`.
     pub prefilter: f32,
-    /// Neurons with more synapses than this are skipped by the index stage
-    /// (they are saturated and carry almost no information).
-    pub max_scan: usize,
+    /// Synapses the index stage may scan per query. Cue neurons are scanned
+    /// rarest first (most informative first) until the budget is spent; the
+    /// rest only enter the exact similarity of the candidates found.
+    pub scan_budget: usize,
     /// Homeostatic scaling: frequently used neurons get lower gain.
     pub homeostasis: bool,
     /// Novelty check: a new input this similar to an existing memory (in
@@ -125,7 +126,7 @@ impl Default for MemoryConfig {
             recall_threshold: 2.0 / 9.0,
             reject_threshold: 1.0 / 9.0,
             prefilter: 0.5,
-            max_scan: 59_049,
+            scan_budget: 19_683,
             homeostasis: true,
             dedupe_threshold: Some(0.9),
             default_ttl: None,

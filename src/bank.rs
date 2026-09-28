@@ -315,7 +315,6 @@ impl<P> EngramBank<P> {
         gains: &[f32],
         now: f64,
         ctx: Option<ContextId>,
-        max_scan: usize,
         out: &mut Vec<Gathered>,
     ) {
         self.epoch = self.epoch.wrapping_add(1);
@@ -325,11 +324,7 @@ impl<P> EngramBank<P> {
         }
         let Self { postings, score, exc, stamp, epoch, touched, meta, syn, width, .. } = self;
         for (&n, &g) in cue.iter().zip(gains) {
-            let list = postings.list(n);
-            if list.len() > max_scan {
-                continue;
-            }
-            for &e in list {
+            for &e in postings.list(n) {
                 let s = entry_slot(e) as usize;
                 let w = Self::eff(syn, s * *width + entry_pos(e));
                 if w == 0 {
@@ -476,7 +471,7 @@ mod tests {
 
     fn gather(bank: &mut EngramBank<&'static str>, cue: &[u32]) -> Vec<(f32, u32)> {
         let mut out = Vec::new();
-        bank.gather(cue, &vec![1.0; cue.len()], 0.0, None, usize::MAX, &mut out);
+        bank.gather(cue, &vec![1.0; cue.len()], 0.0, None, &mut out);
         let mut v: Vec<(f32, u32)> = out.iter().map(|g| (g.score, g.slot)).collect();
         v.sort_by_key(|&(_, s)| s);
         v
