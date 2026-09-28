@@ -45,6 +45,8 @@ pub struct TrainConfig {
     pub init: Option<PathBuf>,
     /// Streams jump to a random document of the whole corpus after each one.
     pub jump: bool,
+    /// Probability per token of a re-reading episode.
+    pub p_reread: f64,
 }
 
 impl Default for TrainConfig {
@@ -68,6 +70,7 @@ impl Default for TrainConfig {
             time_limit: 0,
             init: None,
             jump: true,
+            p_reread: 1.0 / 729.0,
         }
     }
 }
@@ -332,7 +335,7 @@ pub fn token_losses(logits: &Tensor, targets: &[u32]) -> Result<Tensor> {
     logits.reshape((b * t, v))?.contiguous()?.apply_op1(op)
 }
 
-/// Linear warmup, then cosine decay to 10%. With a time limit the decay
+/// Linear warmup, then cosine decay to 40%. With a time limit the decay
 /// follows elapsed time, so the schedule ends exactly when time runs out.
 fn lr_at(cfg: &TrainConfig, step: usize, elapsed: f64) -> f64 {
     if step < cfg.warmup {
@@ -408,6 +411,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         (0..b).map(|i| TaskStream::new(i * region, region, cfg.seed * 1000 + i as u64)).collect();
     for s in &mut streams {
         s.jump = cfg.jump;
+        s.p_reread = cfg.p_reread;
     }
     // Resuming fast-forwards the streams, so data is not repeated.
     for s in &mut streams {

@@ -239,7 +239,14 @@ pub struct TaskStream {
     /// After each document, jump to a random document of the whole corpus
     /// (every topic of the corpus, not only this stream's region).
     pub jump: bool,
+    /// Probability of a re-reading episode: a span of 27–81 tokens seen
+    /// 243–19 683 tokens ago is repeated verbatim (dense far-copy signal).
+    pub p_reread: f64,
+    past: std::collections::VecDeque<u32>,
 }
+
+/// Longest look-back of a re-reading episode.
+const REREAD_MAX: usize = 19_683;
 
 impl TaskStream {
     pub fn new(start: usize, len: usize, seed: u64) -> Self {
@@ -254,11 +261,33 @@ impl TaskStream {
             p_episode: 1.0 / 2187.0,
             distance: (243, 19_683),
             jump: false,
+            p_reread: 0.0,
+            past: Default::default(),
         }
     }
 
     /// Next token and whether it is an episode answer token.
     fn next(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, bool) {
+        if self.pending.is_empty() && self.p_reread > 0.0 && self.past.len() > 2 * 243 {
+            if self.rng.next_f64() < self.p_reread {
+                let len = 27 + self.rng.below(55) as usize;
+                let back = 243 + self.rng.below((self.past.len() - 243 - len) as u64) as usize;
+                let start = self.past.len() - back;
+                let span: Vec<u32> = self.past.range(start..start + len).copied().collect();
+                self.pending.extend(span.into_iter().map(|t| (t, false)));
+            }
+        }
+        let out = self.next_raw(tokens, ep);
+        if self.p_reread > 0.0 {
+            self.past.push_back(out.0);
+            if self.past.len() > REREAD_MAX + 81 {
+                self.past.pop_front();
+            }
+        }
+        out
+    }
+
+    fn next_raw(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, bool) {
         if let Some(t) = self.pending.pop_front() {
             return t;
         }
