@@ -194,3 +194,101 @@ pub fn recall(
     }
     Ok(res)
 }
+
+/// Copy head on held-out text: mean loss without and with it, how often it
+/// fired, and how often the copied token was right.
+pub struct CopyLoss {
+    pub tokens: usize,
+    pub loss: f64,
+    pub loss_copy: f64,
+    pub fired: usize,
+    pub fired_right: usize,
+}
+
+fn nll(logits: &[f32], target: u32) -> f64 {
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f64 = logits.iter().map(|&l| ((l - mx) as f64).exp()).sum();
+    z.ln() - (logits[target as usize] - mx) as f64
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
+}
+
+pub fn copy_loss(engine: &crate::infer::Engine, tokens: &[u32], lambda: f32, precision: KvPrecision) -> CopyLoss {
+    let mut s = engine.session_with(300_000, precision);
+    let mut r = CopyLoss { tokens: 0, loss: 0.0, loss_copy: 0.0, fired: 0, fired_right: 0 };
+    let mut logits = engine.step(&mut s, crate::tokenizer::DOC);
+    for &t in tokens {
+        let mut copied = logits.clone();
+        if let Some((c, _)) = engine.copy(&mut s, &mut copied, lambda, u64::MAX) {
+            r.fired += 1;
+            r.fired_right += usize::from(c == t);
+        }
+        r.loss += nll(&logits, t);
+        r.loss_copy += nll(&copied, t);
+        r.tokens += 1;
+        logits = engine.step(&mut s, t);
+    }
+    r.loss /= r.tokens.max(1) as f64;
+    r.loss_copy /= r.tokens.max(1) as f64;
+    r
+}
+
+/// Exact continuation recall at a distance, per distance:
+/// (passages whose 18 continuation tokens were all top-1 without the copy
+/// head, with it, number of passages).
+pub fn copy_recall(
+    engine: &crate::infer::Engine,
+    filler: &[u32],
+    passages: &[Vec<u32>],
+    distances: &[usize],
+    lambda: f32,
+    precision: KvPrecision,
+) -> Vec<(usize, usize, usize, usize)> {
+    let per = passages.len() / distances.len();
+    let mut s = engine.session_with(300_000, precision);
+    let mut src = 0usize;
+    // Filler is fed in slices: logits only for the last token of each.
+    let mut fill = |s: &mut crate::infer::Session, mut n: usize| {
+        while n > 0 {
+            let from = src % filler.len();
+            let take = n.min(filler.len() - from);
+            engine.feed(s, &filler[from..from + take]);
+            src += take;
+            n -= take;
+        }
+    };
+    engine.step(&mut s, crate::tokenizer::DOC);
+    fill(&mut s, 2 * crate::infer::RING);
+    // Every passage once, in distance order, remembering where it starts.
+    let mut starts = Vec::new();
+    for p in passages {
+        starts.push(engine.position(&s));
+        engine.feed(&mut s, p);
+        fill(&mut s, 9);
+    }
+    let mut out = Vec::new();
+    for (di, &d) in distances.iter().enumerate() {
+        let (mut plain, mut copied) = (0, 0);
+        for (k, p) in passages[di * per..(di + 1) * per].iter().enumerate() {
+            let target = starts[di * per + k] + d as u64;
+            let now = engine.position(&s);
+            fill(&mut s, target.saturating_sub(now) as usize);
+            // Cue with the first 9 tokens, then score the next 18.
+            let mut logits = engine.feed(&mut s, &p[..9]).expect("logits");
+            let (mut ok_plain, mut ok_copy) = (true, true);
+            for &t in &p[9..27] {
+                let mut c = logits.clone();
+                engine.copy(&mut s, &mut c, lambda, u64::MAX);
+                ok_plain &= argmax(&logits) == t;
+                ok_copy &= argmax(&c) == t;
+                logits = engine.step(&mut s, t);
+            }
+            plain += usize::from(ok_plain);
+            copied += usize::from(ok_copy);
+        }
+        out.push((d, plain, copied, per));
+    }
+    out
+}

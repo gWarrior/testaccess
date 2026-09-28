@@ -447,6 +447,49 @@ fn probe(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn copyeval(args: &[String]) -> std::io::Result<()> {
+    let dir = PathBuf::from(arg(args, "--model", "lm/model"));
+    let data = PathBuf::from(arg(args, "--data", "/home/user/data/prepared"));
+    let lambda: f32 = arg(args, "--copy", "0.5").parse().expect("--copy");
+    let n: usize = arg(args, "--tokens", "19683").parse().expect("--tokens");
+    let distances: Vec<usize> = arg(args, "--distances", "243,2187,19683,177147,300000")
+        .split(',')
+        .map(|d| d.parse().expect("--distances"))
+        .collect();
+    let packed =
+        snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
+    let engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
+    let val = snn_lm::data::TokenFile::load(&data.join("val.bin"))?;
+    let val: Vec<u32> = val.tokens.iter().map(|&t| t as u32).collect();
+    let precision = kv_precision(args);
+    let t = Instant::now();
+    let r = snn_lm::eval::copy_loss(&engine, &val[..n], lambda, precision);
+    println!(
+        "held-out {} tokens: loss {:.4} → with copy head {:.4}; fired {} times ({:.1}%), right {} ({:.1}%) ({:.0}s)",
+        r.tokens,
+        r.loss,
+        r.loss_copy,
+        r.fired,
+        100.0 * r.fired as f64 / r.tokens.max(1) as f64,
+        r.fired_right,
+        100.0 * r.fired_right as f64 / r.fired.max(1) as f64,
+        t.elapsed().as_secs_f64()
+    );
+    // Passages and filler from disjoint parts of the held-out text.
+    let half = val.len() / 2;
+    let passages: Vec<Vec<u32>> = (0..9 * distances.len()).map(|i| val[half + i * 2187..][..27].to_vec()).collect();
+    let t = Instant::now();
+    for (d, plain, copied, total) in
+        snn_lm::eval::copy_recall(&engine, &val[n..half], &passages, &distances, lambda, precision)
+    {
+        println!(
+            "distance {d:>7}: exact 18-token continuation {plain}/{total} model alone, {copied}/{total} with copy head"
+        );
+    }
+    println!("({:.0}s)", t.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
@@ -460,6 +503,7 @@ fn main() {
         Some("ablate") => ablate(&args),
         Some("reread") => reread(&args),
         Some("probe") => probe(&args),
+        Some("copyeval") => copyeval(&args),
         _ => {
             eprintln!("usage: snn-lm prepare [--src DIR] [--out DIR] [--vocab N] [--sample-mb N]");
             eprintln!("       snn-lm train [--steps N] [--hours H] [--memory on|off] [--out DIR] [--lr X] [--batch N]");
