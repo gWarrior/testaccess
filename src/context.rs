@@ -165,6 +165,24 @@ pub struct Located {
     pub positions: Vec<u64>,
 }
 
+/// Retrieved key/value rows (see [`ContextMemory::retrieve_rows`]).
+#[derive(Clone, Debug)]
+pub struct MemoryRows {
+    pub verdict: Verdict,
+    pub confidence: f32,
+    pub positions: Vec<u64>,
+    /// `positions.len() × key_dim`, row-major.
+    pub keys: Vec<f32>,
+    /// `positions.len() × value_dim`, row-major.
+    pub values: Vec<f32>,
+}
+
+impl Default for MemoryRows {
+    fn default() -> Self {
+        Self { verdict: Verdict::Unknown, confidence: 0.0, positions: Vec::new(), keys: Vec::new(), values: Vec::new() }
+    }
+}
+
 /// Output of the cross-attention read head.
 #[derive(Clone, Debug)]
 pub struct ReadOut {
@@ -625,6 +643,32 @@ impl ContextMemory {
             Verdict::Absent => 0.0,
         };
         Ok(ReadOut { verdict: r.verdict, gate, attended, spans })
+    }
+
+    /// Keys and values of the tokens the SNN retrieves for `probe`, for a
+    /// model that runs its own (differentiable) attention over them. Rows
+    /// come from the most confident spans first, at most `limit` rows.
+    pub fn retrieve_rows(&mut self, probe: Probe<'_>, top_k: usize, limit: usize) -> Result<MemoryRows, MemoryError> {
+        let kv = self.kv.as_ref().ok_or(MemoryError::InvalidConfig("no K/V store configured".into()))?;
+        let (dk, dv) = (kv.key_dim(), kv.value_dim());
+        let r = self.retrieve(probe, top_k)?;
+        let kv = self.kv.as_ref().expect("checked above");
+        let mut rows = MemoryRows { verdict: r.verdict, ..Default::default() };
+        let (mut key, mut value) = (vec![0f32; dk], vec![0f32; dv]);
+        'spans: for span in r.spans.iter().filter(|s| s.in_window) {
+            for pos in span.start..span.end() {
+                if rows.positions.len() == limit {
+                    break 'spans;
+                }
+                if kv.read(pos, &mut key, &mut value) {
+                    rows.positions.push(pos);
+                    rows.keys.extend_from_slice(&key);
+                    rows.values.extend_from_slice(&value);
+                }
+            }
+        }
+        rows.confidence = r.spans.iter().map(|s| s.confidence).fold(0.0, f32::max);
+        Ok(rows)
     }
 
     // ----- lifecycle ------------------------------------------------------

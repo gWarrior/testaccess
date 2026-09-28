@@ -29,7 +29,8 @@ pub use attention::{attend, Attended};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use context::{
-    Chunk, ContextConfig, ContextMemory, ContextStats, KvConfig, Located, Probe, ReadOut, Retrieval, RetrievedSpan,
+    Chunk, ContextConfig, ContextMemory, ContextStats, KvConfig, Located, MemoryRows, Probe, ReadOut, Retrieval,
+    RetrievedSpan,
 };
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
 pub use kv::{KvPrecision, KvStore};

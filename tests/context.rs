@@ -168,6 +168,14 @@ fn read_head_attends_over_retrieved_tokens() {
     assert!((out.attended.output[0] - target as f32).abs() < 9.0 * 27.0);
     assert!(out.attended.tokens <= 9 * 27, "attention touched only retrieved chunks");
 
+    // The same retrieval as raw rows, for a model's own attention.
+    let rows = ctx.retrieve_rows(Probe::Tokens(&tokens[target - 4..target + 5]), 9, 243).unwrap();
+    assert_eq!(rows.verdict, Verdict::Known);
+    let i = rows.positions.iter().position(|&p| p == target as u64).expect("target row retrieved");
+    assert_eq!(&rows.keys[i * dk..(i + 1) * dk], &keys[target * dk..(target + 1) * dk]);
+    assert_eq!(rows.values.len(), rows.positions.len() * dv);
+    assert!(rows.positions.len() <= 243);
+
     // Semantic probe: the mean key of a chunk retrieves that chunk.
     let chunk_start = 2_700usize;
     let mut mean = vec![0f32; dk];
