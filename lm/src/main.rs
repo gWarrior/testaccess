@@ -288,7 +288,10 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             }
             _ => {}
         }
-        for t in tok.encode(&format!("{line}\n")) {
+        // A finished sentence is a turn; an unfinished one is continued in place.
+        let finished = line.ends_with(['.', '!', '?', '»', '…', '"']);
+        let prompt = if finished { format!("{line}\n") } else { line.to_string() };
+        for t in tok.encode(&prompt) {
             logits = engine.step(&mut session, t);
         }
         print!("модель> ");
@@ -296,16 +299,21 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         for _ in 0..max_new {
             let t = snn_lm::infer::sample(&logits, temperature, top_k, &mut rng);
             if t == snn_lm::tokenizer::DOC {
+                if out.is_empty() {
+                    continue;
+                }
                 break;
             }
             out.push(t);
             let text = tok.decode(&out);
             logits = engine.step(&mut session, t);
-            if text.ends_with('\n') {
+            // A line break ends the answer, but not before it has begun.
+            if text.ends_with('\n') && !text.trim().is_empty() {
                 break;
             }
         }
-        println!("{}", tok.decode(&out).trim_end());
+        // The token limit can cut a multibyte character in half.
+        println!("{}", tok.decode(&out).trim().trim_end_matches('\u{FFFD}'));
         // Close the turn so the model sees a clean line break.
         if !tok.decode(&out).ends_with('\n') {
             for t in tok.encode("\n") {
