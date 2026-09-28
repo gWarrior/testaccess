@@ -12,6 +12,7 @@ pub mod config;
 pub mod encoder;
 pub mod memory;
 pub mod rng;
+pub mod shared;
 pub mod types;
 
 mod bank;
@@ -26,4 +27,5 @@ pub use memory::{
     BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult, SnnMemory,
     Stats,
 };
+pub use shared::{MaintenanceHandle, SharedMemory};
 pub use types::{ContextId, Input, MemoryError, MemoryId, Tier};
