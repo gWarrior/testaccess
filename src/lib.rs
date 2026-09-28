@@ -10,6 +10,7 @@
 pub mod clock;
 pub mod config;
 pub mod encoder;
+pub mod kv;
 pub mod memory;
 pub mod rng;
 pub mod shared;
@@ -24,6 +25,7 @@ mod working;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{DynamicsConfig, MemoryConfig, PlasticityConfig, StpConfig};
 pub use encoder::{CodeEncoder, Encoder, FlyHashEncoder, NGramEncoder};
+pub use kv::{KvPrecision, KvStore};
 pub use memory::{
     Basis, BatchOptions, Hit, LearnOptions, MaintenanceReport, MemoryRecord, RecallOptions, RecallResult,
     SnnMemory, Stats, Verdict,
