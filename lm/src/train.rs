@@ -729,7 +729,10 @@ pub fn train(
         varmap.load(&ckpt)?;
         start_step =
             std::fs::read_to_string(cfg.out.join("step")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        println!("resumed from step {start_step}");
+        println!(
+            "WARNING: resumed from step {start_step} without resume/ state: the optimizer moments, the \
+             schedule clock and the stream memories start over"
+        );
     } else if let Some(init) = &cfg.init {
         // Warm start: every tensor the old checkpoint has; new ones keep their init.
         let old = candle_core::safetensors::load(init, &device)?;
@@ -751,6 +754,14 @@ pub fn train(
                 }
             }
         }
+    } else {
+        // A fresh run: priors for the memory head's scalar features. A
+        // longer induction match is likelier right (+1 nat per length bin);
+        // rows of a block the memory is sure about are likelier right.
+        let data = varmap.data().lock().expect("varmap lock");
+        let len: Vec<f32> = (0..crate::model::LEN_BINS).map(|i| i as f32).collect();
+        data["ind_len"].set(&Tensor::from_vec(len, crate::model::LEN_BINS, &device)?)?;
+        data["far_verdict"].set(&Tensor::new(&[1f32, 0.0, -1.0], &device)?)?;
     }
     let vars = varmap.all_vars();
     println!("parameters: {}", Model::n_params(&vars));
@@ -771,36 +782,29 @@ pub fn train(
             ema.push((name.clone(), v.clone(), t));
         }
     }
-    // Quantization steps θ move 27× slower: Adam normalizes their gradient,
-    // and a crossing of a rounding boundary rescales a whole row.
-    // The K/V step (one θ for many activations) moves at lr/3.
-    let (mut weights, mut steps, mut kv) = (Vec::new(), Vec::new(), Vec::new());
+    let mut groups: Vec<Vec<(String, candle_core::Var)>> = vec![Vec::new(); OPT_GROUPS.len()];
     for (n, v) in varmap.data().lock().expect("varmap lock").iter() {
-        let e = (n.clone(), v.clone());
-        if n == "kv_step" {
-            kv.push(e);
-        } else if n.ends_with("_step") {
-            steps.push(e);
-        } else {
-            weights.push(e);
-        }
+        groups[opt_group(n)].push((n.clone(), v.clone()));
     }
-    let mut opt = AdamW::new(weights, cfg.lr)?;
     // With automatic steps θ follows the latents (see `anchor_steps`).
     if cfg.auto_steps {
-        steps.clear();
+        groups[1].clear();
         anchor_steps(&model, &varmap)?;
     }
-    let mut opt_steps = AdamW::new(steps, cfg.lr / 27.0)?;
-    let mut opt_kv = AdamW::new(kv, cfg.lr / 3.0)?;
-    for o in [&mut opt, &mut opt_steps, &mut opt_kv] {
-        o.beta2 = cfg.beta2;
-    }
+    let mut opts = groups
+        .into_iter()
+        .zip(OPT_GROUPS)
+        .map(|(vars, (_, mult))| {
+            let mut o = AdamW::new(vars, cfg.lr * mult)?;
+            o.beta2 = cfg.beta2;
+            Ok(o)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if let Some(r) = &resumed {
         let saved = candle_core::safetensors::load(resume.join("optim.safetensors"), &device)?;
-        for (o, name, t) in [(&mut opt, "w", r.t[0]), (&mut opt_steps, "s", r.t[1]), (&mut opt_kv, "kv", r.t[2])] {
+        for (o, (name, _)) in opts.iter_mut().zip(OPT_GROUPS) {
             o.load_state(name, &saved)?;
-            o.t = t;
+            o.t = r.t.get(name).copied().unwrap_or(0);
         }
     }
 
@@ -870,9 +874,9 @@ pub fn train(
     let n = (b * t) as f64;
     for step in start_step..cfg.steps {
         let lr = lr_at(cfg, step, elapsed());
-        opt.lr = lr;
-        opt_steps.lr = lr / 27.0;
-        opt_kv.lr = lr / 3.0;
+        for (o, (_, mult)) in opts.iter_mut().zip(OPT_GROUPS) {
+            o.lr = lr * mult;
+        }
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
         let mut kinds = Vec::with_capacity(b * t);
@@ -963,9 +967,9 @@ pub fn train(
             println!("step {}: skipped (loss {loss_value}, grad norm {norm})", step + 1);
             continue;
         }
-        opt.step(&grads)?;
-        opt_steps.step(&grads)?;
-        opt_kv.step(&grads)?;
+        for o in &mut opts {
+            o.step(&grads)?;
+        }
         if cfg.auto_steps {
             anchor_steps(&model, &varmap)?;
         }
@@ -1098,7 +1102,7 @@ pub fn train(
         }
         if (step + 1) % cfg.ckpt_every == 0 || last || stopped {
             let t0 = Instant::now();
-            save_resume(&resume, &varmap, &ema, [&opt, &opt_steps, &opt_kv], &runners, step + 1, elapsed())?;
+            save_resume(&resume, &varmap, &ema, &opts, &runners, step + 1, elapsed())?;
             save_ema()?;
             varmap.save(&ckpt)?;
             std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
@@ -1114,6 +1118,37 @@ pub fn train(
         }
     }
     Ok(())
+}
+
+/// Optimizer groups and their lr multipliers:
+/// - `w`: weights;
+/// - `s`: quantization steps θ (LSQ mode only) — Adam normalizes their
+///   gradient and a rounding crossing rescales a whole row, so 27× slower;
+/// - `kv`: the shared K/V step (one θ for many activations), 3× slower;
+/// - `head`: the memory head's scalar features (null bias, induction and
+///   row biases) — Adam moves a scalar at most lr a step, and they need
+///   several nats (analyst 7: gate_b had not moved from 8.0 by step 891);
+/// - `sign`: the Hadamard recurrence signs, 9× slower — near zero an STE
+///   sign flips from step to step and reshapes the recurrence.
+const OPT_GROUPS: [(&str, f64); 5] =
+    [("w", 1.0), ("s", 1.0 / 27.0), ("kv", 1.0 / 3.0), ("head", 9.0), ("sign", 1.0 / 9.0)];
+
+/// The memory head's scalar features (optimizer group `head`).
+const HEAD_SCALARS: [&str; 9] =
+    ["gate_b", "gate_verdict", "ind_len", "ind_count", "ind_dist", "ind_verdict", "ind_p", "far_verdict", "far_source"];
+
+fn opt_group(name: &str) -> usize {
+    if name == "kv_step" {
+        2
+    } else if name.ends_with("_step") {
+        1
+    } else if HEAD_SCALARS.contains(&name) {
+        3
+    } else if name.ends_with(".sign") {
+        4
+    } else {
+        0
+    }
 }
 
 /// Set every weight row's step to the MSE optimum of its latents.
@@ -1142,8 +1177,8 @@ struct GroupOut {
 struct ResumeInfo {
     step: usize,
     elapsed: f64,
-    /// Updates of the weight, step and K/V-step optimizers.
-    t: [usize; 3],
+    /// Updates done by each optimizer group (`t_{group}`).
+    t: std::collections::HashMap<&'static str, usize>,
 }
 
 impl ResumeInfo {
@@ -1158,7 +1193,8 @@ impl ResumeInfo {
         Ok(Self {
             step: field("step")? as usize,
             elapsed: field("elapsed")?,
-            t: [field("t_w")? as usize, field("t_s")? as usize, field("t_kv")? as usize],
+            // A group missing from an older state starts fresh.
+            t: OPT_GROUPS.iter().filter_map(|(g, _)| field(&format!("t_{g}")).ok().map(|t| (*g, t as usize))).collect(),
         })
     }
 }
@@ -1169,7 +1205,7 @@ fn save_resume(
     dir: &Path,
     varmap: &VarMap,
     ema: &[(String, candle_core::Var, Tensor)],
-    opts: [&AdamW; 3],
+    opts: &[AdamW],
     runners: &[Runner],
     step: usize,
     elapsed: f64,
@@ -1183,7 +1219,7 @@ fn save_resume(
         candle_core::safetensors::save(&m, tmp.join("model.ema.safetensors"))?;
     }
     let mut o = std::collections::HashMap::new();
-    for (opt, name) in opts.iter().zip(["w", "s", "kv"]) {
+    for (opt, (name, _)) in opts.iter().zip(OPT_GROUPS) {
         opt.state(name, &mut o);
     }
     candle_core::safetensors::save(&o, tmp.join("optim.safetensors"))?;
@@ -1192,7 +1228,10 @@ fn save_resume(
     }
     std::fs::write(
         tmp.join("state.txt"),
-        format!("step={step}\nelapsed={elapsed}\nt_w={}\nt_s={}\nt_kv={}\n", opts[0].t, opts[1].t, opts[2].t),
+        format!(
+            "step={step}\nelapsed={elapsed}\n{}",
+            opts.iter().zip(OPT_GROUPS).map(|(o, (g, _))| format!("t_{g}={}\n", o.t)).collect::<String>()
+        ),
     )?;
     let old = dir.with_extension("old");
     let _ = std::fs::remove_dir_all(&old);
