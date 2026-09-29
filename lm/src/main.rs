@@ -302,11 +302,17 @@ fn export(args: &[String]) -> std::io::Result<()> {
 fn chat(args: &[String]) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
     let dir = PathBuf::from(arg(args, "--model", "lm/model"));
-    let mut temperature: f32 = arg(args, "--temp", "0.8").parse().expect("--temp");
-    let top_k: usize = arg(args, "--top-k", "27").parse().expect("--top-k");
+    let d = snn_lm::infer::Decoding::default();
+    let mut decoding = snn_lm::infer::Decoding {
+        temperature: arg(args, "--temp", &d.temperature.to_string()).parse().expect("--temp"),
+        top_p: arg(args, "--top-p", &d.top_p.to_string()).parse().expect("--top-p"),
+        presence: arg(args, "--presence", &d.presence.to_string()).parse().expect("--presence"),
+        copy: arg(args, "--copy", &d.copy.to_string()).parse().expect("--copy"),
+    };
     let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
     let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
-    let copy: f32 = arg(args, "--copy", "0.5").parse().expect("--copy");
+    // Dialogue lines as in prose: "— реплика", the reply after "— ".
+    let dialog = arg(args, "--format", "dialog") == "dialog";
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
@@ -321,7 +327,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         seed
     };
     let mut rng = snn_memory::rng::SplitMix64::new(seed);
-    let mut logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
+    let mut parts = engine.step_parts(&mut session, snn_lm::tokenizer::DOC);
     let context = arg(args, "--context", "");
     if !context.is_empty() {
         let limit: usize = arg(args, "--context-tokens", "300000").parse().expect("--context-tokens");
@@ -329,7 +335,10 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         let mut ids = tok.encode(&text);
         ids.truncate(limit);
         let t = Instant::now();
-        logits = engine.feed(&mut session, &ids).unwrap_or(logits);
+        if let Some((&last, rest)) = ids.split_last() {
+            engine.feed(&mut session, rest);
+            parts = engine.step_parts(&mut session, last);
+        }
         println!("(в контекст загружено {} токенов из {context} за {:.0}s)", ids.len(), t.elapsed().as_secs_f64());
     }
     println!("snn-lm: тернарная HadamRNN ~8M параметров + SNN-память на {memory_tokens} токенов.");
@@ -351,32 +360,40 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             Some("/quit") => break,
             Some("/reset") => {
                 session = engine.session_with(memory_tokens, precision);
-                logits = engine.step(&mut session, snn_lm::tokenizer::DOC);
+                parts = engine.step_parts(&mut session, snn_lm::tokenizer::DOC);
                 println!("(новый диалог)");
                 continue;
             }
             Some("/temp") => {
-                temperature = line[5..].trim().parse().unwrap_or(temperature);
-                println!("(температура {temperature})");
+                decoding.temperature = line[5..].trim().parse().unwrap_or(decoding.temperature);
+                println!("(температура {})", decoding.temperature);
                 continue;
             }
             _ => {}
         }
-        // A finished sentence is a turn; an unfinished one is continued in place.
-        let finished = line.ends_with(['.', '!', '?', '»', '…', '"']);
-        let prompt = if finished { format!("{line}\n") } else { line.to_string() };
+        let prompt = if dialog {
+            format!("— {line}\n— ")
+        } else if line.ends_with(['.', '!', '?', '»', '…', '"']) {
+            // A finished sentence is a turn; an unfinished one is continued in place.
+            format!("{line}\n")
+        } else {
+            line.to_string()
+        };
         for t in tok.encode(&prompt) {
-            logits = engine.step(&mut session, t);
+            parts = engine.step_parts(&mut session, t);
         }
         print!("модель> ");
         let mut out = Vec::new();
         let reply_start = engine.position(&session);
         session.reply_start = reply_start;
         for _ in 0..max_new {
-            if copy > 0.0 {
-                engine.copy(&mut session, &mut logits, copy, reply_start);
+            let mut p = parts.clone();
+            if decoding.copy > 0.0 {
+                if let Some((c, len)) = engine.induction(&mut session, reply_start) {
+                    p.add_copy(c, decoding.copy_weight(len));
+                }
             }
-            let t = snn_lm::infer::sample(&logits, temperature, top_k, &mut rng);
+            let t = decoding.sample(&p, &out, &mut rng);
             if t == snn_lm::tokenizer::DOC {
                 if out.is_empty() {
                     continue;
@@ -385,7 +402,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             }
             out.push(t);
             let text = tok.decode(&out);
-            logits = engine.step(&mut session, t);
+            parts = engine.step_parts(&mut session, t);
             // A line break ends the answer, but not before it has begun.
             if text.ends_with('\n') && !text.trim().is_empty() {
                 break;
@@ -397,7 +414,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         // Close the turn so the model sees a clean line break.
         if !tok.decode(&out).ends_with('\n') {
             for t in tok.encode("\n") {
-                logits = engine.step(&mut session, t);
+                parts = engine.step_parts(&mut session, t);
             }
         }
     }
