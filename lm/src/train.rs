@@ -16,12 +16,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use candle_nn::{VarBuilder, VarMap};
 use rayon::prelude::*;
 use snn_memory::{ContextConfig, ContextMemory, KvConfig, KvPrecision, Probe, Verdict};
 
 use crate::data::{Episodes, TaskStream};
 use crate::model::{BlockRows, Config, IndCand, MemBatch, Model, State, Trunk};
+use crate::optim::AdamW;
 
 #[derive(Clone, Debug)]
 pub struct TrainConfig {
@@ -122,6 +123,39 @@ pub struct Induction {
     limit: usize,
 }
 
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32s(out: &mut Vec<u8>, v: &[u32]) {
+    put_u64(out, v.len() as u64);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if input.len() < n {
+        candle_core::bail!("resume state is truncated");
+    }
+    let (head, rest) = input.split_at(n);
+    *input = rest;
+    Ok(head)
+}
+
+fn get_u64(input: &mut &[u8]) -> Result<u64> {
+    Ok(u64::from_le_bytes(take(input, 8)?.try_into().expect("8 bytes")))
+}
+
+fn get_u32(input: &mut &[u8]) -> Result<u32> {
+    Ok(u32::from_le_bytes(take(input, 4)?.try_into().expect("4 bytes")))
+}
+
+fn get_u32s(input: &mut &[u8]) -> Result<Vec<u32>> {
+    let n = get_u64(input)? as usize;
+    Ok(take(input, n * 4)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes"))).collect())
+}
+
 pub fn ngram_key(g: &[u32]) -> u32 {
     let h =
         g.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ g.len() as u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100_0000_01b3));
@@ -138,6 +172,29 @@ impl Induction {
             let e = self.index.entry(ngram_key(&self.tokens[p + 1 - n..=p])).or_insert((0, 0));
             *e = (p as u32, e.1 + 1);
         }
+    }
+
+    fn save(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.limit as u64);
+        put_u32s(out, &self.tokens);
+        put_u64(out, self.index.len() as u64);
+        for (&k, &(p, c)) in &self.index {
+            out.extend_from_slice(&k.to_le_bytes());
+            out.extend_from_slice(&p.to_le_bytes());
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+
+    fn load(input: &mut &[u8]) -> Result<Self> {
+        let limit = get_u64(input)? as usize;
+        let tokens = get_u32s(input)?;
+        let n = get_u64(input)? as usize;
+        let mut index = std::collections::HashMap::with_capacity(n);
+        for _ in 0..n {
+            let (k, p, c) = (get_u32(input)?, get_u32(input)?, get_u32(input)?);
+            index.insert(k, (p, c));
+        }
+        Ok(Self { tokens, index, limit })
     }
 
     /// Feed a window; the induction candidate of every position.
@@ -189,18 +246,43 @@ pub struct StreamMemory {
 }
 
 impl StreamMemory {
+    fn config(dim: usize, max_tokens: usize, precision: KvPrecision) -> ContextConfig {
+        ContextConfig { max_tokens, kv: Some(KvConfig { precision, ..KvConfig::new(dim, dim) }), ..Default::default() }
+    }
+
     pub fn new(dim: usize, max_tokens: usize, precision: KvPrecision) -> Self {
-        let cfg = ContextConfig {
-            max_tokens,
-            kv: Some(KvConfig { precision, ..KvConfig::new(dim, dim) }),
-            ..Default::default()
-        };
         Self {
-            mem: ContextMemory::new(cfg).expect("valid memory config"),
+            mem: ContextMemory::new(Self::config(dim, max_tokens, precision)).expect("valid memory config"),
             history: Vec::new(),
             induction: Induction::new(max_tokens),
             local: Induction::new(243),
         }
+    }
+
+    /// Everything of this stream's memory, for an exact resume.
+    pub fn save(&self) -> Vec<u8> {
+        let mem = self.mem.save_full();
+        let mut out = Vec::with_capacity(mem.len() + 8 * self.induction.tokens.len() + 64);
+        put_u64(&mut out, mem.len() as u64);
+        out.extend_from_slice(&mem);
+        put_u32s(&mut out, &self.history);
+        self.induction.save(&mut out);
+        self.local.save(&mut out);
+        out
+    }
+
+    pub fn load(dim: usize, max_tokens: usize, precision: KvPrecision, bytes: &[u8]) -> Result<Self> {
+        let mut input = bytes;
+        let n = get_u64(&mut input)? as usize;
+        let mem = ContextMemory::restore_full(Self::config(dim, max_tokens, precision), take(&mut input, n)?)
+            .map_err(candle_core::Error::wrap)?;
+        let history = get_u32s(&mut input)?;
+        let induction = Induction::load(&mut input)?;
+        let local = Induction::load(&mut input)?;
+        if !input.is_empty() {
+            candle_core::bail!("trailing bytes in a stream memory");
+        }
+        Ok(Self { mem, history, induction, local })
     }
 
     /// Rows for every block of this window.
@@ -303,6 +385,60 @@ impl Runner {
         let dim = model.cfg.mem_dim;
         let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
         Ok(Self { model, state, memories, use_memory, top_k: 3, rows: 81, reset_state: false, prev: None, pos: 0 })
+    }
+
+    /// The runner's recurrent state, previous window and stream memories
+    /// into `dir` (files `{tag}.*`), for an exact resume.
+    pub fn save(&self, dir: &Path, tag: &str) -> Result<()> {
+        let mut t = std::collections::HashMap::new();
+        for (i, h) in self.state.h.iter().enumerate() {
+            t.insert(format!("h{i}"), h.clone());
+        }
+        for (i, s) in self.state.s.iter().enumerate() {
+            t.insert(format!("s{i}"), s.clone());
+        }
+        if let Some((k, v, x)) = &self.prev {
+            t.insert("prev_k".into(), k.clone());
+            t.insert("prev_v".into(), v.clone());
+            t.insert("prev_x".into(), Tensor::new(x.as_slice(), k.device())?);
+        }
+        t.insert("pos".into(), Tensor::new(&[self.pos as f64], &Device::Cpu)?);
+        candle_core::safetensors::save(&t, dir.join(format!("{tag}.safetensors")))?;
+        if self.use_memory {
+            let bytes: Vec<Vec<u8>> = self.memories.par_iter().map(StreamMemory::save).collect();
+            for (i, b) in bytes.iter().enumerate() {
+                std::fs::write(dir.join(format!("{tag}.mem{i}")), b)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore what [`save`](Self::save) wrote.
+    pub fn load(&mut self, dir: &Path, tag: &str, max_tokens: usize, precision: KvPrecision) -> Result<()> {
+        let t = candle_core::safetensors::load(dir.join(format!("{tag}.safetensors")), &Device::Cpu)?;
+        let get = |n: &str| t.get(n).cloned().ok_or_else(|| candle_core::Error::Msg(format!("resume: no {n}")));
+        for (i, h) in self.state.h.iter_mut().enumerate() {
+            *h = get(&format!("h{i}"))?;
+        }
+        for (i, s) in self.state.s.iter_mut().enumerate() {
+            *s = get(&format!("s{i}"))?;
+        }
+        self.prev = match t.get("prev_x") {
+            Some(x) => Some((get("prev_k")?, get("prev_v")?, x.to_vec1::<u32>()?)),
+            None => None,
+        };
+        self.pos = get("pos")?.to_vec1::<f64>()?[0] as u64;
+        if self.use_memory {
+            let dim = self.model.cfg.mem_dim;
+            self.memories = (0..self.memories.len())
+                .into_par_iter()
+                .map(|i| {
+                    let bytes = std::fs::read(dir.join(format!("{tag}.mem{i}")))?;
+                    StreamMemory::load(dim, max_tokens, precision, &bytes)
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        Ok(())
     }
 
     /// Forward one window `x` (`B × T`, row-major) without committing it.
@@ -564,8 +700,17 @@ pub fn train(
     let mut varmap = VarMap::new();
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), mcfg.clone())?;
     let ckpt = cfg.out.join("model.safetensors");
+    // The exact resume state (see `save_resume`): weights, moving average,
+    // optimizer moments, schedule clock, runners with their stream memories.
+    let resume = cfg.out.join("resume");
+    let resumed: Option<ResumeInfo> =
+        if resume.join("state.txt").exists() { Some(ResumeInfo::read(&resume)?) } else { None };
     let mut start_step = 0;
-    if ckpt.exists() {
+    if let Some(r) = &resumed {
+        varmap.load(resume.join("model.safetensors"))?;
+        start_step = r.step;
+        println!("resumed exactly from step {start_step} ({:.0}s of schedule done)", r.elapsed);
+    } else if ckpt.exists() {
         varmap.load(&ckpt)?;
         start_step =
             std::fs::read_to_string(cfg.out.join("step")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
@@ -599,7 +744,9 @@ pub fn train(
     let ema_file = cfg.out.join("model.ema.safetensors");
     let mut ema: Vec<(String, candle_core::Var, Tensor)> = Vec::new();
     if cfg.ema > 0.0 {
-        let saved = if start_step > 0 && ema_file.exists() {
+        let saved = if resumed.is_some() && resume.join("model.ema.safetensors").exists() {
+            candle_core::safetensors::load(resume.join("model.ema.safetensors"), &device)?
+        } else if start_step > 0 && ema_file.exists() {
             candle_core::safetensors::load(&ema_file, &device)?
         } else {
             Default::default()
@@ -614,17 +761,25 @@ pub fn train(
     // The K/V step (one θ for many activations) moves at lr/3.
     let (mut weights, mut steps, mut kv) = (Vec::new(), Vec::new(), Vec::new());
     for (n, v) in varmap.data().lock().expect("varmap lock").iter() {
+        let e = (n.clone(), v.clone());
         if n == "kv_step" {
-            kv.push(v.clone());
+            kv.push(e);
         } else if n.ends_with("_step") {
-            steps.push(v.clone());
+            steps.push(e);
         } else {
-            weights.push(v.clone());
+            weights.push(e);
         }
     }
-    let mut opt = AdamW::new(weights, ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
-    let mut opt_steps = AdamW::new(steps, ParamsAdamW { lr: cfg.lr / 27.0, weight_decay: 0.0, ..Default::default() })?;
-    let mut opt_kv = AdamW::new(kv, ParamsAdamW { lr: cfg.lr / 3.0, weight_decay: 0.0, ..Default::default() })?;
+    let mut opt = AdamW::new(weights, cfg.lr)?;
+    let mut opt_steps = AdamW::new(steps, cfg.lr / 27.0)?;
+    let mut opt_kv = AdamW::new(kv, cfg.lr / 3.0)?;
+    if let Some(r) = &resumed {
+        let saved = candle_core::safetensors::load(resume.join("optim.safetensors"), &device)?;
+        for (o, name, t) in [(&mut opt, "w", r.t[0]), (&mut opt_steps, "s", r.t[1]), (&mut opt_kv, "kv", r.t[2])] {
+            o.load_state(name, &saved)?;
+            o.t = t;
+        }
+    }
 
     let (b, t) = (cfg.batch, cfg.window);
     // Streams run in groups of `micro` (gradients accumulate): the autograd
@@ -655,7 +810,18 @@ pub fn train(
         // minus two windows, so a statement is still in memory when asked.
         s.distance = (27, cfg.max_tokens.saturating_sub(2 * 243).max(243));
     }
-    // Resuming fast-forwards the streams, so data is not repeated.
+    if resumed.is_some() {
+        for (g, r) in runners.iter_mut().enumerate() {
+            r.load(&resume, &format!("runner{g}"), cfg.max_tokens, KvPrecision::Trit2)?;
+        }
+    }
+    // SIGTERM / SIGINT: finish the step, save the resume state, stop.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, stop.clone()).map_err(candle_core::Error::wrap)?;
+    }
+    // Resuming fast-forwards the streams (they are deterministic), so data
+    // is neither repeated nor skipped.
     for s in &mut streams {
         for _ in 0..start_step {
             s.window(tokens, &ep, t);
@@ -664,6 +830,9 @@ pub fn train(
 
     println!("rss after setup: {:.2} GB", rss_gb());
     let clock = Instant::now();
+    // Schedule time, carried over a resume (the --hours cosine continues).
+    let elapsed0 = resumed.as_ref().map_or(0.0, |r| r.elapsed);
+    let elapsed = || elapsed0 + clock.elapsed().as_secs_f64();
     let (mut sum_loss, mut sum_known, mut sum_blocks, mut n_steps, mut n_logged) =
         (0f64, 0usize, 0usize, 0usize, 0usize);
     // Mean loss per token kind: plain text, fact answers, re-read spans, templates.
@@ -674,10 +843,10 @@ pub fn train(
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("log.tsv"))?;
     let n = (b * t) as f64;
     for step in start_step..cfg.steps {
-        let lr = lr_at(cfg, step, clock.elapsed().as_secs_f64());
-        opt.set_learning_rate(lr);
-        opt_steps.set_learning_rate(lr / 27.0);
-        opt_kv.set_learning_rate(lr / 3.0);
+        let lr = lr_at(cfg, step, elapsed());
+        opt.lr = lr;
+        opt_steps.lr = lr / 27.0;
+        opt_kv.lr = lr / 3.0;
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
         let mut kinds = Vec::with_capacity(b * t);
@@ -774,7 +943,7 @@ pub fn train(
         if (step + 1) % cfg.log_every == 0 {
             let el = clock.elapsed().as_secs_f64();
             let line = format!(
-                "{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{:.0}\t{:.2e}\tfwd {:.1}s bwd {:.1}s opt {:.1}s mem {:.1}s",
+                "{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{:.0}\t{:.2e}\tfwd {:.1}s bwd {:.1}s opt {:.1}s ckpt {:.1}s",
                 step + 1,
                 sum_loss / n_logged as f64,
                 by_kind[0].0 / by_kind[0].1.max(1) as f64,
@@ -783,7 +952,7 @@ pub fn train(
                 if by_kind[3].1 > 0 { by_kind[3].0 / by_kind[3].1 as f64 } else { f64::NAN },
                 sum_known as f64 / sum_blocks.max(1) as f64,
                 (n_steps * b * t) as f64 / el,
-                lr_at(cfg, step, clock.elapsed().as_secs_f64()),
+                lr_at(cfg, step, elapsed()),
                 timing[0] / n_logged as f64,
                 timing[1] / n_logged as f64,
                 timing[2] / n_logged as f64,
@@ -847,9 +1016,10 @@ pub fn train(
             Ok(())
         };
         // The last step, by count or by the time limit.
-        let time_up = cfg.time_limit > 0 && clock.elapsed().as_secs() >= cfg.time_limit;
+        let time_up = cfg.time_limit > 0 && elapsed() >= cfg.time_limit as f64;
+        let stopped = stop.load(std::sync::atomic::Ordering::Relaxed);
         let last = step + 1 == cfg.steps || time_up;
-        if cfg.val_every > 0 && ((step + 1) % cfg.val_every == 0 || last) && !val.is_empty() {
+        if !stopped && cfg.val_every > 0 && ((step + 1) % cfg.val_every == 0 || last) && !val.is_empty() {
             let t0 = Instant::now();
             let now = crate::eval::val_loss_fitted(model.clone(), val, 9, 27, cfg.memory, KvPrecision::Trit2)?;
             let avg = if ema.is_empty() {
@@ -870,17 +1040,99 @@ pub fn train(
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("val.tsv"))?;
             use std::io::Write as _;
             writeln!(f, "{}\t{now:.4}\t{avg:.4}", step + 1)?;
+            // Keep every validated point: weights and average by step.
+            let snaps = cfg.out.join("snapshots");
+            std::fs::create_dir_all(&snaps)?;
+            varmap.save(snaps.join(format!("step{}.safetensors", step + 1)))?;
+            if !ema.is_empty() {
+                let m: std::collections::HashMap<String, Tensor> =
+                    ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
+                candle_core::safetensors::save(&m, snaps.join(format!("step{}.ema.safetensors", step + 1)))?;
+            }
         }
-        if (step + 1) % cfg.ckpt_every == 0 || last {
+        if (step + 1) % cfg.ckpt_every == 0 || last || stopped {
+            let t0 = Instant::now();
+            save_resume(&resume, &varmap, &ema, [&opt, &opt_steps, &opt_kv], &runners, step + 1, elapsed())?;
             save_ema()?;
             varmap.save(&ckpt)?;
             std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
+            timing[3] += t0.elapsed().as_secs_f64();
+        }
+        if stopped {
+            println!("stopped by a signal at step {}; resume state saved", step + 1);
+            break;
         }
         if time_up {
             println!("time limit reached at step {}", step + 1);
             break;
         }
     }
+    Ok(())
+}
+
+/// What `state.txt` of a resume directory records.
+struct ResumeInfo {
+    step: usize,
+    elapsed: f64,
+    /// Updates of the weight, step and K/V-step optimizers.
+    t: [usize; 3],
+}
+
+impl ResumeInfo {
+    fn read(dir: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(dir.join("state.txt"))?;
+        let field = |k: &str| -> Result<f64> {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.trim().parse().ok())
+                .ok_or_else(|| candle_core::Error::Msg(format!("resume state.txt has no {k}")))
+        };
+        Ok(Self {
+            step: field("step")? as usize,
+            elapsed: field("elapsed")?,
+            t: [field("t_w")? as usize, field("t_s")? as usize, field("t_kv")? as usize],
+        })
+    }
+}
+
+/// Write the exact resume state into `dir`: first into `dir.tmp`, then
+/// swapped in, so a crash while saving leaves the previous state intact.
+fn save_resume(
+    dir: &Path,
+    varmap: &VarMap,
+    ema: &[(String, candle_core::Var, Tensor)],
+    opts: [&AdamW; 3],
+    runners: &[Runner],
+    step: usize,
+    elapsed: f64,
+) -> Result<()> {
+    let tmp = dir.with_extension("tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    varmap.save(tmp.join("model.safetensors"))?;
+    if !ema.is_empty() {
+        let m: std::collections::HashMap<String, Tensor> = ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
+        candle_core::safetensors::save(&m, tmp.join("model.ema.safetensors"))?;
+    }
+    let mut o = std::collections::HashMap::new();
+    for (opt, name) in opts.iter().zip(["w", "s", "kv"]) {
+        opt.state(name, &mut o);
+    }
+    candle_core::safetensors::save(&o, tmp.join("optim.safetensors"))?;
+    for (g, r) in runners.iter().enumerate() {
+        r.save(&tmp, &format!("runner{g}"))?;
+    }
+    std::fs::write(
+        tmp.join("state.txt"),
+        format!("step={step}\nelapsed={elapsed}\nt_w={}\nt_s={}\nt_kv={}\n", opts[0].t, opts[1].t, opts[2].t),
+    )?;
+    let old = dir.with_extension("old");
+    let _ = std::fs::remove_dir_all(&old);
+    if dir.exists() {
+        std::fs::rename(dir, &old)?;
+    }
+    std::fs::rename(&tmp, dir)?;
+    let _ = std::fs::remove_dir_all(&old);
     Ok(())
 }
 

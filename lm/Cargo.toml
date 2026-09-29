@@ -16,4 +16,5 @@ candle-core = "0.9"
 candle-nn = "0.9"
 rayon = "1.10"
 memmap2 = "0.9"
+signal-hook = "0.3"
 parquet = { version = "56", default-features = false, features = ["snap", "zstd"] }
