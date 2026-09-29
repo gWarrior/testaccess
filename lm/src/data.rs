@@ -270,6 +270,8 @@ impl Episodes {
                     &format!("\nКак зовут {acc_lower}? —"),
                     &format!("\nКличка {gen}? —"),
                     &format!("\nНапомни, как зовут {acc_lower}? —"),
+                    // Held out: only the evaluation asks this way.
+                    &format!("\nСкажи, как зовут {acc_lower}? —"),
                 ]),
             )
         })
@@ -286,15 +288,30 @@ impl Episodes {
             friend: e("\nМоего друга зовут"),
             ask_name: (
                 e("\nМеня зовут"),
-                many(&["\nКак меня зовут? —", "\nНапомни, как меня зовут? —", "\nМоё имя? —"]),
+                many(&[
+                    "\nКак меня зовут? —",
+                    "\nНапомни, как меня зовут? —",
+                    "\nМоё имя? —",
+                    "\nСкажи, как меня зовут? —",
+                ]),
             ),
             ask_town: (
                 e("\nЯ живу в городе"),
-                many(&["\nВ каком городе я живу? —", "\nГде я живу? —", "\nНапомни, в каком городе я живу? —"]),
+                many(&[
+                    "\nВ каком городе я живу? —",
+                    "\nГде я живу? —",
+                    "\nНапомни, в каком городе я живу? —",
+                    "\nНазови мой город? —",
+                ]),
             ),
             ask_friend: (
                 e("\nМоего друга зовут"),
-                many(&["\nКак зовут моего друга? —", "\nИмя моего друга? —", "\nНапомни, как зовут моего друга? —"]),
+                many(&[
+                    "\nКак зовут моего друга? —",
+                    "\nИмя моего друга? —",
+                    "\nНапомни, как зовут моего друга? —",
+                    "\nСкажи, как зовут моего друга? —",
+                ]),
             ),
             pets,
             who: (e("\nКто такой"), e("? —")),
@@ -354,6 +371,26 @@ impl Episodes {
         same_words: bool,
         which: Option<u64>,
     ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        self.person(rng, same_words, which, false)
+    }
+
+    /// As [`Self::sample_person`], asked with the paraphrase that training
+    /// never uses (an honest test of association).
+    pub fn sample_person_held_out(
+        &self,
+        rng: &mut snn_memory::rng::SplitMix64,
+        which: u64,
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        self.person(rng, false, Some(which), true)
+    }
+
+    fn person(
+        &self,
+        rng: &mut snn_memory::rng::SplitMix64,
+        same_words: bool,
+        which: Option<u64>,
+        held_out: bool,
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let pick =
             |v: &[Vec<u32>], rng: &mut snn_memory::rng::SplitMix64| v[rng.below(v.len() as u64) as usize].clone();
         let (name, town, pet_name, friend) =
@@ -370,11 +407,14 @@ impl Episodes {
             intro.extend([&self.tok_end[..], &self.friend, &friend].concat());
         }
         intro.extend(&self.end);
+        // The last paraphrase of every list is held out for evaluation.
         let ask = |(own, paraphrases): &(Vec<u32>, Vec<Vec<u32>>), rng: &mut snn_memory::rng::SplitMix64| {
             if same_words {
                 own.clone()
+            } else if held_out {
+                paraphrases[paraphrases.len() - 1].clone()
             } else {
-                pick(paraphrases, rng)
+                pick(&paraphrases[..paraphrases.len() - 1], rng)
             }
         };
         let answer = |a: &[u32]| [a, &self.end].concat();
@@ -427,9 +467,6 @@ pub struct TaskStream {
     past: std::collections::VecDeque<u32>,
 }
 
-/// Longest look-back of a re-reading episode.
-const REREAD_MAX: usize = 19_683;
-
 impl TaskStream {
     pub fn new(start: usize, len: usize, seed: u64) -> Self {
         Self {
@@ -440,7 +477,7 @@ impl TaskStream {
             pending: Default::default(),
             questions: Vec::new(),
             carry: None,
-            p_episode: 1.0 / 243.0,
+            p_episode: 1.0 / 729.0,
             distance: (27, 19_683),
             jump: false,
             p_reread: 0.0,
@@ -453,7 +490,10 @@ impl TaskStream {
         if self.pending.is_empty() && self.p_reread > 0.0 && self.past.len() > 2 * 243 {
             if self.rng.next_f64() < self.p_reread {
                 let len = 27 + self.rng.below(55) as usize;
-                let back = 243 + self.rng.below((self.past.len() - 243 - len) as u64) as usize;
+                // Log-uniform look-back from 243 tokens to all that is kept.
+                let span = ((self.past.len() - len) as f64 / 243.0).ln().max(0.0);
+                let back = ((243f64).ln() + self.rng.next_f64() * span).exp() as usize;
+                let back = back.clamp(243 + len, self.past.len());
                 let start = self.past.len() - back;
                 let span: Vec<u32> = self.past.range(start..start + len).copied().collect();
                 // The first token of the span cannot be predicted; the rest can be copied.
@@ -464,7 +504,7 @@ impl TaskStream {
         let out = self.next_raw(tokens, ep);
         if self.p_reread > 0.0 {
             self.past.push_back(out.0);
-            if self.past.len() > REREAD_MAX + 81 {
+            if self.past.len() > self.distance.1 + 81 {
                 self.past.pop_front();
             }
         }

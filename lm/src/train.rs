@@ -45,8 +45,9 @@ pub struct TrainConfig {
     pub init: Option<PathBuf>,
     /// Streams jump to a random document of the whole corpus after each one.
     pub jump: bool,
-    /// Probability per token of a re-reading episode.
+    /// Probability per token of a re-reading episode and of an episode.
     pub p_reread: f64,
+    pub p_episode: f64,
     /// Weight of the auxiliary pointer loss per answer / re-read token,
     /// relative to a token's mixture loss (template answers get none).
     pub aux: f64,
@@ -63,8 +64,9 @@ impl Default for TrainConfig {
             memory: true,
             top_k: 3,
             rows: 81,
-            // Short in training so stored keys stay close to current weights.
-            max_tokens: 59_049,
+            // 3^11: episodes and re-reading reach this far, close to the 300k
+            // of inference.
+            max_tokens: 177_147,
             clip: 1.0,
             log_every: 9,
             ckpt_every: 81,
@@ -73,7 +75,8 @@ impl Default for TrainConfig {
             time_limit: 0,
             init: None,
             jump: true,
-            p_reread: 1.0 / 729.0,
+            p_reread: 1.0 / 2187.0,
+            p_episode: 1.0 / 729.0,
             aux: 1.0,
         }
     }
@@ -574,6 +577,9 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     for s in &mut streams {
         s.jump = cfg.jump;
         s.p_reread = cfg.p_reread;
+        s.p_episode = cfg.p_episode;
+        // Episodes and re-reading reach as far as the training memory.
+        s.distance = (27, cfg.max_tokens.max(243));
     }
     // Resuming fast-forwards the streams, so data is not repeated.
     for s in &mut streams {
@@ -670,10 +676,17 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         }
         if (step + 1) % (cfg.log_every * 9) == 0 {
             let (mut zero, mut clipped, mut err, mut n) = (0.0, 0.0, 0.0, 0.0);
+            let (mut drift, mut rows) = (0usize, 0usize);
             for (_, q) in runner.model.qtensors() {
                 let (z, c, e) = q.health()?;
                 (zero, clipped, err, n) = (zero + z, clipped + c, err + e, n + 1.0);
+                // Rows whose learned exponent differs from the MSE-optimal one.
+                let learned = q.theta.to_vec1::<f32>()?;
+                let optimal = q.optimal_theta()?.to_vec1::<f32>()?;
+                drift += learned.iter().zip(&optimal).filter(|(a, b)| a.round() != b.round()).count();
+                rows += learned.len();
             }
+            println!("steps: {:.3} of rows differ from the MSE-optimal exponent", drift as f64 / rows.max(1) as f64);
             // Does the model use the ternary verdict and the induction features?
             let data = varmap.data().lock().expect("varmap lock");
             let show = |n: &str| {

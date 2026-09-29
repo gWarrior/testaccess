@@ -103,7 +103,8 @@ pub enum EpisodeSet {
     Secret,
     /// A person's fact, asked with the statement's own words (copying).
     Same,
-    /// A person's fact, asked with a paraphrased question (association).
+    /// A person's fact, asked with a paraphrase training never uses
+    /// (association).
     Paraphrase,
     /// "Кто такой N?": " мой друг." if N was stated, else " не знаю.".
     Who,
@@ -119,7 +120,7 @@ impl EpisodeSet {
             }
             Self::Paraphrase => {
                 let which = rng.below(4);
-                ep.sample_person(rng, false, Some(which))
+                ep.sample_person_held_out(rng, which)
             }
             Self::Who => ep.sample_person(rng, false, Some(4)),
         }
@@ -247,7 +248,8 @@ pub fn recall(
                             // A row copies the key's first token if its next is inside the key.
                             let in_rows = rows.iter().any(|&q| q != u64::MAX && q + 1 >= k0 && q + 1 < k1);
                             let in_window = key.0 + crate::model::LOCAL >= p;
-                            if in_rows || in_window {
+                            // Templates are not in the context: nothing to find.
+                            if (in_rows || in_window) && key.0 < usize::MAX / 2 {
                                 r.found += 1;
                             }
                         }

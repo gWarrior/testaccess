@@ -104,6 +104,10 @@ fn train(args: &[String]) -> std::io::Result<()> {
         init: args.iter().any(|a| a == "--init").then(|| PathBuf::from(arg(args, "--init", ""))),
         jump: arg(args, "--jump", "on") == "on",
         seed: arg(args, "--seed", &d.seed.to_string()).parse().expect("--seed"),
+        p_episode: arg(args, "--p-episode", &d.p_episode.to_string()).parse().expect("--p-episode"),
+        p_reread: arg(args, "--p-reread", &d.p_reread.to_string()).parse().expect("--p-reread"),
+        max_tokens: arg(args, "--mem-train", &d.max_tokens.to_string()).parse().expect("--mem-train"),
+        aux: arg(args, "--aux", &d.aux.to_string()).parse().expect("--aux"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");
