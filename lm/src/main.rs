@@ -109,6 +109,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         max_tokens: arg(args, "--mem-train", &d.max_tokens.to_string()).parse().expect("--mem-train"),
         aux: arg(args, "--aux", &d.aux.to_string()).parse().expect("--aux"),
         aux_fact: arg(args, "--aux-fact", &d.aux_fact.to_string()).parse().expect("--aux-fact"),
+        aux_sem: arg(args, "--aux-sem", &d.aux_sem.to_string()).parse().expect("--aux-sem"),
         micro: arg(args, "--micro", &d.micro.to_string()).parse().expect("--micro"),
         ema: arg(args, "--ema", &d.ema.to_string()).parse().expect("--ema"),
         val_every: arg(args, "--val-every", &d.val_every.to_string()).parse().expect("--val-every"),

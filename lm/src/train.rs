@@ -58,6 +58,8 @@ pub struct TrainConfig {
     /// Extra weight of a fact answer's auxiliary loss (fact answers are
     /// ~0.7% of tokens, re-read spans ~2.5%).
     pub aux_fact: f64,
+    /// Weight of the semantic probe's contrastive loss (0 = off).
+    pub aux_sem: f64,
     /// Decay of the exponential moving average of the latent weights and
     /// steps, saved as `model.ema.safetensors` (0 = off).
     pub ema: f64,
@@ -101,6 +103,7 @@ impl Default for TrainConfig {
             p_episode: 1.0 / 729.0,
             aux: 1.0,
             aux_fact: 3.0,
+            aux_sem: 0.1,
             micro: 3,
             // Short runs (a few thousand steps): a 243-step horizon.
             ema: 1.0 - 1.0 / 243.0,
@@ -629,6 +632,122 @@ impl Runner {
         }
     }
 
+    /// Contrastive loss of the semantic probe (Fable analyst 10): for every
+    /// fact answer, the probe of its block — the mean two-trit key of the
+    /// probe's tokens, with gradient — against the mean key of the 9-token
+    /// unit of its statement (read from the memory, detached) and 26 other
+    /// units: first those the semantic index brought for the block instead
+    /// (the confusable ones), then random units of the memory. All centered
+    /// by the memory's key center: `−ln softmax(cos / τ)`, τ = 1/9. Teaches
+    /// the keys of a question line to resemble its statement's, so the
+    /// semantic index can find a statement by a paraphrase. Returns the sum
+    /// over answers, their count and how many ranked the statement first.
+    pub fn semantic_loss(
+        &self,
+        out: &WindowOut,
+        x: &[u32],
+        kinds: &[u8],
+        src: &[crate::data::Src],
+    ) -> Result<Option<(Tensor, usize, usize)>> {
+        let (b, t, dim) = out.trunk.k.dims3()?;
+        let (block, unit) = (self.model.cfg.block, 9u64);
+        let nb = t / block;
+        let (mut probes, mut cands) = (Vec::new(), Vec::<f32>::new());
+        let (mut key, mut value) = (vec![0f32; dim], vec![0f32; dim]);
+        for r in 0..b * t {
+            if kinds[r] != crate::data::ANSWER || src[r] == crate::data::NO_SRC {
+                continue;
+            }
+            let (bi, ti) = (r / t, r % t);
+            let mem = &self.memories[bi].mem;
+            let (Some(center), Some(kv)) = (mem.semantic_center(), mem.kv()) else { continue };
+            // The block's read: the probe ends at the block's first token.
+            let s0 = (ti / block) * block;
+            let window = &x[bi * t + (s0 + 1).saturating_sub(crate::model::PROBE)..=bi * t + s0];
+            let len = crate::model::probe_of(window).len();
+            if len > s0 + 1 {
+                continue;
+            }
+            // The statement's unit: the one holding its last words.
+            let at = src[r].1.saturating_sub(3);
+            let pos_unit = at / unit * unit;
+            let (lo, hi) = (mem.window().0, mem.position());
+            if pos_unit < lo || pos_unit + unit > hi {
+                continue;
+            }
+            let mean_of = |u: u64, key: &mut [f32], value: &mut [f32]| -> Option<Vec<f32>> {
+                let mut m = vec![0f32; dim];
+                for p in u..u + unit {
+                    if !kv.read(p, key, value) {
+                        return None;
+                    }
+                    m.iter_mut().zip(key.iter()).for_each(|(a, k)| *a += k / unit as f32);
+                }
+                Some(m.iter().zip(center).map(|(a, c)| a - c).collect())
+            };
+            let Some(pos) = mean_of(pos_unit, &mut key, &mut value) else { continue };
+            let mut units = vec![pos_unit];
+            let mut rows = pos;
+            // Confusable units: the semantic rows of this block.
+            let base = (bi * nb + ti / block) * out.m;
+            for j in 0..out.m {
+                if units.len() >= 14 {
+                    break;
+                }
+                let (p, s) = (out.far_pos[base + j], out.far_src.get(base + j).copied().unwrap_or(0));
+                let u = p / unit * unit;
+                if s == 1 && p != u64::MAX && !units.contains(&u) && u >= lo && u + unit <= hi {
+                    if let Some(m) = mean_of(u, &mut key, &mut value) {
+                        units.push(u);
+                        rows.extend(m);
+                    }
+                }
+            }
+            // Random units of the memory, deterministic per position.
+            let mut rng = snn_memory::rng::SplitMix64::new(self.pos ^ (r as u64).wrapping_mul(0x9E37_79B9));
+            let span = (hi - lo) / unit;
+            let mut tries = 0;
+            while units.len() < 27 && span > 27 && tries < 81 {
+                tries += 1;
+                let u = lo / unit * unit + rng.below(span) * unit;
+                if u < lo || u + unit > hi || units.contains(&u) {
+                    continue;
+                }
+                if let Some(m) = mean_of(u, &mut key, &mut value) {
+                    units.push(u);
+                    rows.extend(m);
+                }
+            }
+            if units.len() < 27 {
+                continue;
+            }
+            probes.push((bi, s0 + 1 - len, len, center.to_vec()));
+            cands.extend(rows);
+        }
+        if probes.is_empty() {
+            return Ok(None);
+        }
+        let n = probes.len();
+        let dev = out.trunk.k.device();
+        let p = probes
+            .iter()
+            .map(|(bi, from, len, center)| {
+                let k = out.trunk.k.get(*bi)?.narrow(0, *from, *len)?.mean(0)?;
+                k - Tensor::from_vec(center.clone(), dim, dev)?
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let p = Tensor::stack(&p, 0)?; // (n, dim)
+        let p = p.broadcast_div(&(p.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-6)?)?;
+        let c = Tensor::from_vec(cands, (n, 27, dim), dev)?;
+        let c = c.broadcast_div(&(c.sqr()?.sum_keepdim(2)?.sqrt()? + 1e-6)?)?;
+        // cos / τ with τ = 1/9; the statement is candidate 0.
+        let logits = (c.matmul(&p.unsqueeze(2)?)?.squeeze(2)? * 9.0)?;
+        let logp = candle_nn::ops::log_softmax(&logits, 1)?;
+        let loss = logp.narrow(1, 0, 1)?.neg()?.sum_all()?;
+        let top = logits.argmax(1)?.to_vec1::<u32>()?.iter().filter(|&&i| i == 0).count();
+        Ok(Some((loss, n, top)))
+    }
+
     /// Per-token loss of the mixture `a_null·p_vocab + Σ a·[next]`, `(B·T,)`.
     pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
         Ok(self.losses_and_pointer(out, x, y, None)?.0)
@@ -971,6 +1090,7 @@ pub fn train(
     // Fact answers some pointer column could copy.
     let mut found = (0usize, 0usize);
     let mut facts = FactStats::default();
+    let mut sem_log = (0f64, 0usize, 0usize);
     let mut timing = [0f64; 4];
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("log.tsv"))?;
     let n = (b * t) as f64;
@@ -1046,7 +1166,14 @@ pub fn train(
             }
             let mask = Tensor::from_vec(mask, ks.len(), &device)?;
             let aux = ((pointer * mask)?.sum_all()? * (cfg.aux / n))?;
-            let loss = ((losses.sum_all()? / n)? + aux)?;
+            let mut loss = ((losses.sum_all()? / n)? + aux)?;
+            let mut sem = (0f64, 0usize, 0usize);
+            if cfg.aux_sem > 0.0 {
+                if let Some((l, k, top)) = runner.semantic_loss(&out, xs, ks, ss)? {
+                    sem = (l.to_scalar::<f32>()? as f64, k, top);
+                    loss = (loss + (l * (cfg.aux_sem / n))?)?;
+                }
+            }
             let t1 = Instant::now();
             let loss_value = loss.to_scalar::<f32>()?;
             let grads = loss.backward()?;
@@ -1055,7 +1182,7 @@ pub fn train(
             let (known, blocks) = (out.known, out.blocks);
             // Commit now: the group's graph is freed before the next group.
             runner.commit(xs, t, &out, next)?;
-            Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, facts, time: [t1 - t0, t2 - t1] })
+            Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, facts, sem, time: [t1 - t0, t2 - t1] })
         };
         for (ci, chunk) in runners.chunks_mut(parallel).enumerate() {
             let round = Instant::now();
@@ -1093,6 +1220,7 @@ pub fn train(
                 sum_known += o.known;
                 sum_blocks += o.blocks;
                 facts.add(&o.facts);
+                sem_log = (sem_log.0 + o.sem.0, sem_log.1 + o.sem.1, sem_log.2 + o.sem.2);
                 found.0 += o.found.0;
                 found.1 += o.found.1;
             }
@@ -1169,6 +1297,15 @@ pub fn train(
                 facts.from[0], facts.from[1], facts.from[2], facts.from[3], facts.from[4]
             );
             facts = FactStats::default();
+            if sem_log.1 > 0 {
+                println!(
+                    "semantic probe: loss {:.3} statement first {}/{}",
+                    sem_log.0 / sem_log.1 as f64,
+                    sem_log.2,
+                    sem_log.1
+                );
+            }
+            sem_log = (0.0, 0, 0);
             found = (0, 0);
             timing = [0.0; 4];
         }
@@ -1358,6 +1495,8 @@ struct GroupOut {
     blocks: usize,
     found: (usize, usize),
     facts: FactStats,
+    /// Semantic contrastive loss: sum, answers, statement ranked first.
+    sem: (f64, usize, usize),
     time: [std::time::Duration; 2],
 }
 
