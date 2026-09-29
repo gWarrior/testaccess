@@ -593,3 +593,27 @@ fn equal_matches_go_to_the_newest_chunks() {
     let recent = at[at.len() - 9];
     assert!(span.end() > recent, "{:?}, the 9 newest phrases start at {recent}", (span.start, span.end()));
 }
+
+#[test]
+fn rows_cover_several_places() {
+    // A phrase in three places: with several chunks asked for, the rows hold
+    // every place (a chunk each), not one merged 45-token span.
+    let mut rng = SplitMix64::new(4);
+    let phrase = text(&mut rng, 9);
+    let mut ctx =
+        ContextMemory::new(ContextConfig { max_tokens: 59_049, kv: Some(KvConfig::new(4, 4)), ..Default::default() })
+            .unwrap();
+    let mut at = Vec::new();
+    for _ in 0..3 {
+        let t = text(&mut rng, 2_187);
+        ctx.append_kv(&t, &vec![0.5; t.len() * 4], &vec![0.5; t.len() * 4]).unwrap();
+        at.push(ctx.position());
+        ctx.append_kv(&phrase, &vec![0.5; 36], &vec![0.5; 36]).unwrap();
+    }
+    let t = text(&mut rng, 243);
+    ctx.append_kv(&t, &vec![0.5; t.len() * 4], &vec![0.5; t.len() * 4]).unwrap();
+    let rows = ctx.retrieve_rows(Probe::Tokens(&phrase), 9, 81).unwrap();
+    for &p in &at {
+        assert!(rows.positions.iter().any(|&r| r >= p && r < p + 9), "phrase at {p} not in rows");
+    }
+}

@@ -608,7 +608,9 @@ impl Engine {
             if let Some(mem) = &mut s.memory {
                 let recent: Vec<u32> = s.recent.iter().copied().collect();
                 let probe = crate::model::probe_of(&recent);
-                if let Ok(r) = mem.retrieve_rows(Probe::Both(probe, &q), 3, 81) {
+                if let Ok(r) =
+                    mem.retrieve_rows(Probe::Both(probe, &q), crate::model::MEM_TOP_K, crate::model::MEM_ROWS)
+                {
                     s.verdict = match r.verdict {
                         Verdict::Known => 0,
                         Verdict::Unknown => 1,

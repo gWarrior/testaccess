@@ -781,8 +781,15 @@ impl ContextMemory {
         for pos in covered.max(self.base)..self.position() {
             push(&mut rows, pos, 2);
         }
-        for span in r.spans.iter().filter(|s| s.in_window) {
-            for pos in span.start..span.end() {
+        // Several places: at most a chunk of rows from the middle of each
+        // (three overlapping chunks of one place merge into a 45-token span,
+        // which alone would take the rows of the next places).
+        let spans: Vec<&RetrievedSpan> = r.spans.iter().filter(|s| s.in_window).collect();
+        let cap = if spans.len() > 1 { self.cfg.chunk_size as u64 } else { u64::MAX };
+        for span in spans {
+            let len = span.end() - span.start;
+            let from = span.start + len.saturating_sub(cap) / 2;
+            for pos in from..(from + cap.min(len)) {
                 push(&mut rows, pos, if span.lexical { 0 } else { 1 });
             }
         }

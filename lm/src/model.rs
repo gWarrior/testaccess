@@ -257,6 +257,11 @@ pub struct Ablation {
 /// Tokens in the lexical probe of a memory read.
 pub const PROBE: usize = 9;
 
+/// Chunks a memory read asks for (several places, a chunk of rows each)
+/// and rows it reads at most.
+pub const MEM_TOP_K: usize = 9;
+pub const MEM_ROWS: usize = 81;
+
 /// The line-break token (byte 0x0A).
 pub const NEWLINE: u32 = 10;
 

@@ -84,8 +84,8 @@ impl Default for TrainConfig {
             batch: 27,
             window: 243,
             memory: true,
-            top_k: 3,
-            rows: 81,
+            top_k: crate::model::MEM_TOP_K,
+            rows: crate::model::MEM_ROWS,
             // 3^11: episodes and re-reading reach this far, close to the 300k
             // of inference.
             max_tokens: 177_147,
@@ -408,7 +408,17 @@ impl Runner {
         let state = model.zero_state(batch, device)?;
         let dim = model.cfg.mem_dim;
         let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
-        Ok(Self { model, state, memories, use_memory, top_k: 3, rows: 81, reset_state: false, prev: None, pos: 0 })
+        Ok(Self {
+            model,
+            state,
+            memories,
+            use_memory,
+            top_k: crate::model::MEM_TOP_K,
+            rows: crate::model::MEM_ROWS,
+            reset_state: false,
+            prev: None,
+            pos: 0,
+        })
     }
 
     /// The runner's recurrent state, previous window and stream memories
