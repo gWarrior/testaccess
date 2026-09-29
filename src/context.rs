@@ -555,9 +555,6 @@ impl ContextMemory {
             return Err(MemoryError::DimensionMismatch { expected: n * dv, got: values.len() });
         }
         kv.push(keys, values);
-        if let Some(c) = &mut self.center {
-            c.add(keys);
-        }
         self.append_tokens(tokens)
     }
 
@@ -605,31 +602,41 @@ impl ContextMemory {
 
         // Semantic code of a chunk: the centred mean key of its first stride
         // (each stride of the stream is pooled by exactly one chunk; a mean
-        // over the whole chunk would blur three places into one). Nothing is
-        // written before the centre is fixed.
-        let center = self.center.as_ref().and_then(|c| c.center.as_deref());
-        let sem_ids: Vec<Option<MemoryId>> = match (&mut self.semantic, &self.kv, center) {
-            (Some(sem), Some(kv), Some(center)) => {
-                let (dk, st) = (kv.key_dim(), self.cfg.stride as u64);
-                let (mut key, mut value) = (vec![0f32; dk], vec![0f32; kv.value_dim()]);
-                let pooled: Vec<Vec<f32>> = starts
-                    .iter()
-                    .map(|&s| {
-                        let mut sum = vec![0f32; dk];
-                        for p in s..s + st {
-                            kv.read(p, &mut key, &mut value);
-                            sum.iter_mut().zip(&key).for_each(|(m, k)| *m += k);
-                        }
-                        sum.iter().zip(center).map(|(m, c)| m / st as f32 - c).collect()
-                    })
-                    .collect();
-                let inputs: Vec<Input> = pooled.iter().map(|m| Input::Dense(m)).collect();
+        // over the whole chunk would blur three places into one). The centre
+        // takes in each first stride as its chunk is written, in stream
+        // order, so a chunk's code does not depend on how the tokens arrived
+        // (training appends a window at a time, the engine nine tokens).
+        // Nothing is written before the centre is set.
+        let mut sem_ids: Vec<Option<MemoryId>> = vec![None; starts.len()];
+        if let (Some(sem), Some(kv), Some(center)) = (&mut self.semantic, &self.kv, &mut self.center) {
+            let (dk, st) = (kv.key_dim(), self.cfg.stride as u64);
+            let (mut key, mut value) = (vec![0f32; dk], vec![0f32; kv.value_dim()]);
+            let mut pooled: Vec<(usize, Vec<f32>)> = Vec::new();
+            for (i, &s) in starts.iter().enumerate() {
+                let mut stride = Vec::with_capacity(st as usize * dk);
+                for p in s..s + st {
+                    kv.read(p, &mut key, &mut value);
+                    stride.extend_from_slice(&key);
+                }
+                center.add(&stride);
+                if let Some(c) = center.center.as_deref() {
+                    let mut mean = vec![0f32; dk];
+                    for row in stride.chunks_exact(dk) {
+                        mean.iter_mut().zip(row).for_each(|(m, k)| *m += k / st as f32);
+                    }
+                    pooled.push((i, mean.iter().zip(c).map(|(m, c)| m - c).collect()));
+                }
+            }
+            if !pooled.is_empty() {
+                let inputs: Vec<Input> = pooled.iter().map(|(_, m)| Input::Dense(m)).collect();
+                let payloads: Vec<Chunk> = pooled.iter().map(|&(i, _)| chunks[i].clone()).collect();
                 let opts =
                     BatchOptions { link_sequence: true, after: self.last.and_then(|l| l.1), ..Default::default() };
-                sem.learn_batch(&inputs, Some(chunks), &opts)?.into_iter().map(Some).collect()
+                for ((i, _), id) in pooled.iter().zip(sem.learn_batch(&inputs, Some(payloads), &opts)?) {
+                    sem_ids[*i] = Some(id);
+                }
             }
-            _ => vec![None; starts.len()],
-        };
+        }
 
         for ((&start, lexical), semantic) in starts.iter().zip(lex_ids).zip(sem_ids) {
             self.chunks.push_back(ChunkRec { start, lexical, semantic });

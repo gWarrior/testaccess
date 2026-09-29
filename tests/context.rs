@@ -708,14 +708,17 @@ fn semantic_index_waits_for_the_key_centre() {
     let dk = 27;
     let mut rng = SplitMix64::new(21);
     let mut ctx = semantic_context(dk);
+    // The centre takes in the first stride of every chunk as it is written:
+    // after n tokens, 9 keys per chunk.
     let n = SEMANTIC_CENTER_AFTER as usize - 27;
-    let keys: Vec<f32> = (0..(n + 81) * dk).map(|_| 3.0 + rng.normal() as f32).collect();
-    let tokens = text(&mut rng, n + 81);
+    let total = SEMANTIC_CENTER_AFTER as usize + 18;
+    let keys: Vec<f32> = (0..total * dk).map(|_| 3.0 + rng.normal() as f32).collect();
+    let tokens = text(&mut rng, total);
     ctx.append_kv(&tokens[..n], &keys[..n * dk], &vec![0.0; n * 9]).unwrap();
 
     assert_eq!(ctx.semantic_center(), None);
-    assert_eq!(ctx.semantic_center_count(), n as u64);
     let before = ctx.stats();
+    assert_eq!(ctx.semantic_center_count(), before.chunks as u64 * 9);
     assert!(before.chunks > 200);
     assert_eq!(before.semantic.as_ref().unwrap().fast_memories, 0, "nothing indexed before the centre");
     let key = &keys[..dk];
@@ -727,9 +730,10 @@ fn semantic_index_waits_for_the_key_centre() {
     assert_eq!(r.verdict, Verdict::Known);
     assert!(r.spans.iter().all(|s| s.lexical));
 
-    ctx.append_kv(&tokens[n..], &keys[n * dk..], &vec![0.0; 81 * 9]).unwrap();
+    // Up to the chunk whose first stride holds key 3^7.
+    ctx.append_kv(&tokens[n..], &keys[n * dk..], &vec![0.0; (total - n) * 9]).unwrap();
     assert_eq!(ctx.semantic_center_count(), SEMANTIC_CENTER_AFTER);
-    // The centre is the mean of exactly the first 3^7 keys.
+    // The centre is the mean of exactly the first 3^7 keys of the stream.
     let center = ctx.semantic_center().expect("fixed");
     for (d, &c) in center.iter().enumerate() {
         let m = (0..SEMANTIC_CENTER_AFTER as usize).map(|i| keys[i * dk + d] as f64).sum::<f64>()
@@ -737,9 +741,18 @@ fn semantic_index_waits_for_the_key_centre() {
         assert!((c as f64 - m).abs() < 1e-5, "dim {d}: {c} vs {m}");
     }
     let after = ctx.stats();
-    let new = after.chunks - before.chunks;
-    assert_eq!(new, 9);
-    assert_eq!(after.semantic.as_ref().unwrap().fast_memories, new, "chunks after the centre are indexed");
+    assert_eq!(after.chunks - before.chunks, 5);
+    assert_eq!(after.semantic.as_ref().unwrap().fast_memories, 1, "the chunk that set the centre is indexed");
+
+    // The same stream appended nine tokens at a time gives the same centre
+    // and the same semantic chunks (training appends windows, the engine
+    // single tokens).
+    let mut small = semantic_context(dk);
+    for (t, k) in tokens.chunks(9).zip(keys.chunks(9 * dk)) {
+        small.append_kv(t, k, &vec![0.0; t.len() * 9]).unwrap();
+    }
+    assert_eq!(small.semantic_center(), ctx.semantic_center());
+    assert_eq!(small.stats().semantic.unwrap().fast_memories, 1);
 
     // Later keys pull it towards them (a moving average: the model's keys
     // drift while it trains); reset keeps it.
