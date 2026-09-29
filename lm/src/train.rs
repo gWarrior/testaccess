@@ -383,6 +383,8 @@ pub struct WindowOut {
     /// Token after each memory row and its position `(B, nb, M)`, and `M`.
     pub far_next: Vec<u32>,
     pub far_pos: Vec<u64>,
+    /// Source trit of each memory row (0 lexical, 1 semantic, 2 newest).
+    pub far_src: Vec<u8>,
     /// Induction candidates `(B·T)`.
     pub ind: Vec<IndCand>,
     /// The previous window's tokens `(B·T)` (empty for the first window).
@@ -514,6 +516,7 @@ impl Runner {
             point: h.point,
             gate: h.gate,
             log_point: h.log_point,
+            far_src: mem.source.flatten_all()?.to_vec1::<u32>()?.into_iter().map(|s| s as u8).collect(),
             far_next: mem.next,
             far_pos: mem.pos,
             ind: mem.ind,
@@ -576,6 +579,22 @@ impl Runner {
         }
     }
 
+    /// Where column `col` copies from, as a bit: 1 the local window, 2/4/8 a
+    /// memory row found lexically / semantically / from the unindexed newest
+    /// tokens, 16 the induction column.
+    fn column_kind(&self, out: &WindowOut, t: usize, bi: usize, ti: usize, col: usize) -> u8 {
+        let nb = t / self.model.cfg.block;
+        if col < 2 * t {
+            1
+        } else if col < 2 * t + out.m {
+            let s =
+                out.far_src.get((bi * nb + ti / self.model.cfg.block) * out.m + (col - 2 * t)).copied().unwrap_or(0);
+            2 << s.min(2)
+        } else {
+            16
+        }
+    }
+
     /// Per-token loss of the mixture `a_null·p_vocab + Σ a·[next]`, `(B·T,)`.
     pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
         Ok(self.losses_and_pointer(out, x, y, None)?.0)
@@ -593,11 +612,11 @@ impl Runner {
         x: &[u32],
         y: &[u32],
         src: Option<&[crate::data::Src]>,
-    ) -> Result<(Tensor, Tensor, Vec<bool>)> {
+    ) -> Result<(Tensor, Tensor, Vec<u8>)> {
         let (b, t, l) = out.point.dims3()?;
         let mut hit = vec![0f32; b * t * l];
         let mut own = vec![0f32; b * t * l];
-        let mut found = vec![false; b * t];
+        let mut found = vec![0u8; b * t];
         for bi in 0..b {
             for ti in 0..t {
                 let r = bi * t + ti;
@@ -609,7 +628,7 @@ impl Runner {
                             || self.column_source(out, t, bi, ti, col).is_some_and(|p| p >= span.0 && p < span.1);
                         if from_statement {
                             own[r * l + col] = 1.0;
-                            found[r] = true;
+                            found[r] |= self.column_kind(out, t, bi, ti, col);
                         }
                     }
                 }
@@ -917,6 +936,7 @@ pub fn train(
     let mut by_kind = [(0f64, 0usize); 4];
     // Fact answers some pointer column could copy.
     let mut found = (0usize, 0usize);
+    let mut facts = FactStats::default();
     let mut timing = [0f64; 4];
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("log.tsv"))?;
     let n = (b * t) as f64;
@@ -961,17 +981,33 @@ pub fn train(
             let mask: Vec<f32> = ks
                 .iter()
                 .zip(&findable)
-                .map(|(&k, &f)| match (k, f) {
+                .map(|(&k, &f)| match (k, f != 0) {
                     (crate::data::ANSWER, true) => cfg.aux_fact as f32,
                     (crate::data::REREAD, true) => 1.0,
                     _ => 0.0,
                 })
                 .collect();
             let mut found = (0, 0);
-            for (&k, &f) in ks.iter().zip(&findable) {
+            let mut facts = FactStats::default();
+            for (i, (&k, &f)) in ks.iter().zip(&findable).enumerate() {
                 if k == crate::data::ANSWER {
-                    found.0 += usize::from(f);
+                    found.0 += usize::from(f != 0);
                     found.1 += 1;
+                    // Distance from the answer back to its statement.
+                    let at = runner.pos + (i % t) as u64 + 1;
+                    let d = at.saturating_sub(ss[i].0);
+                    let bin = if d <= crate::model::LOCAL as u64 {
+                        0
+                    } else if d <= 19_683 {
+                        1
+                    } else {
+                        2
+                    };
+                    facts.by_dist[bin].0 += usize::from(f != 0);
+                    facts.by_dist[bin].1 += 1;
+                    for (j, n) in facts.from.iter_mut().enumerate() {
+                        *n += usize::from(f & (1 << j) != 0);
+                    }
                 }
             }
             let mask = Tensor::from_vec(mask, ks.len(), &device)?;
@@ -985,7 +1021,7 @@ pub fn train(
             let (known, blocks) = (out.known, out.blocks);
             // Commit now: the group's graph is freed before the next group.
             runner.commit(xs, t, &out, next)?;
-            Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, time: [t1 - t0, t2 - t1] })
+            Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, facts, time: [t1 - t0, t2 - t1] })
         };
         for (ci, chunk) in runners.chunks_mut(parallel).enumerate() {
             let round = Instant::now();
@@ -1022,6 +1058,7 @@ pub fn train(
                 lv.extend(o.lv);
                 sum_known += o.known;
                 sum_blocks += o.blocks;
+                facts.add(&o.facts);
                 found.0 += o.found.0;
                 found.1 += o.found.1;
             }
@@ -1091,6 +1128,13 @@ pub fn train(
             (sum_loss, sum_known, sum_blocks, n_logged) = (0.0, 0, 0, 0);
             by_kind = [(0.0, 0); 4];
             println!("answers findable: {:.3} | rss {:.2} GB", found.0 as f64 / found.1.max(1) as f64, rss_gb());
+            let d = facts.by_dist;
+            println!(
+                "facts found by distance: near {}/{} mid {}/{} far {}/{} | from window {} lexical {} semantic {} newest {} induction {}",
+                d[0].0, d[0].1, d[1].0, d[1].1, d[2].0, d[2].1,
+                facts.from[0], facts.from[1], facts.from[2], facts.from[3], facts.from[4]
+            );
+            facts = FactStats::default();
             found = (0, 0);
             timing = [0.0; 4];
         }
@@ -1279,7 +1323,29 @@ struct GroupOut {
     known: usize,
     blocks: usize,
     found: (usize, usize),
+    facts: FactStats,
     time: [std::time::Duration; 2],
+}
+
+/// Fact answers whose statement some pointer column copies from, by the
+/// distance back to the statement (local window / up to 3^9 / farther) and
+/// by where the copying column looks (window, lexical row, semantic row,
+/// newest row, induction).
+#[derive(Default, Clone, Copy)]
+struct FactStats {
+    by_dist: [(usize, usize); 3],
+    from: [usize; 5],
+}
+
+impl FactStats {
+    fn add(&mut self, o: &FactStats) {
+        for (a, b) in self.by_dist.iter_mut().zip(&o.by_dist) {
+            (a.0, a.1) = (a.0 + b.0, a.1 + b.1);
+        }
+        for (a, b) in self.from.iter_mut().zip(&o.from) {
+            *a += b;
+        }
+    }
 }
 
 /// What `state.txt` of a resume directory records.
