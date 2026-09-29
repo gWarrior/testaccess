@@ -979,8 +979,19 @@ pub fn train(
             Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, time: [t1 - t0, t2 - t1] })
         };
         for (ci, chunk) in runners.chunks_mut(parallel).enumerate() {
+            let round = Instant::now();
             let outs: Vec<Result<GroupOut>> =
                 chunk.par_iter_mut().enumerate().map(|(j, r)| run_group(ci * parallel + j, r)).collect();
+            // Wall-clock of the round, split into forward and backward in the
+            // proportion of the groups' own times.
+            let wall = round.elapsed().as_secs_f64();
+            let (mut fwd, mut bwd) = (0f64, 0f64);
+            for o in outs.iter().flatten() {
+                fwd += o.time[0].as_secs_f64();
+                bwd += o.time[1].as_secs_f64();
+            }
+            timing[0] += wall * fwd / (fwd + bwd).max(1e-9);
+            timing[1] += wall * bwd / (fwd + bwd).max(1e-9);
             for o in outs {
                 let o = o?;
                 grads = Some(match grads {
@@ -1004,9 +1015,6 @@ pub fn train(
                 sum_blocks += o.blocks;
                 found.0 += o.found.0;
                 found.1 += o.found.1;
-                for (acc, d) in timing.iter_mut().zip(o.time) {
-                    *acc += d.as_secs_f64() / parallel as f64;
-                }
             }
         }
         let mut grads = grads.expect("at least one group");
