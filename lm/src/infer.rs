@@ -292,7 +292,26 @@ impl Engine {
 
     /// Feed one token; returns next-token logits.
     pub fn step(&self, s: &mut Session, token: u32) -> Vec<f32> {
+        self.step_parts(s, token).mixture()
+    }
+
+    /// Feed one token; returns the next-token distribution by component:
+    /// the vocabulary, its gate and the pointer's copies.
+    pub fn step_parts(&self, s: &mut Session, token: u32) -> Parts {
         self.advance(s, token, true).expect("logits requested")
+    }
+
+    /// The induction candidate the last step computed (for the reply limit
+    /// `limit`), or `None` when nothing continues.
+    pub fn induction(&self, s: &mut Session, limit: u64) -> Option<(u32, usize)> {
+        let c = match s.last_ind {
+            Some((pos, c)) if pos + 1 == s.pos && limit == s.reply_start => c,
+            _ => {
+                let first = s.pos - s.ring.len() as u64;
+                self.continuation(s, first, limit)
+            }
+        };
+        (c.len > 0).then_some((c.tok, c.len as usize))
     }
 
     /// Tokens seen so far in this session.
@@ -386,10 +405,10 @@ impl Engine {
         for (i, &t) in tokens.iter().enumerate() {
             last = self.advance(s, t, i + 1 == tokens.len());
         }
-        last
+        last.map(|p| p.mixture())
     }
 
-    fn advance(&self, s: &mut Session, token: u32, want_logits: bool) -> Option<Vec<f32>> {
+    fn advance(&self, s: &mut Session, token: u32, want_logits: bool) -> Option<Parts> {
         let (d, heads) = (self.cfg.d, self.cfg.heads);
         let hd = d / heads;
         let mut x = self.emb.dense_row(token as usize);
@@ -576,17 +595,133 @@ impl Engine {
             }
         }
         s.pos += 1;
-        let logits = logits?;
-        // Mixture a_null·p_vocab + Σ a·[next], returned as log-probabilities.
-        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
-        let mut p: Vec<f32> = logits.iter().map(|l| gate * (l - mx).exp() / z).collect();
-        for (t, a) in copy {
-            if let Some(pt) = p.get_mut(t as usize) {
-                *pt += a;
+        Some(Parts { logits: logits?, gate, copy })
+    }
+}
+
+/// The next-token distribution by component: `gate · softmax(logits) +
+/// Σ weight·[token]` over the pointer's copies.
+#[derive(Clone, Debug)]
+pub struct Parts {
+    /// Vocabulary logits.
+    pub logits: Vec<f32>,
+    /// The vocabulary's share (the pointer's null column).
+    pub gate: f32,
+    /// Copied tokens and their weights (they sum to `1 − gate`).
+    pub copy: Vec<(u32, f32)>,
+}
+
+impl Parts {
+    /// The mixture as log-probabilities.
+    pub fn mixture(&self) -> Vec<f32> {
+        self.probs(1.0, 1.0, &[]).into_iter().map(|v| v.max(f32::MIN_POSITIVE).ln()).collect()
+    }
+
+    /// Mix in `lambda` of a hard copy of `token`: p' = (1 − λ)·p + λ·[token].
+    pub fn add_copy(&mut self, token: u32, lambda: f32) {
+        self.gate *= 1.0 - lambda;
+        self.copy.iter_mut().for_each(|c| c.1 *= 1.0 - lambda);
+        self.copy.push((token, lambda));
+    }
+
+    /// Probabilities with temperature and nucleus (top-p) applied to the
+    /// vocabulary part only — the copies keep their weights, so a fact the
+    /// pointer found is not flattened by the temperature — and with a
+    /// logit penalty for `penalized` tokens of the vocabulary.
+    pub fn probs(&self, temperature: f32, top_p: f32, penalized: &[(u32, f32)]) -> Vec<f32> {
+        let t = temperature.max(1e-3);
+        let mut l: Vec<f32> = self.logits.iter().map(|v| v / t).collect();
+        for &(tok, pen) in penalized {
+            if let Some(v) = l.get_mut(tok as usize) {
+                *v -= pen;
             }
         }
-        Some(p.into_iter().map(|v| v.max(f32::MIN_POSITIVE).ln()).collect())
+        let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut p: Vec<f32> = l.iter().map(|v| (v - mx).exp()).collect();
+        if top_p < 1.0 {
+            // Keep the most probable tokens that cover `top_p` of the mass.
+            let total: f32 = p.iter().sum();
+            let mut idx: Vec<usize> = (0..p.len()).collect();
+            idx.sort_unstable_by(|&a, &b| p[b].total_cmp(&p[a]));
+            let mut acc = 0.0;
+            let mut keep = idx.len();
+            for (k, &i) in idx.iter().enumerate() {
+                acc += p[i];
+                if acc >= top_p * total {
+                    keep = k + 1;
+                    break;
+                }
+            }
+            for &i in &idx[keep..] {
+                p[i] = 0.0;
+            }
+        }
+        let z: f32 = p.iter().sum();
+        p.iter_mut().for_each(|v| *v *= self.gate / z);
+        for &(tok, a) in &self.copy {
+            if let Some(v) = p.get_mut(tok as usize) {
+                *v += a;
+            }
+        }
+        p
+    }
+}
+
+/// Chat decoding: temperature and top-p on the vocabulary part, a presence
+/// penalty for tokens already in the reply, a ban on repeating a 4-gram of
+/// the reply, and a hard copy of the induction candidate weighted by the
+/// length of its match.
+#[derive(Clone, Debug)]
+pub struct Decoding {
+    pub temperature: f32,
+    pub top_p: f32,
+    /// Logit penalty for a vocabulary token already in the reply.
+    pub presence: f32,
+    /// Weight of the induction copy at a match of 8 tokens or more.
+    pub copy: f32,
+}
+
+impl Default for Decoding {
+    fn default() -> Self {
+        Self { temperature: 0.8, top_p: 0.9, presence: 0.5, copy: 0.5 }
+    }
+}
+
+impl Decoding {
+    /// Weight of a hard copy after a match of `len` tokens: nothing below 3,
+    /// growing to `copy` at 8 (a longer match is a surer continuation).
+    pub fn copy_weight(&self, len: usize) -> f32 {
+        self.copy * ((len as f32 - 2.0) / 6.0).clamp(0.0, 1.0)
+    }
+
+    /// Sample the next token of `reply` from `parts`.
+    pub fn sample(&self, parts: &Parts, reply: &[u32], rng: &mut snn_memory::rng::SplitMix64) -> u32 {
+        let mut seen: Vec<u32> = reply.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        let penalized: Vec<(u32, f32)> = seen.iter().map(|&t| (t, self.presence)).collect();
+        let mut p = parts.probs(self.temperature, self.top_p, &penalized);
+        // No 4-gram twice in a reply.
+        if reply.len() >= 3 {
+            let tail = &reply[reply.len() - 3..];
+            for w in reply.windows(4) {
+                if &w[..3] == tail {
+                    p[w[3] as usize] = 0.0;
+                }
+            }
+        }
+        let total: f32 = p.iter().sum();
+        if total <= 0.0 {
+            return parts.logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
+        }
+        let mut u = rng.next_f64() as f32 * total;
+        for (i, &v) in p.iter().enumerate() {
+            if u < v {
+                return i as u32;
+            }
+            u -= v;
+        }
+        p.iter().rposition(|&v| v > 0.0).unwrap_or(0) as u32
     }
 }
 
@@ -626,6 +761,32 @@ mod tests {
     use crate::model::{MemBatch, Model};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{VarBuilder, VarMap};
+
+    #[test]
+    fn decoding_tempers_only_the_vocabulary_and_bans_repeated_4grams() {
+        let parts = Parts { logits: vec![2.0, 1.0, 0.0, -1.0], gate: 0.6, copy: vec![(3, 0.4)] };
+        let mix: f32 = parts.mixture().iter().map(|l| l.exp()).sum();
+        assert!((mix - 1.0).abs() < 1e-5);
+        // A cold temperature sharpens the vocabulary; the copy keeps 0.4.
+        let p = parts.probs(0.1, 1.0, &[]);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!((p[3] - 0.4).abs() < 1e-3 && p[0] > 0.59);
+        // Top-p drops the tail of the vocabulary.
+        let p = parts.probs(1.0, 0.5, &[]);
+        assert!(p[1] == 0.0 && p[2] == 0.0 && p[0] > 0.59);
+        // After "0 1 2 … 0 1 2", token 3 would repeat the 4-gram "0 1 2 3".
+        let d = Decoding { temperature: 1.0, top_p: 1.0, presence: 0.0, copy: 0.0 };
+        let only3 = Parts { logits: vec![0.0; 4], gate: 0.0, copy: vec![(3, 1.0)] };
+        let mut rng = snn_memory::rng::SplitMix64::new(1);
+        assert_eq!(d.sample(&only3, &[5, 6], &mut rng), 3);
+        let reply = [0, 1, 2, 3, 0, 1, 2];
+        let mixed = Parts { logits: vec![0.0; 4], gate: 0.5, copy: vec![(3, 0.5)] };
+        for _ in 0..50 {
+            assert_ne!(d.sample(&mixed, &reply, &mut rng), 3);
+        }
+        assert_eq!(d.copy_weight(2), 0.0);
+        assert_eq!(Decoding::default().copy_weight(8), 0.5);
+    }
 
     #[test]
     fn engine_matches_the_training_model() {
