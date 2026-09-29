@@ -385,8 +385,7 @@ impl Episodes {
     /// no episode of an open type; many types keep that from discarding most
     /// episodes (with five types it dropped 80%, Fable analyst 11).
     pub fn sample_tagged(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>, u8) {
-        // One in nine: "не знаю" for a name never stated. It has no
-        // statement, so any number may be open at once.
+        // One in nine: "не знаю" for a name never stated (no statement).
         if rng.below(9) == 0 {
             let (intro, q, a) = self.sample_unknown(rng);
             return (intro, q, a, 30);
@@ -598,8 +597,10 @@ impl TaskStream {
         let sampled = episode.then(|| ep.sample_tagged(&mut self.rng));
         // Not while a question of the same type is open: it would be asked
         // about two statements.
-        // (An episode without a statement — "не знаю" — never conflicts.)
-        let free = |e: &(Vec<u32>, Vec<u32>, Vec<u32>, u8)| e.0.is_empty() || self.questions.iter().all(|q| q.4 != e.3);
+        // "не знаю" is blocked like the others (one open at a time): exempt,
+        // it made ~27% of the episodes instead of 1/9 while the stated ones
+        // were blocked (Fable analyst 12).
+        let free = |e: &(Vec<u32>, Vec<u32>, Vec<u32>, u8)| self.questions.iter().all(|q| q.4 != e.3);
         if let Some((intro, q, a, tag)) = sampled.filter(free) {
             let (lo, hi) = self.distance;
             let d = ((lo as f64).ln() + self.rng.next_f64() * ((hi as f64).ln() - (lo as f64).ln())).exp() as usize;
