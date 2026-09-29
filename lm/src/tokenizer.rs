@@ -208,6 +208,16 @@ impl Tokenizer {
         out
     }
 
+    /// For each token id, whether it consists only of newlines.
+    pub fn newline_tokens(&self) -> Vec<bool> {
+        (0..self.vocab_size() as u32)
+            .map(|id| {
+                let s = self.decode(&[id]);
+                !s.is_empty() && s.chars().all(|c| c == '\n')
+            })
+            .collect()
+    }
+
     pub fn decode(&self, ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {

@@ -616,8 +616,10 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     let region = tokens.len() / b;
     let mut streams: Vec<TaskStream> =
         (0..b).map(|i| TaskStream::new(i * region, region, cfg.seed * 1000 + i as u64)).collect();
+    let lines = tok.newline_tokens();
     for s in &mut streams {
         s.jump = cfg.jump;
+        s.lines = lines.clone();
         s.p_reread = cfg.p_reread;
         s.p_episode = cfg.p_episode;
         // Episodes and re-reading reach as far as the training memory,

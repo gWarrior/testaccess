@@ -489,6 +489,10 @@ pub struct TaskStream {
     /// 243–19 683 tokens ago is repeated verbatim (dense far-copy signal).
     pub p_reread: f64,
     past: std::collections::VecDeque<u32>,
+    /// Tokens made only of newlines (empty: no poem filter). A jump that
+    /// lands on a document with more than 1/12 of such tokens in its first
+    /// 729 (poems, lists, dialogue columns) jumps again.
+    pub lines: Vec<bool>,
 }
 
 impl TaskStream {
@@ -506,6 +510,7 @@ impl TaskStream {
             jump: false,
             p_reread: 0.0,
             past: Default::default(),
+            lines: Vec::new(),
         }
     }
 
@@ -560,14 +565,36 @@ impl TaskStream {
         let t = tokens[self.start + self.pos % self.len] as u32;
         self.pos += 1;
         if self.jump && t == crate::tokenizer::DOC {
-            // Land on the start of a random document.
-            let mut p = self.rng.below(tokens.len() as u64) as usize;
-            while p < tokens.len() && tokens[p] as u32 != crate::tokenizer::DOC {
-                p += 1;
+            // Land on the start of a random prose document.
+            for _ in 0..9 {
+                let mut p = self.rng.below(tokens.len() as u64) as usize;
+                while p < tokens.len() && tokens[p] as u32 != crate::tokenizer::DOC {
+                    p += 1;
+                }
+                (self.start, self.len, self.pos) = (0, tokens.len(), (p + 1) % tokens.len());
+                if !self.is_poem(tokens, self.pos) {
+                    break;
+                }
             }
-            (self.start, self.len, self.pos) = (0, tokens.len(), (p + 1) % tokens.len());
         }
         (t, PLAIN)
+    }
+
+    /// Whether the document starting at `p` breaks lines more often than
+    /// prose: over 1/12 newline tokens in its first 729.
+    fn is_poem(&self, tokens: &[u16], p: usize) -> bool {
+        if self.lines.is_empty() {
+            return false;
+        }
+        let (mut n, mut lines) = (0usize, 0usize);
+        for &t in tokens[p..].iter().take(729) {
+            if t as u32 == crate::tokenizer::DOC {
+                break;
+            }
+            n += 1;
+            lines += usize::from(self.lines.get(t as usize).copied().unwrap_or(false));
+        }
+        lines * 12 > n
     }
 
     /// `window + 1` tokens continuing the stream (the first is the last of
@@ -590,6 +617,25 @@ impl TaskStream {
 mod episode_tests {
     use super::*;
     use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn jumps_skip_documents_that_break_lines_like_poems() {
+        let prose = "Она шла по улице и думала о том, что завтра будет дождь. ".repeat(9);
+        let poem = "Шёл дождь\nи ветер\nпел\n".repeat(9);
+        let tok = Tokenizer::train(&format!("{prose}\n{poem}"), 400);
+        let doc = crate::tokenizer::DOC as u16;
+        let mut tokens = Vec::new();
+        for text in [&prose, &poem] {
+            tokens.push(doc);
+            tokens.extend(tok.encode(text).iter().map(|&t| t as u16));
+        }
+        let poem_at = tokens.iter().rposition(|&t| t == doc).expect("two documents") + 1;
+        let mut s = TaskStream::new(0, tokens.len(), 3);
+        assert!(!s.is_poem(&tokens, poem_at), "the filter is off without newline tokens");
+        s.lines = tok.newline_tokens();
+        assert!(s.is_poem(&tokens, poem_at));
+        assert!(!s.is_poem(&tokens, 1));
+    }
 
     #[test]
     fn every_episode_answer_is_in_its_statement() {
