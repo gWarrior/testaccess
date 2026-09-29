@@ -373,7 +373,9 @@ impl Episodes {
 
     /// `(intro tokens, question tokens, answer tokens)` of a random episode.
     pub fn sample(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-        let same_words = rng.below(2) == 0;
+        // A third asked with the statement's own words: the induction column
+        // answers those by itself; paraphrases are what has to be learned.
+        let same_words = rng.below(3) == 0;
         if rng.below(4) == 0 {
             let (intro, q, a) = self.sample_secret(rng);
             if same_words {

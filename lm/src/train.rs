@@ -55,6 +55,9 @@ pub struct TrainConfig {
     /// Weight of the auxiliary pointer loss per answer / re-read token,
     /// relative to a token's mixture loss (template answers get none).
     pub aux: f64,
+    /// Extra weight of a fact answer's auxiliary loss (fact answers are
+    /// ~0.7% of tokens, re-read spans ~2.5%).
+    pub aux_fact: f64,
     /// Decay of the exponential moving average of the latent weights and
     /// steps, saved as `model.ema.safetensors` (0 = off).
     pub ema: f64,
@@ -97,6 +100,7 @@ impl Default for TrainConfig {
             p_reread: 1.0 / 2187.0,
             p_episode: 1.0 / 729.0,
             aux: 1.0,
+            aux_fact: 3.0,
             micro: 3,
             // Short runs (a few thousand steps): a 243-step horizon.
             ema: 1.0 - 1.0 / 243.0,
@@ -942,7 +946,11 @@ pub fn train(
             let mask: Vec<f32> = ks
                 .iter()
                 .zip(&findable)
-                .map(|(&k, &f)| f32::from((k == crate::data::ANSWER || k == crate::data::REREAD) && f))
+                .map(|(&k, &f)| match (k, f) {
+                    (crate::data::ANSWER, true) => cfg.aux_fact as f32,
+                    (crate::data::REREAD, true) => 1.0,
+                    _ => 0.0,
+                })
                 .collect();
             let mut found = (0, 0);
             for (&k, &f) in ks.iter().zip(&findable) {
