@@ -134,15 +134,32 @@ mod tests {
     }
 }
 
-/// Long-range recall episodes woven into a token stream:
-/// `… Секретное слово — X. … (D tokens) … Какое было секретное слово? — X. …`
-/// The answer can only be produced by remembering the key `D` tokens back.
+/// Long-range recall episodes woven into a token stream. Each states
+/// something once and asks for it `D` tokens later:
+///
+/// * a secret word: `Секретное слово — X.` … `Какое было секретное слово? — X.`
+///   or, copyable, `Секретное слово — X.`;
+/// * personal facts of an invented person (name, town, pet), asked either
+///   with the same words (`Меня зовут` → name) or with a question
+///   (`Как меня зовут? —` → name).
+///
+/// The answer can only be produced by remembering the statement.
 pub struct Episodes {
     keys: Vec<Vec<u32>>,
     intros: Vec<Vec<u32>>,
     questions: Vec<Vec<u32>>,
+    names: Vec<Vec<u32>>,
+    pets: Vec<(Vec<u32>, Vec<u32>, Vec<u32>)>,
+    fact_parts: [Vec<u32>; 6],
     end: Vec<u32>,
+    tok_end: Vec<u32>,
 }
+
+/// Syllables of invented names (no real names or places).
+const SYLLABLES: &[&str] = &[
+    "ла", "ми", "ро", "на", "ке", "ти", "ва", "со", "ре", "лу", "ни", "да", "фе", "ри", "то", "ме", "ли", "зо", "ка",
+    "эн", "ор", "ай",
+];
 
 const KEY_WORDS: &[&str] = &[
     "яблоко",
@@ -204,23 +221,81 @@ const KEY_WORDS: &[&str] = &[
 
 impl Episodes {
     pub fn new(tok: &crate::tokenizer::Tokenizer) -> Self {
-        let mut keys: Vec<Vec<u32>> = KEY_WORDS.iter().map(|w| tok.encode(&format!(" {w}"))).collect();
-        keys.extend((0..81).map(|i| tok.encode(&format!(" {}", 1000 + (i * 7919) % 9000))));
+        let keys: Vec<Vec<u32>> = KEY_WORDS.iter().map(|w| tok.encode(&format!(" {w}"))).collect();
+        // 729 invented names of 2–3 syllables.
+        let mut rng = snn_memory::rng::SplitMix64::new(0x9e37);
+        let names = (0..729)
+            .map(|_| {
+                let n = 2 + rng.below(2) as usize;
+                let word: String = (0..n).map(|_| SYLLABLES[rng.below(SYLLABLES.len() as u64) as usize]).collect();
+                let mut c = word.chars();
+                let cap: String = c.next().into_iter().flat_map(char::to_uppercase).chain(c).collect();
+                tok.encode(&format!(" {cap}"))
+            })
+            .collect();
+        let pets = [("Мою", "мою", "кошку"), ("Мою", "мою", "собаку"), ("Моего", "моего", "попугая")]
+            .iter()
+            .map(|(my, my_lower, pet)| {
+                (
+                    tok.encode(&format!(" {my} {pet} зовут")),
+                    tok.encode(&format!("\n{my} {pet} зовут")),
+                    tok.encode(&format!("\nКак зовут {my_lower} {pet}? —")),
+                )
+            })
+            .collect();
+        let fact_parts = [
+            tok.encode("\nМеня зовут"),
+            tok.encode(". Я живу в городе"),
+            tok.encode("\nМеня зовут"),
+            tok.encode("\nКак меня зовут? —"),
+            tok.encode("\nЯ живу в городе"),
+            tok.encode("\nВ каком городе я живу? —"),
+        ];
         let intros =
             ["\nСекретное слово —", "\nЗапомни пароль:", "\nКод доступа:"].iter().map(|s| tok.encode(s)).collect();
         let questions = ["\nКакое было секретное слово? —", "\nКакой был пароль? —", "\nНапомни код доступа:"]
             .iter()
             .map(|s| tok.encode(s))
             .collect();
-        Self { keys, intros, questions, end: tok.encode(".\n") }
+        Self { keys, intros, questions, names, pets, fact_parts, end: tok.encode(".\n"), tok_end: tok.encode(".") }
     }
 
-    /// `(intro tokens, question tokens, answer tokens)` of a random episode.
-    pub fn sample(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    /// A secret-word episode asked with a question (association, not
+    /// copying): the evaluation's recall test.
+    pub fn sample_secret(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let key = &self.keys[rng.below(self.keys.len() as u64) as usize];
         let kind = rng.below(self.intros.len() as u64) as usize;
         let intro = [&self.intros[kind][..], key, &self.end].concat();
         (intro, self.questions[kind].clone(), [&key[..], &self.end].concat())
+    }
+
+    /// `(intro tokens, question tokens, answer tokens)` of a random episode:
+    /// a secret word (asked by a question or by the same words) or a fact
+    /// about an invented person (likewise).
+    pub fn sample(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let same_words = rng.below(2) == 0;
+        if rng.below(3) == 0 {
+            let (intro, q, a) = self.sample_secret(rng);
+            if same_words {
+                // The question is the statement's own opening.
+                let kind = self.intros.iter().position(|i| intro.starts_with(i)).unwrap_or(0);
+                return (intro, self.intros[kind].clone(), a);
+            }
+            return (intro, q, a);
+        }
+        let pick =
+            |v: &Vec<Vec<u32>>, rng: &mut snn_memory::rng::SplitMix64| v[rng.below(v.len() as u64) as usize].clone();
+        let (name, town, pet_name) = (pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng));
+        let pet = &self.pets[rng.below(self.pets.len() as u64) as usize];
+        let p = &self.fact_parts;
+        // "Меня зовут N. Я живу в городе T. Мою кошку зовут P."
+        let intro = [&p[0][..], &name, &p[1], &town, &self.tok_end, &pet.0, &pet_name, &self.end].concat();
+        let (q, a) = match rng.below(3) {
+            0 => (if same_words { p[2].clone() } else { p[3].clone() }, name),
+            1 => (if same_words { p[4].clone() } else { p[5].clone() }, town),
+            _ => (if same_words { pet.1.clone() } else { pet.2.clone() }, pet_name),
+        };
+        (intro, q, [&a[..], &self.end].concat())
     }
 }
 
@@ -258,7 +333,7 @@ impl TaskStream {
             pending: Default::default(),
             question: None,
             carry: None,
-            p_episode: 1.0 / 2187.0,
+            p_episode: 1.0 / 729.0,
             distance: (243, 19_683),
             jump: false,
             p_reread: 0.0,
@@ -340,6 +415,24 @@ impl TaskStream {
 mod episode_tests {
     use super::*;
     use crate::tokenizer::Tokenizer;
+
+    #[test]
+    fn every_episode_answer_is_in_its_statement() {
+        let tok = Tokenizer::train(
+            &"Меня зовут Лами. Я живу в городе Роке. Мою кошку зовут Нита. Секретное слово — маяк.\n".repeat(30),
+            400,
+        );
+        let ep = Episodes::new(&tok);
+        let mut rng = snn_memory::rng::SplitMix64::new(5);
+        for _ in 0..200 {
+            let (intro, question, answer) = ep.sample(&mut rng);
+            let key = &answer[..answer.len() - ep.end.len()];
+            assert!(intro.windows(key.len()).any(|w| w == key), "{}", tok.decode(&intro));
+            assert!(!question.is_empty());
+        }
+        let (intro, q, a) = ep.sample(&mut snn_memory::rng::SplitMix64::new(11));
+        println!("{} | {} | {}", tok.decode(&intro), tok.decode(&q), tok.decode(&a));
+    }
 
     #[test]
     fn episodes_repeat_the_key_after_the_distance() {

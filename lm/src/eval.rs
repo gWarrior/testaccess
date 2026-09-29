@@ -126,7 +126,7 @@ pub fn recall(
     let lead = 2 * t;
     let mut streams: Vec<(Vec<u32>, Vec<(usize, usize, usize)>)> = Vec::new();
     for b in 0..batch {
-        let (intro, question, answer) = ep.sample(&mut rng);
+        let (intro, question, answer) = ep.sample_secret(&mut rng);
         let mut src = (b * 7919) % filler.len().max(1);
         let mut take = |n: usize, out: &mut Vec<u32>| {
             for _ in 0..n {
