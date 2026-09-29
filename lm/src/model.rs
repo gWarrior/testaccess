@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! tokens → embedding (3 trits)
-//!        → 3 × [ HadamRNN cell (ternary decays) | retention | SwiGLU ]
+//!        → 4 × [ HadamRNN cell (ternary decays) | retention (swish gate) | SwiGLU ]
 //!        → memory head: one softmax over
 //!             · the window's own tokens (causal, differentiable), and
 //!             · the rows the SNN memory retrieved from the past 300k
