@@ -147,7 +147,7 @@ cargo run --release -p snn-lm -- chat                   # консольный �
 
 | Команда | Флаги |
 |---|---|
-| `chat` | `--temp 0.8`, `--top-p 0.9` (только на словарную часть), `--presence 0.5` (штраф за повтор токена ответа), `--copy 0.5` (вес индукционной копии при совпадении ≥ 8 токенов), `--format dialog\|plain` (реплики «— …» или продолжение текста), `--max-tokens 81`, `--memory 300000`, `--context файл` + `--context-tokens`, `--pointer on\|off`, `--kv`, `--seed` |
+| `chat` | `--temp 0.8`, `--top-p 0.9` (только на словарную часть), `--presence 0.5` (штраф за повтор токена ответа), `--copy 0.5` (вес индукционной копии при совпадении ≥ 8 токенов), `--format dialog\|plain` (реплики «- …», как в корпусе, или продолжение текста), `--max-tokens 81`, `--memory 300000`, `--context файл` + `--context-tokens`, `--pointer on\|off`, `--kv`, `--seed` |
 | `probe` | `--context файл`, `--probes файл` — что память находит по фрагментам |
 | `copyeval` | `--copy 0.5`, `--tokens 19683`, `--distances …`, `--pointer on\|off` |
 

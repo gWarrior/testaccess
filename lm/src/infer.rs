@@ -819,21 +819,32 @@ impl Decoding {
         self.copy * ((len as f32 - 2.0) / 6.0).clamp(0.0, 1.0)
     }
 
-    /// Sample the next token of `reply` from `parts`.
-    pub fn sample(&self, parts: &Parts, reply: &[u32], rng: &mut snn_memory::rng::SplitMix64) -> u32 {
+    /// Sample the next token of `reply` from `parts`. `recent` are the
+    /// session's last tokens (at least the three before the candidate) and
+    /// `said` every 4-gram that ended in a token the model produced in this
+    /// dialogue: a candidate completing one of them is banned, so the model
+    /// repeats neither itself within a reply nor an earlier reply.
+    pub fn sample(
+        &self,
+        parts: &Parts,
+        reply: &[u32],
+        recent: &[u32],
+        said: &std::collections::HashSet<[u32; 4]>,
+        rng: &mut snn_memory::rng::SplitMix64,
+    ) -> u32 {
         let mut seen: Vec<u32> = reply.to_vec();
         seen.sort_unstable();
         seen.dedup();
         let penalized: Vec<(u32, f32)> = seen.iter().map(|&t| (t, self.presence)).collect();
         let mut p = parts.probs(self.temperature, self.top_p, &penalized);
-        // No 4-gram twice in a reply.
+        // No 4-gram the model has already said.
         let mut banned = Vec::new();
-        if reply.len() >= 3 {
-            let tail = &reply[reply.len() - 3..];
-            for w in reply.windows(4) {
-                if &w[..3] == tail {
-                    p[w[3] as usize] = 0.0;
-                    banned.push(w[3]);
+        if recent.len() >= 3 {
+            let tail = &recent[recent.len() - 3..];
+            for g in said.iter().filter(|g| g[..3] == *tail) {
+                if let Some(v) = p.get_mut(g[3] as usize) {
+                    *v = 0.0;
+                    banned.push(g[3]);
                 }
             }
         }
@@ -932,12 +943,16 @@ mod tests {
         let d = Decoding { temperature: 1.0, top_p: 1.0, presence: 0.0, copy: 0.0 };
         let only3 = Parts { logits: vec![0.0; 4], gate: 0.0, copy: vec![(3, 1.0)] };
         let mut rng = snn_memory::rng::SplitMix64::new(1);
-        assert_eq!(d.sample(&only3, &[5, 6], &mut rng), 3);
-        let reply = [0, 1, 2, 3, 0, 1, 2];
+        let none = std::collections::HashSet::new();
+        assert_eq!(d.sample(&only3, &[], &[5, 6, 7], &none, &mut rng), 3);
+        // "0 1 2 3" was said (in an earlier reply): after "0 1 2" no 3.
+        let said: std::collections::HashSet<[u32; 4]> = [[0, 1, 2, 3]].into_iter().collect();
         let mixed = Parts { logits: vec![0.0; 4], gate: 0.5, copy: vec![(3, 0.5)] };
         for _ in 0..50 {
-            assert_ne!(d.sample(&mixed, &reply, &mut rng), 3);
+            assert_ne!(d.sample(&mixed, &[], &[0, 1, 2], &said, &mut rng), 3);
         }
+        // Everything banned but the fallback still avoids the banned token.
+        assert_ne!(d.sample(&only3, &[], &[0, 1, 2], &said, &mut rng), 3);
         assert_eq!(d.copy_weight(2), 0.0);
         assert_eq!(Decoding::default().copy_weight(8), 0.5);
     }

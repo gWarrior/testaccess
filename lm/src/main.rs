@@ -315,7 +315,9 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     };
     let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
     let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
-    // Dialogue lines as in prose: "— реплика", the reply after "— ".
+    // Dialogue lines as the corpus writes them: "- реплика" (Taiga has no
+    // em dash, which BPE never merged), the reply after "-" (BPE glues the
+    // space to the next word, so the model starts " слово").
     let dialog = arg(args, "--format", "dialog") == "dialog";
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
@@ -332,6 +334,9 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     };
     let mut rng = snn_memory::rng::SplitMix64::new(seed);
     let mut parts = engine.step_parts(&mut session, snn_lm::tokenizer::DOC);
+    // The session's last tokens and the 4-grams the model has said.
+    let mut recent: Vec<u32> = vec![snn_lm::tokenizer::DOC];
+    let mut said = std::collections::HashSet::new();
     let context = arg(args, "--context", "");
     if !context.is_empty() {
         let limit: usize = arg(args, "--context-tokens", "300000").parse().expect("--context-tokens");
@@ -365,6 +370,8 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             Some("/reset") => {
                 session = engine.session_with(memory_tokens, precision);
                 parts = engine.step_parts(&mut session, snn_lm::tokenizer::DOC);
+                recent = vec![snn_lm::tokenizer::DOC];
+                said.clear();
                 println!("(новый диалог)");
                 continue;
             }
@@ -376,15 +383,18 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             _ => {}
         }
         let prompt = if dialog {
-            format!("— {line}\n— ")
+            format!("- {line}\n-")
         } else if line.ends_with(['.', '!', '?', '»', '…', '"']) {
             // A finished sentence is a turn; an unfinished one is continued in place.
             format!("{line}\n")
         } else {
             line.to_string()
         };
+        let keep = recent.len().saturating_sub(3);
+        recent.drain(..keep);
         for t in tok.encode(&prompt) {
             parts = engine.step_parts(&mut session, t);
+            recent.push(t);
         }
         print!("модель> ");
         let mut out = Vec::new();
@@ -397,7 +407,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
                     p.add_copy(c, decoding.copy_weight(len));
                 }
             }
-            let t = decoding.sample(&p, &out, &mut rng);
+            let t = decoding.sample(&p, &out, &recent, &said, &mut rng);
             if t == snn_lm::tokenizer::DOC {
                 if out.is_empty() {
                     continue;
@@ -405,6 +415,10 @@ fn chat(args: &[String]) -> std::io::Result<()> {
                 break;
             }
             out.push(t);
+            if let [.., a, b, c] = recent[..] {
+                said.insert([a, b, c, t]);
+            }
+            recent.push(t);
             let text = tok.decode(&out);
             parts = engine.step_parts(&mut session, t);
             // A line break ends the answer, but not before it has begun.
@@ -419,6 +433,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         if !tok.decode(&out).ends_with('\n') {
             for t in tok.encode("\n") {
                 parts = engine.step_parts(&mut session, t);
+                recent.push(t);
             }
         }
     }

@@ -143,7 +143,7 @@ snn-lm recall   --run $R --episodes secret    # вспоминание факт�
 snn-lm reread   --run $R --file книга.txt     # точность повторного чтения
 snn-lm ablate   --run $R                      # вклад состояния и позиции в окне
 snn-lm export   --run $R [--weights ema] --out lm/model
-snn-lm chat     --model lm/model              # диалог: реплики «— …»
+snn-lm chat     --model lm/model              # диалог: реплики «- …»
 snn-lm copyeval --model lm/model              # точное копирование из памяти движком
 ```
 
