@@ -61,3 +61,16 @@ impl Clock for ManualClock {
         f64::from_bits(self.bits.load(Ordering::SeqCst))
     }
 }
+
+/// `inner` shifted by a constant: a restored memory continues from the
+/// moment its snapshot was taken, whatever the new clock reads.
+pub(crate) struct OffsetClock {
+    pub inner: Box<dyn Clock>,
+    pub offset: f64,
+}
+
+impl Clock for OffsetClock {
+    fn now(&self) -> f64 {
+        self.inner.now() + self.offset
+    }
+}

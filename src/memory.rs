@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::bank::{Engram, EngramBank, SlotMeta, SlotStatus, NO_ID};
-use crate::clock::{Clock, SystemClock};
+use crate::bank::{Engram, EngramBank, GetPayload, PutPayload, SlotMeta, SlotStatus, NO_ID};
+use crate::clock::{Clock, OffsetClock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::dynamics::{self, Cand};
 use crate::encoder::{check_code, Encoder};
@@ -298,8 +298,12 @@ struct Counters {
     learns: u64,
     recalls: u64,
     forgets: u64,
+    /// Wall-clock time of the operations of this session (not part of a
+    /// full snapshot) and how many operations it covers.
     learn_ns: u128,
     recall_ns: u128,
+    timed_learns: u64,
+    timed_recalls: u64,
 }
 
 /// Fast SNN memory with an explicit memory lifecycle.
@@ -365,6 +369,11 @@ impl<P: Clone> SnnMemory<P> {
     pub fn with_clock(mut self, clock: impl Clock + 'static) -> Self {
         self.clock = Box::new(clock);
         self
+    }
+
+    /// Replace the time source in place (see [`with_clock`](Self::with_clock)).
+    pub(crate) fn set_clock(&mut self, clock: Box<dyn Clock>) {
+        self.clock = clock;
     }
 
     pub fn config(&self) -> &MemoryConfig {
@@ -523,6 +532,7 @@ impl<P: Clone> SnnMemory<P> {
         let code = self.encode(input)?;
         let id = self.learn_code(code, opts)?;
         self.counters.learns += 1;
+        self.counters.timed_learns += 1;
         self.counters.learn_ns += start.elapsed().as_nanos();
         Ok(id)
     }
@@ -567,6 +577,7 @@ impl<P: Clone> SnnMemory<P> {
             ids.push(id);
         }
         self.counters.learns += ids.len() as u64;
+        self.counters.timed_learns += ids.len() as u64;
         self.counters.learn_ns += start.elapsed().as_nanos();
         Ok(ids)
     }
@@ -712,6 +723,7 @@ impl<P: Clone> SnnMemory<P> {
         let cue = self.encode(input)?;
         let result = self.recall_code(&cue, opts);
         self.counters.recalls += 1;
+        self.counters.timed_recalls += 1;
         self.counters.recall_ns += start.elapsed().as_nanos();
         Ok(result)
     }
@@ -1093,10 +1105,166 @@ impl<P: Clone> SnnMemory<P> {
             learns: c.learns,
             recalls: c.recalls,
             forgets: c.forgets,
-            avg_learn_us: avg(c.learn_ns, c.learns),
-            avg_recall_us: avg(c.recall_ns, c.recalls),
+            avg_learn_us: avg(c.learn_ns, c.timed_learns),
+            avg_recall_us: avg(c.recall_ns, c.timed_recalls),
             approx_bytes: self.fast.bytes() + self.long.bytes() + self.loc.capacity() * 32,
         }
+    }
+}
+
+/// Magic and version of [`SnnMemory::save_full`] snapshots.
+const IMAGE_MAGIC: &[u8; 4] = b"SNNI";
+const IMAGE_VERSION: u32 = 1;
+
+impl<P: Clone> SnnMemory<P> {
+    /// Exact image of the whole memory (the body of a full snapshot):
+    ///
+    /// ```text
+    /// encoder fingerprint u64 | n_neurons u32 | max_ensemble u32 | now f64
+    /// next_id u64 | contexts: count u32, (len u32, utf-8)*
+    /// counters: learns, recalls, forgets u64
+    /// working memory: traces (id u64, u f32, t f64)* by id | recent ids | last state
+    /// fast bank | long-term bank   (see EngramBank::write_image)
+    /// ```
+    ///
+    /// Times are absolute readings of this memory's clock, together with
+    /// the reading at the moment of saving; a restored memory continues
+    /// from that moment. Wall-clock timings of operations (the averages in
+    /// [`Stats`]) are per session and start over after a restore.
+    pub(crate) fn write_image(&self, out: &mut Vec<u8>, put: &mut PutPayload<'_, P>) {
+        out.extend_from_slice(&self.encoder.fingerprint().to_le_bytes());
+        out.extend_from_slice(&self.n_neurons.to_le_bytes());
+        out.extend_from_slice(&(self.cfg.max_ensemble as u32).to_le_bytes());
+        out.extend_from_slice(&self.clock.now().to_le_bytes());
+        out.extend_from_slice(&self.next_id.to_le_bytes());
+        out.extend_from_slice(&(self.contexts.len() as u32).to_le_bytes());
+        for name in &self.contexts {
+            name.write(out);
+        }
+        let c = &self.counters;
+        for x in [c.learns, c.recalls, c.forgets] {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        self.working.write_image(out);
+        self.fast.write_image(out, put);
+        self.long.write_image(out, put);
+    }
+
+    /// Rough size of [`write_image`](Self::write_image) output, to reserve
+    /// the buffer once.
+    pub(crate) fn image_size_hint(&self) -> usize {
+        let w = self.cfg.max_ensemble;
+        let slots = self.fast.slots() + self.long.slots();
+        slots * (64 + 2 * w + (2 * w).div_ceil(5)) + self.working.len() * 20 + 4096
+    }
+
+    /// Replace the whole state of this (freshly built) memory with an
+    /// image. Its clock becomes `clock` shifted to read the saved moment.
+    pub(crate) fn read_image(
+        &mut self,
+        input: &mut &[u8],
+        clock: Box<dyn Clock>,
+        get: &mut GetPayload<'_, P>,
+    ) -> Result<(), MemoryError> {
+        use persist::{corrupt, read_f64, read_u32, read_u64};
+        if read_u64(input)? != self.encoder.fingerprint() {
+            return Err(MemoryError::InvalidConfig("snapshot was written with a different encoder".into()));
+        }
+        if read_u32(input)? != self.n_neurons {
+            return Err(MemoryError::InvalidConfig("snapshot has a different neuron space".into()));
+        }
+        let width = read_u32(input)? as usize;
+        if width != self.cfg.max_ensemble {
+            return Err(MemoryError::InvalidConfig(format!(
+                "snapshot has max_ensemble {width}, config has {}",
+                self.cfg.max_ensemble
+            )));
+        }
+        let saved_now = read_f64(input)?;
+        let next_id = read_u64(input)?;
+        let n_ctx = read_u32(input)? as usize;
+        let mut contexts = Vec::with_capacity(n_ctx.min(input.len()));
+        let mut context_ids = HashMap::new();
+        for i in 0..n_ctx {
+            let name = String::read(input)?;
+            if context_ids.insert(name.clone(), ContextId(i as u32)).is_some() {
+                return Err(corrupt("duplicate context name"));
+            }
+            contexts.push(name);
+        }
+        let counters = Counters {
+            learns: read_u64(input)?,
+            recalls: read_u64(input)?,
+            forgets: read_u64(input)?,
+            ..Counters::default()
+        };
+        let mut working = WorkingMemory::new(self.cfg.stp.clone());
+        working.read_image(input)?;
+        let fast = EngramBank::read_image(Tier::Fast, self.n_neurons, width, input, get)?;
+        let long = EngramBank::read_image(Tier::LongTerm, self.n_neurons, width, input, get)?;
+
+        let mut loc = HashMap::new();
+        for (tier, bank) in [(Tier::Fast, &fast), (Tier::LongTerm, &long)] {
+            for slot in bank.active_slots() {
+                let m = &bank.meta[slot as usize];
+                if m.id == NO_ID || m.id >= next_id || loc.insert(m.id, Loc { tier, slot }).is_some() {
+                    return Err(corrupt(&format!("memory id {} is invalid or duplicated", m.id)));
+                }
+            }
+            if bank.meta.iter().any(|m| m.status != SlotStatus::Free && m.ctx.0 as usize >= n_ctx) {
+                return Err(corrupt("bad context index"));
+            }
+        }
+        let offset = saved_now - clock.now();
+        self.clock = Box::new(OffsetClock { inner: clock, offset });
+        self.fast = fast;
+        self.long = long;
+        self.loc = loc;
+        self.next_id = next_id;
+        self.contexts = contexts;
+        self.context_ids = context_ids;
+        self.working = working;
+        self.counters = counters;
+        Ok(())
+    }
+}
+
+impl<P: Clone + Persist> SnnMemory<P> {
+    /// Full snapshot: everything recall, learning and statistics depend
+    /// on (slot layout, both synapse components, index order, working
+    /// memory, counters, plasticity RNG), so that a memory restored with
+    /// [`load_full`](Self::load_full) behaves exactly like this one.
+    ///
+    /// `magic "SNNI" | version u32 | image | checksum u64` (see
+    /// `write_image`). Larger than [`save`](Self::save); use `save` to
+    /// carry knowledge across sessions and this to resume a computation.
+    pub fn save_full(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(IMAGE_MAGIC);
+        out.extend_from_slice(&IMAGE_VERSION.to_le_bytes());
+        self.write_image(&mut out, &mut |p: &P, out: &mut Vec<u8>| p.write(out));
+        let sum = persist::checksum64(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Restore a [`save_full`](Self::save_full) snapshot. The encoder and
+    /// `max_ensemble` must match; other settings may differ. `clock` is
+    /// shifted so that the memory resumes at the moment it was saved.
+    pub fn load_full<E: Encoder + 'static>(
+        encoder: E,
+        cfg: MemoryConfig,
+        bytes: &[u8],
+        clock: impl Clock + 'static,
+    ) -> Result<Self, MemoryError> {
+        let body = persist::checked_body(bytes, IMAGE_MAGIC, IMAGE_VERSION)?;
+        let mut input = body;
+        let mut mem = Self::new(encoder, cfg)?;
+        mem.read_image(&mut input, Box::new(clock), &mut |input: &mut &[u8]| P::read(input))?;
+        if !input.is_empty() {
+            return Err(persist::corrupt("trailing bytes"));
+        }
+        Ok(mem)
     }
 }
 

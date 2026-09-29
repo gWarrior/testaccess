@@ -17,7 +17,9 @@
 //! power-of-two step per row. A row that already lies on such a grid (a
 //! model's two-trit keys) is stored exactly.
 
+use crate::persist::{self, corrupt};
 use crate::trit::TritVec;
+use crate::types::MemoryError;
 
 /// Storage precision of keys/values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -27,6 +29,17 @@ pub enum KvPrecision {
     F16,
     Ternary,
     Trit2,
+}
+
+impl KvPrecision {
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            KvPrecision::F32 => 0,
+            KvPrecision::F16 => 1,
+            KvPrecision::Ternary => 2,
+            KvPrecision::Trit2 => 3,
+        }
+    }
 }
 
 /// Power-of-two step exponent for a [`KvPrecision::Trit2`] row: the finest
@@ -206,6 +219,43 @@ impl RowStore {
         self.drain_front(self.len);
     }
 
+    /// Rows as stored: raw `f32`/`f16` words, or packed trit bytes plus
+    /// per-row scales / exponents.
+    fn write_image(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.len as u64).to_le_bytes());
+        match &self.rows {
+            Rows::F32(v) => persist::put_f32s(out, v),
+            Rows::F16(v) => persist::put_u16s(out, v),
+            Rows::Ternary { trits, scales } => {
+                out.extend_from_slice(trits.as_bytes());
+                persist::put_f32s(out, scales);
+            }
+            Rows::Trit2 { trits, exps } => {
+                out.extend_from_slice(trits.as_bytes());
+                out.extend(exps.iter().map(|&e| e as u8));
+            }
+        }
+    }
+
+    fn read_image(dim: usize, precision: KvPrecision, input: &mut &[u8]) -> Result<Self, MemoryError> {
+        let len = usize::try_from(persist::read_u64(input)?).map_err(|_| corrupt("bad row count"))?;
+        let n = len.checked_mul(dim).filter(|&n| n / 8 <= input.len()).ok_or_else(|| corrupt("bad row count"))?;
+        let trits = |input: &mut &[u8], count: usize| {
+            TritVec::from_bytes(persist::take(input, count.div_ceil(5))?, count).ok_or_else(|| corrupt("bad K/V trits"))
+        };
+        let rows = match precision {
+            KvPrecision::F32 => Rows::F32(persist::read_f32s(input, n)?),
+            KvPrecision::F16 => Rows::F16(persist::read_u16s(input, n)?),
+            KvPrecision::Ternary => Rows::Ternary { trits: trits(input, n)?, scales: persist::read_f32s(input, len)? },
+            KvPrecision::Trit2 => {
+                let trits = trits(input, 2 * n)?;
+                let exps = persist::take(input, len)?.iter().map(|&e| e as i8).collect();
+                Rows::Trit2 { trits, exps }
+            }
+        };
+        Ok(Self { dim, rows, len })
+    }
+
     fn bytes(&self) -> usize {
         match &self.rows {
             Rows::F32(v) => v.capacity() * 4,
@@ -284,6 +334,50 @@ impl KvStore {
 
     pub fn bytes(&self) -> usize {
         self.keys.bytes() + self.values.bytes()
+    }
+
+    pub fn precision(&self) -> KvPrecision {
+        match self.keys.rows {
+            Rows::F32(_) => KvPrecision::F32,
+            Rows::F16(_) => KvPrecision::F16,
+            Rows::Ternary { .. } => KvPrecision::Ternary,
+            Rows::Trit2 { .. } => KvPrecision::Trit2,
+        }
+    }
+
+    /// Exact image: `key_dim u32 | value_dim u32 | precision u8 | base u64`,
+    /// then keys and values as `rows u64` + the stored rows.
+    pub(crate) fn write_image(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.keys.dim as u32).to_le_bytes());
+        out.extend_from_slice(&(self.values.dim as u32).to_le_bytes());
+        out.push(self.precision().tag());
+        out.extend_from_slice(&self.base.to_le_bytes());
+        self.keys.write_image(out);
+        self.values.write_image(out);
+    }
+
+    /// Inverse of [`write_image`](Self::write_image); the dimensions and the
+    /// precision must be the configured ones.
+    pub(crate) fn read_image(
+        key_dim: usize,
+        value_dim: usize,
+        precision: KvPrecision,
+        input: &mut &[u8],
+    ) -> Result<Self, MemoryError> {
+        let (dk, dv) = (persist::read_u32(input)? as usize, persist::read_u32(input)? as usize);
+        let tag = persist::read_u8(input)?;
+        if (dk, dv) != (key_dim, value_dim) || tag != precision.tag() {
+            return Err(MemoryError::InvalidConfig(format!(
+                "snapshot K/V is {dk}x{dv} (precision #{tag}), config is {key_dim}x{value_dim} ({precision:?})"
+            )));
+        }
+        let base = persist::read_u64(input)?;
+        let keys = RowStore::read_image(dk, precision, input)?;
+        let values = RowStore::read_image(dv, precision, input)?;
+        if keys.len != values.len || base.checked_add(keys.len as u64).is_none() {
+            return Err(corrupt("keys and values differ in length"));
+        }
+        Ok(Self { keys, values, base })
     }
 }
 

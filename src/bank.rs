@@ -18,10 +18,38 @@
 //! bounded synapses) rather than a real-valued update.
 
 use crate::config::PlasticityConfig;
-use crate::index::{entry, entry_slot, PostingIndex, MAX_SLOTS};
+use crate::index::{entry, entry_slot, PostingIndex, MAX_SLOTS, MAX_WIDTH};
+use crate::persist::{self, corrupt};
 use crate::rng::SplitMix64;
 use crate::trit::TritVec;
+use crate::types::MemoryError;
 use crate::types::{ContextId, MemoryId, Tier};
+
+/// Writes one payload into a full snapshot.
+pub(crate) type PutPayload<'a, P> = dyn FnMut(&P, &mut Vec<u8>) + 'a;
+/// Reads one payload back from a full snapshot.
+pub(crate) type GetPayload<'a, P> = dyn FnMut(&mut &[u8]) -> Result<P, MemoryError> + 'a;
+
+/// How the posting lists of a bank are stored in a full snapshot. The
+/// lists are usually in a canonical order that can be rebuilt from the
+/// engrams alone (they are only ever appended to, in insertion order, and
+/// purged in place), so only that order is recorded; otherwise they are
+/// written out verbatim.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexLayout {
+    Raw = 0,
+    /// Every non-free slot, by (memory id, slot).
+    AllById = 1,
+    /// Every non-free slot, by slot.
+    AllBySlot = 2,
+    /// Active slots, by (memory id, slot).
+    ActiveById = 3,
+    /// Active slots, by slot (the order after `reset_fast_weights`).
+    ActiveBySlot = 4,
+}
+
+const CANONICAL: [IndexLayout; 4] =
+    [IndexLayout::AllById, IndexLayout::AllBySlot, IndexLayout::ActiveById, IndexLayout::ActiveBySlot];
 
 pub(crate) const NO_ID: MemoryId = 0;
 const NO_NEURON: u16 = u16::MAX;
@@ -503,6 +531,242 @@ impl<P> EngramBank<P> {
 
     fn chance(&mut self, p: f32) -> bool {
         p >= 1.0 || (p > 0.0 && self.rng.next_f64() < p as f64)
+    }
+
+    // ----- full snapshot ----------------------------------------------------
+
+    /// Slots in the order `layout` rebuilds the posting lists.
+    fn layout_order(&self, layout: IndexLayout) -> Vec<u32> {
+        let all = matches!(layout, IndexLayout::AllById | IndexLayout::AllBySlot);
+        let mut order: Vec<u32> = (0..self.meta.len() as u32)
+            .filter(|&s| match self.meta[s as usize].status {
+                SlotStatus::Active => true,
+                SlotStatus::Deleted => all,
+                SlotStatus::Free => false,
+            })
+            .collect();
+        if matches!(layout, IndexLayout::AllById | IndexLayout::ActiveById) {
+            order.sort_unstable_by_key(|&s| (self.meta[s as usize].id, s));
+        }
+        order
+    }
+
+    /// Whether the posting lists are exactly what indexing the synapses of
+    /// `order` one slot after another produces.
+    fn index_matches(&self, order: &[u32]) -> bool {
+        let n = self.exc.n_neurons() as usize;
+        let (mut ce, mut ci) = (vec![0u32; n], vec![0u32; n]);
+        for &slot in order {
+            let base = slot as usize * self.width;
+            for pos in 0..self.meta[slot as usize].len as usize {
+                let neuron = self.ens[base + pos] as usize;
+                let (index, cursor) = match Self::eff(&self.syn, base + pos) {
+                    1 => (&self.exc, &mut ce[neuron]),
+                    -1 => (&self.inh, &mut ci[neuron]),
+                    _ => continue,
+                };
+                if index.list(neuron as u32).get(*cursor as usize) != Some(&entry(slot, pos)) {
+                    return false;
+                }
+                *cursor += 1;
+            }
+        }
+        (0..n).all(|i| ce[i] as usize == self.exc.len(i as u32) && ci[i] as usize == self.inh.len(i as u32))
+    }
+
+    /// Index the synapses of `order`, one slot after another.
+    fn rebuild_index(&mut self, order: &[u32]) {
+        let n = self.exc.n_neurons();
+        let (mut ne, mut ni) = (vec![0usize; n as usize], vec![0usize; n as usize]);
+        for &slot in order {
+            let base = slot as usize * self.width;
+            for pos in 0..self.meta[slot as usize].len as usize {
+                match Self::eff(&self.syn, base + pos) {
+                    1 => ne[self.ens[base + pos] as usize] += 1,
+                    -1 => ni[self.ens[base + pos] as usize] += 1,
+                    _ => {}
+                }
+            }
+        }
+        self.exc = PostingIndex::new(n);
+        self.inh = PostingIndex::new(n);
+        for i in 0..n {
+            self.exc.reserve(i, ne[i as usize]);
+            self.inh.reserve(i, ni[i as usize]);
+        }
+        for &slot in order {
+            let base = slot as usize * self.width;
+            for pos in 0..self.meta[slot as usize].len as usize {
+                let (neuron, state) = (self.ens[base + pos] as u32, Self::eff(&self.syn, base + pos));
+                self.index_add(neuron, slot, pos, state);
+            }
+        }
+    }
+
+    /// Exact image of the bank: slot layout, synapses (slow and fast
+    /// components), metadata with absolute times, payloads, free and pending
+    /// lists, the plasticity RNG and the posting-list order.
+    pub fn write_image(&self, out: &mut Vec<u8>, put: &mut PutPayload<'_, P>) {
+        out.extend_from_slice(&(self.meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.rng.state().to_le_bytes());
+        out.reserve(self.meta.len() * 56);
+        for m in &self.meta {
+            match m.status {
+                SlotStatus::Free => {
+                    out.push(0);
+                    continue;
+                }
+                SlotStatus::Active => out.push(1),
+                SlotStatus::Deleted => out.push(2),
+            }
+            out.extend_from_slice(&m.id.to_le_bytes());
+            out.extend_from_slice(&m.ctx.0.to_le_bytes());
+            out.extend_from_slice(&m.created.to_le_bytes());
+            out.extend_from_slice(&m.expires.to_le_bytes());
+            out.extend_from_slice(&m.strength.to_le_bytes());
+            out.extend_from_slice(&m.recalls.to_le_bytes());
+            out.push(m.pinned as u8);
+            out.push(m.polarity as u8);
+            out.extend_from_slice(&m.prev.to_le_bytes());
+            out.extend_from_slice(&m.next.to_le_bytes());
+            out.push(m.len as u8);
+        }
+        persist::put_u16s(out, &self.ens);
+        out.extend_from_slice(self.syn.as_bytes());
+        for (m, p) in self.meta.iter().zip(&self.payload) {
+            if m.status != SlotStatus::Free {
+                match p {
+                    Some(p) => {
+                        out.push(1);
+                        put(p, out);
+                    }
+                    None => out.push(0),
+                }
+            }
+        }
+        for list in [&self.free, &self.pending] {
+            out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            persist::put_u32s(out, list);
+        }
+        match CANONICAL.into_iter().find(|&l| self.index_matches(&self.layout_order(l))) {
+            Some(layout) => out.push(layout as u8),
+            None => {
+                out.push(IndexLayout::Raw as u8);
+                for index in [&self.exc, &self.inh] {
+                    for n in 0..index.n_neurons() {
+                        let list = index.list(n);
+                        out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+                        persist::put_u32s(out, list);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inverse of [`write_image`](Self::write_image).
+    pub fn read_image(
+        tier: Tier,
+        n_neurons: u32,
+        width: usize,
+        input: &mut &[u8],
+        get: &mut GetPayload<'_, P>,
+    ) -> Result<Self, MemoryError> {
+        use persist::{read_f32, read_f64, read_i8, read_u32, read_u64, read_u8};
+        let mut bank = Self::new(tier, n_neurons, width);
+        let slots = read_u32(input)? as usize;
+        if slots > MAX_SLOTS || slots > input.len() {
+            return Err(corrupt("bad slot count"));
+        }
+        bank.rng = SplitMix64::new(read_u64(input)?);
+        bank.meta.reserve_exact(slots);
+        for _ in 0..slots {
+            let status = match read_u8(input)? {
+                0 => {
+                    bank.meta.push(SlotMeta::new(NO_ID));
+                    continue;
+                }
+                1 => SlotStatus::Active,
+                2 => SlotStatus::Deleted,
+                _ => return Err(corrupt("bad slot status")),
+            };
+            let m = SlotMeta {
+                id: read_u64(input)?,
+                ctx: ContextId(read_u32(input)?),
+                status,
+                created: read_f64(input)?,
+                expires: read_f64(input)?,
+                strength: read_f32(input)?,
+                recalls: read_u32(input)?,
+                pinned: read_u8(input)? != 0,
+                polarity: read_i8(input)?,
+                prev: read_u64(input)?,
+                next: read_u64(input)?,
+                len: read_u8(input)? as u32,
+            };
+            if m.len as usize > width || m.len == 0 {
+                return Err(corrupt("bad engram size"));
+            }
+            bank.n_active += (status == SlotStatus::Active) as usize;
+            bank.meta.push(m);
+        }
+        bank.ens = persist::read_u16s(input, slots * width)?;
+        for (s, m) in bank.meta.iter().enumerate() {
+            let used = if m.status == SlotStatus::Free { 0 } else { m.len as usize };
+            let row = &bank.ens[s * width..(s + 1) * width];
+            if row[..used].iter().any(|&n| n as u32 >= n_neurons) || row[used..].iter().any(|&n| n != NO_NEURON) {
+                return Err(corrupt("bad presynaptic neuron"));
+            }
+        }
+        let trits = 2 * width * slots;
+        bank.syn = TritVec::from_bytes(persist::take(input, trits.div_ceil(5))?, trits)
+            .ok_or_else(|| corrupt("bad synapse states"))?;
+        bank.payload = Vec::with_capacity(slots);
+        for s in 0..slots {
+            let p = match bank.meta[s].status {
+                SlotStatus::Free => None,
+                _ => match read_u8(input)? {
+                    0 => None,
+                    _ => Some(get(input)?),
+                },
+            };
+            bank.payload.push(p);
+        }
+        let mut lists = [Vec::new(), Vec::new()];
+        for (list, want) in lists.iter_mut().zip([SlotStatus::Free, SlotStatus::Deleted]) {
+            let n = read_u32(input)? as usize;
+            *list = persist::read_u32s(input, n)?;
+            if list.iter().any(|&s| bank.meta.get(s as usize).map_or(true, |m| m.status != want)) {
+                return Err(corrupt("bad free/pending slot"));
+            }
+        }
+        [bank.free, bank.pending] = lists;
+        bank.acc = vec![Acc::default(); slots];
+        let layout = read_u8(input)?;
+        match CANONICAL.into_iter().find(|&l| l as u8 == layout) {
+            Some(l) => bank.rebuild_index(&bank.layout_order(l)),
+            None if layout == IndexLayout::Raw as u8 => {
+                let read = |input: &mut &[u8]| -> Result<PostingIndex, MemoryError> {
+                    let mut lists = Vec::with_capacity(n_neurons as usize);
+                    for _ in 0..n_neurons {
+                        let n = read_u32(input)? as usize;
+                        let list = persist::read_u32s(input, n)?;
+                        let ok = |&e: &u32| {
+                            let (s, pos) = (entry_slot(e) as usize, (e & 0xFF) as usize);
+                            s < slots && pos < width.min(MAX_WIDTH)
+                        };
+                        if !list.iter().all(ok) {
+                            return Err(corrupt("bad posting entry"));
+                        }
+                        lists.push(list);
+                    }
+                    Ok(PostingIndex::from_lists(lists))
+                };
+                bank.exc = read(input)?;
+                bank.inh = read(input)?;
+            }
+            None => return Err(corrupt("bad index layout")),
+        }
+        Ok(bank)
     }
 
     /// Approximate heap usage in bytes.

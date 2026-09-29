@@ -38,6 +38,17 @@ impl PostingIndex {
         Self { lists: (0..n_neurons).map(|_| Vec::new()).collect(), entries: 0 }
     }
 
+    /// An index holding exactly `lists` (one per neuron).
+    pub fn from_lists(lists: Vec<Vec<u32>>) -> Self {
+        let entries = lists.iter().map(Vec::len).sum();
+        Self { lists, entries }
+    }
+
+    /// Reserve room for `n` more entries of `neuron`.
+    pub fn reserve(&mut self, neuron: u32, n: usize) {
+        self.lists[neuron as usize].reserve_exact(n);
+    }
+
     pub fn n_neurons(&self) -> u32 {
         self.lists.len() as u32
     }

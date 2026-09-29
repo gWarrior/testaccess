@@ -22,6 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::attention::{attend, Attended};
+use crate::clock::{Clock, SystemClock};
 use crate::config::MemoryConfig;
 use crate::encoder::{FlyHashEncoder, NGramEncoder};
 use crate::kv::{KvPrecision, KvStore};
@@ -121,6 +122,103 @@ impl Persist for Chunk {
 }
 
 const CONTEXT_MAGIC: &[u8; 4] = b"SNNC";
+/// Full snapshots ([`ContextMemory::save_full`]).
+const FULL_MAGIC: &[u8; 4] = b"SNCF";
+const FULL_VERSION: u32 = 1;
+
+/// The configuration a full snapshot's state depends on; everything else
+/// (thresholds, `top_k`, dynamics, ...) may change between save and restore.
+#[derive(Debug, PartialEq, Eq)]
+struct Shape {
+    chunk_size: u64,
+    stride: u64,
+    max_tokens: u64,
+    ngrams: Vec<u32>,
+    n_neurons: u32,
+    seed: u64,
+    /// `key_dim, value_dim, precision, semantic_index, dense_k, fan_in`.
+    kv: Option<(u32, u32, u8, bool, u32, u32)>,
+}
+
+impl Shape {
+    fn of(cfg: &ContextConfig) -> Self {
+        Self {
+            chunk_size: cfg.chunk_size as u64,
+            stride: cfg.stride as u64,
+            max_tokens: cfg.max_tokens as u64,
+            ngrams: cfg.ngrams.iter().map(|&n| n as u32).collect(),
+            n_neurons: cfg.n_neurons,
+            seed: cfg.seed,
+            kv: cfg.kv.as_ref().map(|k| {
+                let (dk, dv) = (k.key_dim as u32, k.value_dim as u32);
+                (dk, dv, k.precision.tag(), k.semantic_index, k.dense_k as u32, k.fan_in as u32)
+            }),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        for x in [self.chunk_size, self.stride, self.max_tokens, self.seed] {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.extend_from_slice(&self.n_neurons.to_le_bytes());
+        self.ngrams.write(out);
+        match self.kv {
+            None => out.push(0),
+            Some((dk, dv, precision, semantic, dense_k, fan_in)) => {
+                out.push(1);
+                for x in [dk, dv, dense_k, fan_in] {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                out.push(precision);
+                out.push(semantic as u8);
+            }
+        }
+    }
+
+    fn read(input: &mut &[u8]) -> Result<Self, MemoryError> {
+        use persist::{read_u32, read_u64, read_u8};
+        let [chunk_size, stride, max_tokens, seed] =
+            [read_u64(input)?, read_u64(input)?, read_u64(input)?, read_u64(input)?];
+        let n_neurons = read_u32(input)?;
+        let ngrams = Vec::<u32>::read(input)?;
+        let kv = match read_u8(input)? {
+            0 => None,
+            _ => {
+                let [dk, dv, dense_k, fan_in] =
+                    [read_u32(input)?, read_u32(input)?, read_u32(input)?, read_u32(input)?];
+                Some((dk, dv, read_u8(input)?, read_u8(input)? != 0, dense_k, fan_in))
+            }
+        };
+        Ok(Self { chunk_size, stride, max_tokens, ngrams, n_neurons, seed, kv })
+    }
+}
+
+/// Chunk payloads in a full snapshot: chunks still in the token window are
+/// stored as a reference to it, others inline.
+fn put_chunk(c: &Chunk, window: &[u32], base: u64, out: &mut Vec<u8>) {
+    let held = c.start >= base
+        && c.start - base + c.tokens.len() as u64 <= window.len() as u64
+        && window[(c.start - base) as usize..(c.start - base) as usize + c.tokens.len()] == c.tokens[..];
+    out.push(held as u8);
+    out.extend_from_slice(&c.start.to_le_bytes());
+    out.extend_from_slice(&(c.tokens.len() as u32).to_le_bytes());
+    if !held {
+        persist::put_u32s(out, &c.tokens);
+    }
+}
+
+fn get_chunk(window: &[u32], base: u64, input: &mut &[u8]) -> Result<Chunk, MemoryError> {
+    let held = persist::read_u8(input)? != 0;
+    let start = persist::read_u64(input)?;
+    let len = persist::read_u32(input)? as usize;
+    let tokens = if held {
+        let from = start.checked_sub(base).ok_or_else(|| persist::corrupt("chunk before the window"))? as usize;
+        window.get(from..from.saturating_add(len)).ok_or_else(|| persist::corrupt("chunk past the window"))?.to_vec()
+    } else {
+        persist::read_u32s(input, len)?
+    };
+    Ok(Chunk { start, tokens })
+}
 
 /// What to look up.
 #[derive(Clone, Copy, Debug)]
@@ -783,6 +881,211 @@ impl ContextMemory {
         if let Some(kv) = &mut ctx.kv {
             kv.reset(position);
         }
+        Ok(ctx)
+    }
+
+    /// Replace the time source of both SNN memories (e.g. with a shared
+    /// [`ManualClock`](crate::ManualClock) in tests). Use it on a fresh
+    /// memory: times already stored are readings of the previous clock.
+    pub fn with_clock(mut self, clock: impl Clock + Clone + 'static) -> Self {
+        if let Some(sem) = &mut self.semantic {
+            sem.set_clock(Box::new(clock.clone()));
+        }
+        self.lexical.set_clock(Box::new(clock));
+        self
+    }
+
+    /// Full snapshot of the whole state, for resuming exactly where this
+    /// memory is: the token window, chunk list, both SNN memories in full
+    /// (slot layout, synapses, index order, working memory, counters,
+    /// times) and the K/V store. After
+    /// [`restore_full`](Self::restore_full), every operation gives the same
+    /// results as it would on this memory. (Only the byte-usage estimates
+    /// of [`stats`](Self::stats), which depend on allocation capacities,
+    /// may differ.)
+    ///
+    /// Format (little endian):
+    ///
+    /// ```text
+    /// magic "SNCF" | version u32
+    /// shape: chunk_size, stride, max_tokens, seed u64 | n_neurons u32
+    ///        ngrams (count u32, u32*) | kv u8 [key_dim, value_dim,
+    ///        dense_k, fan_in u32 | precision u8 | semantic_index u8]
+    /// state section:    len u64 | base, next_chunk, census_from u64
+    ///                   last: u8 [lexical u64, semantic u64 (0 = none)]
+    ///                   tokens (count u64, u32*) | chunks (count u64,
+    ///                   (start, lexical, semantic u64)*)
+    /// lexical section:  len u64 | SNN memory image
+    /// semantic section: len u64 | SNN memory image (len 0 = none)
+    /// K/V section:      len u64 | K/V image (len 0 = none)
+    /// checksum u64 (of everything before it)
+    /// ```
+    ///
+    /// Chunk payloads that are still in the token window are stored as
+    /// references to it; K/V trits and synapse states are stored as packed
+    /// bytes (5 trits per byte). The census of window n-grams is rebuilt
+    /// from the tokens on restore.
+    pub fn save_full(&self) -> Vec<u8> {
+        let hint = self.tokens.len() * 4
+            + self.chunks.len() * 24
+            + self.lexical.image_size_hint()
+            + self.semantic.as_ref().map_or(0, SnnMemory::image_size_hint)
+            + self.kv.as_ref().map_or(0, KvStore::bytes)
+            + 1024;
+        let mut out = Vec::with_capacity(hint);
+        out.extend_from_slice(FULL_MAGIC);
+        out.extend_from_slice(&FULL_VERSION.to_le_bytes());
+        Shape::of(&self.cfg).write(&mut out);
+
+        let sec = persist::begin_section(&mut out);
+        for x in [self.base, self.next_chunk, self.census_from] {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        match self.last {
+            None => out.push(0),
+            Some((lex, sem)) => {
+                out.push(1);
+                out.extend_from_slice(&lex.to_le_bytes());
+                out.extend_from_slice(&sem.unwrap_or(0).to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.tokens.len() as u64).to_le_bytes());
+        persist::put_u32s(&mut out, &self.tokens);
+        out.extend_from_slice(&(self.chunks.len() as u64).to_le_bytes());
+        out.reserve(self.chunks.len() * 24);
+        for c in &self.chunks {
+            for x in [c.start, c.lexical, c.semantic.unwrap_or(0)] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        persist::end_section(&mut out, sec);
+
+        let (window, base) = (&self.tokens[..], self.base);
+        let mut put = |c: &Chunk, out: &mut Vec<u8>| put_chunk(c, window, base, out);
+        let sec = persist::begin_section(&mut out);
+        self.lexical.write_image(&mut out, &mut put);
+        persist::end_section(&mut out, sec);
+        let sec = persist::begin_section(&mut out);
+        if let Some(sem) = &self.semantic {
+            sem.write_image(&mut out, &mut put);
+        }
+        persist::end_section(&mut out, sec);
+        let sec = persist::begin_section(&mut out);
+        if let Some(kv) = &self.kv {
+            kv.write_image(&mut out);
+        }
+        persist::end_section(&mut out, sec);
+
+        let sum = persist::checksum64(&out);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out
+    }
+
+    /// Restore a [`save_full`](Self::save_full) snapshot. `cfg` must have
+    /// the same shape (chunking, window, n-grams, neuron space, seed, K/V
+    /// dimensions, precision and semantic index); thresholds and query
+    /// settings may differ. The SNN clocks resume at the saved moment.
+    pub fn restore_full(cfg: ContextConfig, bytes: &[u8]) -> Result<Self, MemoryError> {
+        Self::restore_full_with_clock(cfg, bytes, SystemClock::new())
+    }
+
+    /// [`restore_full`](Self::restore_full) with an explicit time source
+    /// (shifted so that it reads the saved moment now).
+    pub fn restore_full_with_clock(
+        cfg: ContextConfig,
+        bytes: &[u8],
+        clock: impl Clock + Clone + 'static,
+    ) -> Result<Self, MemoryError> {
+        use persist::{corrupt, read_u64, read_u8};
+        let mut input = persist::checked_body(bytes, FULL_MAGIC, FULL_VERSION)?;
+        let (saved, want) = (Shape::read(&mut input)?, Shape::of(&cfg));
+        if saved != want {
+            return Err(MemoryError::InvalidConfig(format!(
+                "snapshot was written with another context shape: {saved:?}, config: {want:?}"
+            )));
+        }
+        let mut ctx = Self::new(cfg)?;
+
+        let mut state = persist::section(&mut input)?;
+        let (base, next_chunk, census_from) = (read_u64(&mut state)?, read_u64(&mut state)?, read_u64(&mut state)?);
+        let last = match read_u8(&mut state)? {
+            0 => None,
+            _ => {
+                let lex = read_u64(&mut state)?;
+                let sem = read_u64(&mut state)?;
+                Some((lex, (sem != 0).then_some(sem)))
+            }
+        };
+        let n = read_u64(&mut state)? as usize;
+        let tokens = persist::read_u32s(&mut state, n)?;
+        let n = read_u64(&mut state)? as usize;
+        let recs = persist::read_u64s(&mut state, n.checked_mul(3).ok_or_else(|| corrupt("bad chunk count"))?)?;
+        if !state.is_empty() {
+            return Err(corrupt("trailing bytes in context state"));
+        }
+        let position = base.checked_add(tokens.len() as u64).ok_or_else(|| corrupt("bad position"))?;
+        let cs = ctx.cfg.chunk_size as u64;
+        let chunks: VecDeque<ChunkRec> = recs
+            .chunks_exact(3)
+            .map(|r| ChunkRec { start: r[0], lexical: r[1], semantic: (r[2] != 0).then_some(r[2]) })
+            .collect();
+        if !(base <= census_from && census_from <= position && base <= next_chunk && next_chunk <= position)
+            || chunks.iter().any(|c| c.start < base || c.start.saturating_add(cs) > position)
+        {
+            return Err(corrupt("inconsistent context positions"));
+        }
+
+        let mut get = |input: &mut &[u8]| get_chunk(&tokens, base, input);
+        let mut part = persist::section(&mut input)?;
+        ctx.lexical.read_image(&mut part, Box::new(clock.clone()), &mut get)?;
+        if !part.is_empty() {
+            return Err(corrupt("trailing bytes in lexical memory"));
+        }
+        let part = persist::section(&mut input)?;
+        match (&mut ctx.semantic, part.is_empty()) {
+            (Some(sem), false) => {
+                let mut part = part;
+                sem.read_image(&mut part, Box::new(clock), &mut get)?;
+                if !part.is_empty() {
+                    return Err(corrupt("trailing bytes in semantic memory"));
+                }
+            }
+            (None, true) => {}
+            _ => return Err(corrupt("semantic index presence differs from the shape")),
+        }
+        let mut part = persist::section(&mut input)?;
+        match (&ctx.cfg.kv, part.is_empty()) {
+            (Some(k), false) => {
+                let kv = KvStore::read_image(k.key_dim, k.value_dim, k.precision, &mut part)?;
+                if !part.is_empty() {
+                    return Err(corrupt("trailing bytes in K/V store"));
+                }
+                if kv.base() != base || kv.end() != position {
+                    return Err(corrupt("K/V store does not cover the token window"));
+                }
+                ctx.kv = Some(kv);
+            }
+            (None, true) => {}
+            _ => return Err(corrupt("K/V store presence differs from the shape")),
+        }
+        if !input.is_empty() {
+            return Err(corrupt("trailing bytes"));
+        }
+
+        ctx.tokens = tokens;
+        ctx.base = base;
+        ctx.next_chunk = next_chunk;
+        ctx.chunks = chunks;
+        ctx.last = last;
+        ctx.census_from = census_from;
+        // The census is exactly the window n-grams starting at `census_from`.
+        let n = ctx.census_n as u64;
+        let mut census = HashMap::new();
+        for s in census_from..(position + 1).saturating_sub(n) {
+            let h = ctx.census_hash(ctx.tokens(s, s + n).expect("census n-gram is held"));
+            *census.entry(h).or_insert(0) += 1;
+        }
+        ctx.census = census;
         Ok(ctx)
     }
 

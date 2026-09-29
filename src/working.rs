@@ -10,7 +10,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::config::StpConfig;
-use crate::types::MemoryId;
+use crate::persist;
+use crate::types::{MemoryError, MemoryId};
 
 pub(crate) struct WorkingMemory {
     cfg: StpConfig,
@@ -58,7 +59,9 @@ impl WorkingMemory {
         let mut all: Vec<(f32, MemoryId)> =
             self.traces.iter().map(|(&id, &(u, t))| (self.decayed(u, t, now), id)).collect();
         let keep = self.cfg.capacity.min(all.len());
-        all.select_nth_unstable_by(keep.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+        // Ties go to the newest id, so pruning does not depend on the hash
+        // map's iteration order (a restored copy prunes identically).
+        all.select_nth_unstable_by(keep.saturating_sub(1), |a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
         for &(_, id) in &all[keep..] {
             self.traces.remove(&id);
         }
@@ -74,6 +77,44 @@ impl WorkingMemory {
         self.traces.clear();
         self.recent.clear();
         self.last_state.clear();
+    }
+
+    /// Exact state for a full snapshot (absolute times of the memory's
+    /// clock; traces sorted by id so equal states give equal bytes).
+    pub fn write_image(&self, out: &mut Vec<u8>) {
+        let mut traces: Vec<(MemoryId, (f32, f64))> = self.traces.iter().map(|(&id, &t)| (id, t)).collect();
+        traces.sort_unstable_by_key(|t| t.0);
+        out.extend_from_slice(&(traces.len() as u64).to_le_bytes());
+        for (id, (u, t)) in traces {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&u.to_le_bytes());
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.recent.len() as u64).to_le_bytes());
+        for id in &self.recent {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.last_state.len() as u64).to_le_bytes());
+        persist::put_u32s(out, &self.last_state);
+    }
+
+    pub fn read_image(&mut self, input: &mut &[u8]) -> Result<(), MemoryError> {
+        let n = persist::read_u64(input)? as usize;
+        let mut traces = HashMap::with_capacity(n.min(input.len() / 20));
+        for _ in 0..n {
+            let id = persist::read_u64(input)?;
+            let u = persist::read_f32(input)?;
+            let t = persist::read_f64(input)?;
+            traces.insert(id, (u, t));
+        }
+        let n = persist::read_u64(input)? as usize;
+        let recent = persist::read_u64s(input, n)?.into();
+        let n = persist::read_u64(input)? as usize;
+        let last_state = persist::read_u32s(input, n)?;
+        self.traces = traces;
+        self.recent = recent;
+        self.last_state = last_state;
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

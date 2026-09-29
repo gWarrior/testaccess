@@ -74,6 +74,118 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01B3))
 }
 
+/// Fast 64-bit checksum of full snapshots (four independent multiply-xor
+/// lanes over 64-bit words, then a SplitMix64 finish). Any change of a
+/// single word is always detected; it runs at memory speed, unlike the
+/// byte-serial FNV-1a used by the (small) long-term snapshots.
+pub(crate) fn checksum64(bytes: &[u8]) -> u64 {
+    const P: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = [0x243F_6A88_85A3_08D3u64, 0x1319_8A2E_0370_7344, 0xA409_3822_299F_31D0, 0x082E_FA98_EC4E_6C89];
+    let mut chunks = bytes.chunks_exact(32);
+    for c in &mut chunks {
+        for (i, lane) in h.iter_mut().enumerate() {
+            let w = u64::from_le_bytes(c[8 * i..8 * i + 8].try_into().expect("8 bytes"));
+            *lane = (*lane ^ w).wrapping_mul(P).rotate_left(29);
+        }
+    }
+    let mut acc = crate::rng::mix64(bytes.len() as u64);
+    for (i, &x) in h.iter().enumerate() {
+        acc = crate::rng::mix64(acc ^ x.wrapping_add(i as u64));
+    }
+    for &b in chunks.remainder() {
+        acc = crate::rng::mix64(acc ^ b as u64);
+    }
+    acc
+}
+
+/// Check the trailing [`checksum64`], magic and version of a full
+/// snapshot; returns the bytes after the version.
+pub(crate) fn checked_body<'a>(bytes: &'a [u8], magic: &[u8; 4], version: u32) -> Result<&'a [u8], MemoryError> {
+    if bytes.len() < 16 {
+        return Err(corrupt("snapshot too short"));
+    }
+    let (body, sum) = bytes.split_at(bytes.len() - 8);
+    if checksum64(body).to_le_bytes() != sum {
+        return Err(corrupt("checksum mismatch"));
+    }
+    let mut input = body;
+    if take(&mut input, 4)? != magic {
+        return Err(corrupt("wrong snapshot kind"));
+    }
+    let v = read_u32(&mut input)?;
+    if v != version {
+        return Err(corrupt(&format!("unsupported snapshot version {v}")));
+    }
+    Ok(input)
+}
+
+/// Bulk little-endian writers and readers for full snapshots.
+pub(crate) fn put_u16s(out: &mut Vec<u8>, xs: &[u16]) {
+    out.reserve(xs.len() * 2);
+    for x in xs {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+pub(crate) fn put_u32s(out: &mut Vec<u8>, xs: &[u32]) {
+    out.reserve(xs.len() * 4);
+    for x in xs {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+pub(crate) fn put_f32s(out: &mut Vec<u8>, xs: &[f32]) {
+    out.reserve(xs.len() * 4);
+    for x in xs {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+/// `n` items of `size` bytes, checked against the remaining input before
+/// anything is allocated.
+fn take_items<'a>(input: &mut &'a [u8], n: usize, size: usize) -> Result<&'a [u8], MemoryError> {
+    let bytes = n.checked_mul(size).ok_or_else(|| corrupt("length overflow"))?;
+    take(input, bytes)
+}
+
+pub(crate) fn read_u16s(input: &mut &[u8], n: usize) -> Result<Vec<u16>, MemoryError> {
+    let b = take_items(input, n, 2)?;
+    Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+pub(crate) fn read_u32s(input: &mut &[u8], n: usize) -> Result<Vec<u32>, MemoryError> {
+    let b = take_items(input, n, 4)?;
+    Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect())
+}
+
+pub(crate) fn read_u64s(input: &mut &[u8], n: usize) -> Result<Vec<u64>, MemoryError> {
+    let b = take_items(input, n, 8)?;
+    Ok(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect())
+}
+
+pub(crate) fn read_f32s(input: &mut &[u8], n: usize) -> Result<Vec<f32>, MemoryError> {
+    let b = take_items(input, n, 4)?;
+    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes"))).collect())
+}
+
+/// Start a length-prefixed section; finish it with [`end_section`].
+pub(crate) fn begin_section(out: &mut Vec<u8>) -> usize {
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.len()
+}
+
+pub(crate) fn end_section(out: &mut [u8], start: usize) {
+    let len = (out.len() - start) as u64;
+    out[start - 8..start].copy_from_slice(&len.to_le_bytes());
+}
+
+/// The body of a length-prefixed section.
+pub(crate) fn section<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], MemoryError> {
+    let n = read_u64(input)?;
+    let n = usize::try_from(n).map_err(|_| corrupt("section too long"))?;
+    take(input, n)
+}
+
 impl Persist for () {
     fn write(&self, _: &mut Vec<u8>) {}
     fn read(_: &mut &[u8]) -> Result<Self, MemoryError> {

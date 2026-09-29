@@ -184,6 +184,28 @@ impl TritVec {
         Some(Self { bytes, len })
     }
 
+    /// The packed storage: `len.div_ceil(5)` bytes of five trits each
+    /// (`byte = Σ (tᵢ + 1)·3ⁱ`), trits past `len` are zero.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Rebuild from [`as_bytes`](Self::as_bytes) output. `None` if the
+    /// length does not match, a byte is not a valid packing (`>= 243`) or a
+    /// trit past `len` is not zero.
+    pub fn from_bytes(bytes: &[u8], len: usize) -> Option<Self> {
+        if bytes.len() != len.div_ceil(TRITS_PER_BYTE) || bytes.iter().any(|&b| b >= 243) {
+            return None;
+        }
+        let tail = len % TRITS_PER_BYTE;
+        if let (Some(&last), true) = (bytes.last(), tail != 0) {
+            if DECODE[last as usize][tail..].iter().any(|&t| t != 0) {
+                return None;
+            }
+        }
+        Some(Self { bytes: bytes.to_vec(), len })
+    }
+
     /// Heap bytes used.
     pub fn bytes(&self) -> usize {
         self.bytes.capacity()
@@ -242,6 +264,17 @@ mod tests {
             grown.extend_zeros(9);
             assert!((b - a..b - a + 9).all(|i| grown.get(i) == 0), "tail must be zero after {a}..{b}");
         }
+
+        assert_eq!(TritVec::from_bytes(v.as_bytes(), n).unwrap(), v);
+        assert!(TritVec::from_bytes(v.as_bytes(), n - 1).is_none());
+        let mut bad = v.as_bytes().to_vec();
+        bad[0] = 243;
+        assert!(TritVec::from_bytes(&bad, n).is_none());
+        let mut short = TritVec::zeros(3);
+        short.set(2, 1);
+        let mut bytes = short.as_bytes().to_vec();
+        bytes[0] += 27; // trit 3 (past len) becomes +1
+        assert!(TritVec::from_bytes(&bytes, 3).is_none());
 
         v.extend_zeros(7);
         assert_eq!(v.get(n + 6), 0);
