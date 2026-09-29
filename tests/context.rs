@@ -741,12 +741,16 @@ fn semantic_index_waits_for_the_key_centre() {
     assert_eq!(new, 9);
     assert_eq!(after.semantic.as_ref().unwrap().fast_memories, new, "chunks after the centre are indexed");
 
-    // Later keys do not move it; reset keeps it.
+    // Later keys pull it towards them (a moving average: the model's keys
+    // drift while it trains); reset keeps it.
     let fixed = center.to_vec();
     append_filler(&mut ctx, &mut rng, 243, &vec![50.0; dk]);
-    assert_eq!(ctx.semantic_center(), Some(&fixed[..]));
+    let moved = ctx.semantic_center().expect("fixed").to_vec();
+    for (a, b) in moved.iter().zip(&fixed) {
+        assert!(a > b, "the centre follows the new keys: {a} vs {b}");
+    }
     ctx.reset();
-    assert_eq!(ctx.semantic_center(), Some(&fixed[..]));
+    assert_eq!(ctx.semantic_center(), Some(&moved[..]));
 }
 
 #[test]

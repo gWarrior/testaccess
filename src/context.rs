@@ -144,7 +144,8 @@ pub const SEMANTIC_TOP_K: usize = 27;
 /// Distinct places (the newest) kept of the semantic candidates.
 pub const SEMANTIC_PLACES: usize = 3;
 
-/// The mean of the first [`SEMANTIC_CENTER_AFTER`] keys appended. A model's
+/// The mean of the first [`SEMANTIC_CENTER_AFTER`] keys appended, then a
+/// moving average of the keys over about as many. A model's
 /// keys share a large common component; pooled over a few tokens it
 /// dominates every chunk, and the spike codes of all chunks look alike.
 /// Subtracting the mean leaves what distinguishes them.
@@ -161,9 +162,19 @@ impl KeyCenter {
         Self { sum: vec![0.0; dim], count: 0, center: None }
     }
 
-    /// Accumulate rows of `keys` until the centre is fixed.
+    /// Accumulate rows of `keys` until the centre is set, then follow them
+    /// as a moving average over the last ~3^7 keys (`sum` stays `centre ·
+    /// count`). A model's keys drift all through training: a centre fixed
+    /// on the first keys of a freshly initialised model was nearly
+    /// orthogonal to the real mean by step 486 (cos −0.07), and every code
+    /// looked alike again (Fable analyst 11).
     fn add(&mut self, keys: &[f32]) {
         if self.center.is_some() {
+            let n = self.count as f64;
+            for row in keys.chunks_exact(self.sum.len()) {
+                self.sum.iter_mut().zip(row).for_each(|(s, &k)| *s += k as f64 - *s / n);
+            }
+            self.freeze();
             return;
         }
         for row in keys.chunks_exact(self.sum.len()) {
