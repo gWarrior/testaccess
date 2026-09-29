@@ -302,6 +302,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         print!("модель> ");
         let mut out = Vec::new();
         let reply_start = engine.position(&session);
+        session.reply_start = reply_start;
         for _ in 0..max_new {
             if copy > 0.0 {
                 engine.copy(&mut session, &mut logits, copy, reply_start);
@@ -322,6 +323,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             }
         }
         // The token limit can cut a multibyte character in half.
+        session.reply_start = u64::MAX;
         println!("{}", tok.decode(&out).trim().trim_end_matches('\u{FFFD}'));
         // Close the turn so the model sees a clean line break.
         if !tok.decode(&out).ends_with('\n') {

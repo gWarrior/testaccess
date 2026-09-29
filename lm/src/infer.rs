@@ -19,6 +19,7 @@ use snn_memory::{ContextConfig, ContextMemory, KvConfig, KvPrecision, Probe, Ver
 
 use crate::model::Config;
 use crate::pack::{Packed, PackedModel};
+use crate::train::{IND_MAX, IND_MIN};
 
 /// Length of the local attention ring (the training window).
 pub const RING: usize = 243;
@@ -146,6 +147,8 @@ pub struct Engine {
     gate_verdict: Vec<f32>,
     /// Ablation: all weight on the vocabulary, no copying.
     pub no_pointer: bool,
+    ind_len: Vec<f32>,
+    ind_w: Vec<f32>,
 }
 
 /// Recurrent state of one conversation.
@@ -159,6 +162,9 @@ pub struct Session {
     rows: (Vec<f32>, Vec<f32>, usize, Vec<u32>),
     verdict: usize,
     pos: u64,
+    /// Position where the current reply starts: the pointer and the
+    /// induction column never copy from it (`u64::MAX` between replies).
+    pub reply_start: u64,
 }
 
 impl Engine {
@@ -213,6 +219,8 @@ impl Engine {
             gate_b: vec("gate_b")?[0],
             gate_verdict: vec("gate_verdict")?,
             no_pointer: false,
+            ind_len: vec("ind_len")?,
+            ind_w: vec("ind_w")?,
         })
     }
 
@@ -243,6 +251,7 @@ impl Engine {
             rows: (Vec::new(), Vec::new(), 0, Vec::new()),
             verdict: 1,
             pos: 0,
+            reply_start: u64::MAX,
         }
     }
 
@@ -263,9 +272,26 @@ impl Engine {
     /// after `limit` are skipped, so a reply never copies itself. Returns
     /// the copied token and the suffix length, or `None` ("не знаю").
     pub fn copy(&self, s: &mut Session, logits: &mut [f32], lambda: f32, limit: u64) -> Option<(u32, usize)> {
+        let first = s.pos - s.ring.len() as u64;
+        let (token, n) = self.continuation(s, first, limit)?;
+        // p' = (1 − λ)·p + λ·[token], written back as log-probabilities.
+        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
+        for (i, l) in logits.iter_mut().enumerate() {
+            let p = (1.0 - lambda) * (*l - mx).exp() / z + if i == token as usize { lambda } else { 0.0 };
+            *l = p.max(f32::MIN_POSITIVE).ln();
+        }
+        Some((token, n))
+    }
+
+    /// The token that followed the most recent earlier occurrence of the
+    /// longest suffix of the ring (8 down to 3 tokens): in the ring, or in the
+    /// SNN memory when it is sure (`Known`). `first` is the position of the
+    /// ring's first token; continuations at or after `limit` are skipped.
+    fn continuation(&self, s: &mut Session, first: u64, limit: u64) -> Option<(u32, usize)> {
         let ring: Vec<u32> = s.ring.iter().map(|e| e.0).collect();
-        let ring_start = s.pos - ring.len() as u64;
-        let found = (3..=8usize).rev().filter(|&n| n < ring.len()).find_map(|n| {
+        let ring_start = first;
+        (IND_MIN..=IND_MAX).rev().filter(|&n| n < ring.len()).find_map(|n| {
             let suffix = &ring[ring.len() - n..];
             // The ring first: exact and cheap.
             let local = (0..ring.len() - n)
@@ -286,16 +312,7 @@ impl Engine {
                     })
                 })
                 .map(|t| (t, n))
-        });
-        let (token, n) = found?;
-        // p' = (1 − λ)·p + λ·[token], written back as log-probabilities.
-        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
-        for (i, l) in logits.iter_mut().enumerate() {
-            let p = (1.0 - lambda) * (*l - mx).exp() / z + if i == token as usize { lambda } else { 0.0 };
-            *l = p.max(f32::MIN_POSITIVE).ln();
-        }
-        Some((token, n))
+        })
     }
 
     /// Feed many tokens (e.g. a document into memory); returns the logits
@@ -427,9 +444,20 @@ impl Engine {
         let mut gate = 1f32;
         if want_logits && !self.no_pointer {
             let pq = self.pq.apply(&xn);
+            // Ring positions: the current token (the last) is at `s.pos`; a
+            // reply never copies from itself.
+            let first = s.pos + 1 - s.ring.len() as u64;
             let n_ring = s.ring.len() - 1;
-            let mut sc: Vec<(u32, f32)> = (0..n_ring).map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1))).collect();
+            let mut sc: Vec<(u32, f32)> = (0..n_ring)
+                .filter(|&i| first + i as u64 + 1 < s.reply_start)
+                .map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1)))
+                .collect();
             sc.extend((0..s.rows.2).map(|i| (s.rows.3[i], dot(&pq, &s.rows.0[i * m..(i + 1) * m]))));
+            // Induction column: the memory's exact continuation.
+            if let Some((tok, n)) = self.continuation(s, first, s.reply_start) {
+                let w: f32 = xn.iter().zip(&self.ind_w).map(|(a, b)| a * b).sum();
+                sc.push((tok, self.ind_len[n] + w));
+            }
             // The null column's weight is the vocabulary's share.
             let null: f32 = xn.iter().zip(&self.gate_w).map(|(a, b)| a * b).sum::<f32>()
                 + self.gate_b
@@ -509,14 +537,19 @@ mod tests {
                 || name.ends_with(".n1")
                 || name == "nout"
                 || name.starts_with("gate")
+                || name.starts_with("ind_")
             {
                 var.set(&Tensor::randn(0f32, 1.0, var.as_tensor().shape(), &dev).unwrap()).unwrap();
             }
         }
-        let tokens: Vec<u32> = (0..9).map(|i| (i * 7 + 3) % 81).collect();
+        // Repeats, so the induction column fires ("3 10 17" → 24).
+        let tokens: Vec<u32> = vec![3, 10, 17, 24, 31, 3, 10, 17, 5];
         let ids = Tensor::from_vec(tokens.clone(), (1, 9), &dev).unwrap();
         let (tr, _) = model.trunk(&ids, &model.zero_state(1, &dev).unwrap()).unwrap();
-        let head = model.head(&tr, &MemBatch::empty(1, 3, 9, &dev).unwrap()).unwrap();
+        let ind = crate::train::Induction::new(100).window(&tokens);
+        assert_eq!(ind[7], (24, 3));
+        let mem = MemBatch::empty(1, 3, 9, &dev).unwrap().with_induction(&ind, 1, 9, &dev).unwrap();
+        let head = model.head(&tr, &mem).unwrap();
         let logits = head.logits.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
         let point = head.point.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
         let gate = head.gate.squeeze(0).unwrap().to_vec1::<f32>().unwrap();
@@ -529,6 +562,10 @@ mod tests {
                 let mut p: Vec<f32> = row.iter().map(|l| gate[t] * (l - mx).exp() / z).collect();
                 for j in 0..8 {
                     p[tokens[j + 1] as usize] += point[t][j];
+                }
+                // Columns: 9 window, 1 (empty) memory row, induction, null.
+                if ind[t].1 > 0 {
+                    p[ind[t].0 as usize] += point[t][10];
                 }
                 p.into_iter().map(|v| v.ln()).collect()
             })
