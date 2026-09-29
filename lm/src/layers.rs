@@ -367,7 +367,10 @@ impl HadamCell {
         let (_, t, _) = x.dims3()?;
         let u = self.wu.forward(x)?.contiguous()?;
         let z = candle_nn::ops::sigmoid(&self.wz.forward(x)?)?;
-        let hs = u.apply_op2(&self.recurrence()?, HadamScan { h0: h0.detach(), trits: self.trits })?;
+        // The fast path gets the recurrence's factors: R = diag(s)·H·diag(γ).
+        let s = ste_sign(&self.sign)?.detach().to_vec1::<f32>()?;
+        let fast = Some((s, self.decay.to_vec1::<f32>()?));
+        let hs = u.apply_op2(&self.recurrence()?, HadamScan { h0: h0.detach(), trits: self.trits, fast })?;
         let last = hs.narrow(1, t - 1, 1)?.squeeze(1)?;
         Ok(((hs * z)?, last))
     }
@@ -386,6 +389,99 @@ struct HadamScan {
     /// Round the state to `trits` balanced trits after `tanh`
     /// (straight-through); 0 keeps f32.
     trits: u8,
+    /// The factors `(s, γ)` of `R = diag(s)·H·diag(γ)` (H orthonormal
+    /// Hadamard): `h·R = FWHT(h ⊙ s)/√d ⊙ γ`, d·log d operations instead of
+    /// a d×d product per step. `None`: a general `R` (tests).
+    fast: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// In-place unnormalized Walsh–Hadamard transform (Sylvester order).
+pub fn fwht(x: &mut [f32]) {
+    let n = x.len();
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(2 * h) {
+            for j in i..i + h {
+                let (a, b) = (x[j], x[j + h]);
+                x[j] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+}
+
+/// The scan on the fast path, stream by stream in parallel. `u`: `(B, T,
+/// d)`, `h0`: `(B, d)`. Returns the states `(B, T, d)`.
+fn scan_fast(u: &[f32], h0: &[f32], b: usize, t: usize, d: usize, s: &[f32], g: &[f32], trits: u8) -> Vec<f32> {
+    use rayon::prelude::*;
+    let inv = 1.0 / (d as f32).sqrt();
+    let mut hs = vec![0f32; b * t * d];
+    hs.par_chunks_mut(t * d).enumerate().for_each(|(bi, out)| {
+        let mut h = h0[bi * d..(bi + 1) * d].to_vec();
+        let mut tmp = vec![0f32; d];
+        for ti in 0..t {
+            for j in 0..d {
+                tmp[j] = h[j] * s[j];
+            }
+            fwht(&mut tmp);
+            let ut = &u[(bi * t + ti) * d..(bi * t + ti + 1) * d];
+            for j in 0..d {
+                h[j] = state_round_f32((tmp[j] * inv * g[j] + ut[j]).tanh(), trits);
+            }
+            out[ti * d..(ti + 1) * d].copy_from_slice(&h);
+        }
+    });
+    hs
+}
+
+/// Back-propagation through the fast scan: `dA_t = (dH_t + dA_{t+1} Rᵀ)
+/// ⊙ (1 − c_t²)` with `dA Rᵀ = s ⊙ FWHT(dA ⊙ γ)/√d`; `c_t` is `tanh`'s
+/// output (recomputed from the previous state when the state is rounded).
+#[allow(clippy::too_many_arguments)]
+fn scan_fast_bwd(
+    u: &[f32],
+    hs: &[f32],
+    h0: &[f32],
+    grad: &[f32],
+    (b, t, d): (usize, usize, usize),
+    s: &[f32],
+    g: &[f32],
+    trits: u8,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let inv = 1.0 / (d as f32).sqrt();
+    let mut da = vec![0f32; b * t * d];
+    da.par_chunks_mut(t * d).enumerate().for_each(|(bi, out)| {
+        let mut next = vec![0f32; d];
+        let mut tmp = vec![0f32; d];
+        let mut c = vec![0f32; d];
+        for ti in (0..t).rev() {
+            let at = (bi * t + ti) * d;
+            if trits > 0 {
+                let prev = if ti == 0 { &h0[bi * d..(bi + 1) * d] } else { &hs[at - d..at] };
+                for j in 0..d {
+                    tmp[j] = prev[j] * s[j];
+                }
+                fwht(&mut tmp);
+                for j in 0..d {
+                    c[j] = (tmp[j] * inv * g[j] + u[at + j]).tanh();
+                }
+            } else {
+                c.copy_from_slice(&hs[at..at + d]);
+            }
+            for j in 0..d {
+                tmp[j] = next[j] * g[j];
+            }
+            fwht(&mut tmp);
+            for j in 0..d {
+                let dh = grad[at + j] + s[j] * tmp[j] * inv;
+                next[j] = dh * (1.0 - c[j] * c[j]);
+            }
+            out[ti * d..(ti + 1) * d].copy_from_slice(&next);
+        }
+    });
+    da
 }
 
 fn cpu_tensor(s: &candle_core::CpuStorage, l: &candle_core::Layout) -> Result<Tensor> {
@@ -439,6 +535,13 @@ impl candle_core::CustomOp2 for HadamScan {
         s2: &candle_core::CpuStorage,
         l2: &candle_core::Layout,
     ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        if let Some((s, g)) = &self.fast {
+            let u = cpu_tensor(s1, l1)?;
+            let (b, t, d) = u.dims3()?;
+            let h0 = self.h0.flatten_all()?.to_vec1::<f32>()?;
+            let hs = scan_fast(&u.flatten_all()?.to_vec1::<f32>()?, &h0, b, t, d, s, g, self.trits);
+            return Ok((candle_core::CpuStorage::F32(hs), u.shape().clone()));
+        }
         let hs = scan(&cpu_tensor(s1, l1)?, &cpu_tensor(s2, l2)?, &self.h0, self.trits)?;
         Ok((candle_core::CpuStorage::F32(hs.flatten_all()?.to_vec1()?), hs.shape().clone()))
     }
@@ -446,6 +549,23 @@ impl candle_core::CustomOp2 for HadamScan {
     fn bwd(&self, u: &Tensor, r: &Tensor, res: &Tensor, grad: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let (b, t, d) = res.dims3()?;
         let (res, grad) = (res.detach(), grad.detach());
+        if let Some((s, g)) = &self.fast {
+            let flat = |x: &Tensor| x.contiguous().and_then(|x| x.flatten_all()?.to_vec1::<f32>());
+            let da = scan_fast_bwd(
+                &flat(&u.detach())?,
+                &flat(&res)?,
+                &flat(&self.h0)?,
+                &flat(&grad)?,
+                (b, t, d),
+                s,
+                g,
+                self.trits,
+            );
+            let da = Tensor::from_vec(da, (b, t, d), res.device())?;
+            let prev = Tensor::cat(&[self.h0.unsqueeze(1)?, res.narrow(1, 0, t - 1)?], 1)?;
+            let dr = prev.reshape((b * t, d))?.t()?.matmul(&da.reshape((b * t, d))?)?;
+            return Ok((Some(da), Some(dr)));
+        }
         let rt = r.detach().t()?.contiguous()?;
         let hs = res.transpose(0, 1)?.contiguous()?;
         let gs = grad.transpose(0, 1)?.contiguous()?;
@@ -804,7 +924,7 @@ mod tests {
         let h0 = Tensor::randn(0f32, 0.5, (2, 8), &dev).unwrap();
         let w = Tensor::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
 
-        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), trits }).unwrap();
+        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), trits, fast: None }).unwrap();
         let g1 = (&fast * &w).unwrap().sum_all().unwrap().backward().unwrap();
 
         let mut h = h0.clone();
@@ -829,6 +949,41 @@ mod tests {
         for v in [&u, &r] {
             let d = max_diff(g1.get(v.as_tensor()).unwrap(), g2.get(v.as_tensor()).unwrap());
             assert!(d < 1e-4, "gradient mismatch {d}");
+        }
+    }
+
+    #[test]
+    fn fast_hadamard_scan_matches_the_matrix_scan() {
+        let dev = Device::Cpu;
+        let d = 16;
+        let s: Vec<f32> = (0..d).map(|j| if j % 3 == 0 { -1.0 } else { 1.0 }).collect();
+        let g = hadam_decays(d);
+        let st = Tensor::new(s.as_slice(), &dev).unwrap();
+        let gt = Tensor::new(g.as_slice(), &dev).unwrap();
+        let r = candle_core::Var::from_tensor(
+            &hadamard(d, &dev)
+                .unwrap()
+                .broadcast_mul(&st.unsqueeze(1).unwrap())
+                .unwrap()
+                .broadcast_mul(&gt.unsqueeze(0).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        for trits in [0u8, 1, 2] {
+            let u = candle_core::Var::randn(0f32, 1.0, (3, 7, d), &dev).unwrap();
+            let h0 = Tensor::randn(0f32, 0.5, (3, d), &dev).unwrap();
+            let w = Tensor::randn(0f32, 1.0, (3, 7, d), &dev).unwrap();
+            let run = |fast: Option<(Vec<f32>, Vec<f32>)>| {
+                let y = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), trits, fast }).unwrap();
+                let gr = (&y * &w).unwrap().sum_all().unwrap().backward().unwrap();
+                (y, gr.get(u.as_tensor()).unwrap().clone(), gr.get(r.as_tensor()).unwrap().clone())
+            };
+            let (a, b) = (run(None), run(Some((s.clone(), g.clone()))));
+            let diff =
+                |x: &Tensor, y: &Tensor| (x - y).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+            assert!(diff(&a.0, &b.0) < 1e-5, "states, {trits} trits");
+            assert!(diff(&a.1, &b.1) < 1e-4, "dU, {trits} trits");
+            assert!(diff(&a.2, &b.2) < 1e-4, "dR, {trits} trits");
         }
     }
 
