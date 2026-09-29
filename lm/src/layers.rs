@@ -46,6 +46,19 @@ impl QTensor {
         Ok(Self { w, theta, levels })
     }
 
+    /// Every row's optimal θ for its current weights (for a warm start).
+    pub fn optimal_theta(&self) -> Result<Tensor> {
+        let w = self.w.to_vec2::<f32>()?;
+        let theta: Vec<f32> = w
+            .iter()
+            .map(|row| {
+                let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len().max(1) as f64;
+                (mean * step_ratio(self.levels)).max(1e-30).log2() as f32
+            })
+            .collect();
+        Tensor::from_vec(theta, self.theta.shape(), self.theta.device())
+    }
+
     pub fn q(&self) -> Result<Tensor> {
         self.w.contiguous()?.apply_op2(&self.theta.contiguous()?, Quant { levels: self.levels })
     }

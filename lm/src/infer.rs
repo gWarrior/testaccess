@@ -157,6 +157,7 @@ pub struct Engine {
     pub no_pointer: bool,
     ind_len: Vec<f32>,
     ind_count: Vec<f32>,
+    ind_dist: Vec<f32>,
     ind_verdict: Vec<f32>,
     ind_w: Vec<f32>,
     ind_p: Vec<f32>,
@@ -244,6 +245,7 @@ impl Engine {
             no_pointer: false,
             ind_len: vec("ind_len")?,
             ind_count: vec("ind_count")?,
+            ind_dist: vec("ind_dist")?,
             ind_verdict: vec("ind_verdict")?,
             ind_w: vec("ind_w")?,
             ind_p: vec("ind_p")?,
@@ -348,16 +350,18 @@ impl Engine {
             }
             let count = (local.len() + far.len()) as u32;
             // The most recent occurrence: the ring's last, else the memory's.
-            let (tok, before): (u32, Box<dyn Fn(usize) -> Option<u32>>) = if let Some(&i) = local.last() {
+            // Distance from the ring's last token back to the occurrence's end.
+            let (tok, dist, before): (u32, u32, Box<dyn Fn(usize) -> Option<u32>>) = if let Some(&i) = local.last() {
                 let r = ring.clone();
-                (ring[i + n], Box::new(move |k: usize| (k <= i).then(|| r[i - k])))
+                (ring[i + n], (len - i - n) as u32, Box::new(move |k: usize| (k <= i).then(|| r[i - k])))
             } else if let Some(&p) = far.iter().max() {
                 let mem = s.memory.as_ref().expect("far matches come from the memory");
                 let Some(t) = mem.tokens(p + n as u64, p + n as u64 + 1).map(|t| t[0]) else { continue };
                 let ctx: Vec<u32> = (1..=IND_EXT as u64)
                     .map_while(|k| p.checked_sub(k).and_then(|q| mem.tokens(q, q + 1)).map(|t| t[0]))
                     .collect();
-                (t, Box::new(move |k: usize| ctx.get(k - 1).copied()))
+                let last = first + len as u64 - 1;
+                (t, (last - (p + n as u64 - 1)) as u32, Box::new(move |k: usize| ctx.get(k - 1).copied()))
             } else {
                 continue;
             };
@@ -366,7 +370,7 @@ impl Engine {
             while m < IND_EXT && m < len && before(m - n + 1) == Some(ring[len - 1 - m]) {
                 m += 1;
             }
-            return IndCand { tok, len: m as u16, count };
+            return IndCand { tok, len: m as u16, count, dist };
         }
         IndCand::NONE
     }
@@ -526,6 +530,7 @@ impl Engine {
                 let w: f32 = xn.iter().zip(&self.ind_w).map(|(a, b)| a * b).sum();
                 let logit = self.ind_len[c.len_bin() as usize]
                     + self.ind_count[c.count_trit() as usize]
+                    + self.ind_dist[c.dist_trit() as usize]
                     + self.ind_verdict[s.verdict]
                     + w
                     + self.ind_p[0] * lp_tok
@@ -632,7 +637,7 @@ mod tests {
         let ids = Tensor::from_vec(tokens.clone(), (1, 9), &dev).unwrap();
         let (tr, _) = model.trunk(&ids, &model.zero_state(1, &dev).unwrap()).unwrap();
         let ind = crate::train::Induction::new(100).window(&tokens);
-        assert_eq!(ind[7], IndCand { tok: 24, len: 3, count: 1 });
+        assert_eq!(ind[7], IndCand { tok: 24, len: 3, count: 1, dist: 5 });
         let mem = MemBatch::empty(1, 3, 9, &dev).unwrap().with_induction(ind.clone());
         let head = model.head(&tr, &mem).unwrap();
         let logits = head.logits.squeeze(0).unwrap().to_vec2::<f32>().unwrap();

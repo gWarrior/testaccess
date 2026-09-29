@@ -47,7 +47,8 @@ pub struct TrainConfig {
     pub jump: bool,
     /// Probability per token of a re-reading episode.
     pub p_reread: f64,
-    /// Weight of the auxiliary pointer loss on answers and re-read spans.
+    /// Weight of the auxiliary pointer loss per answer / re-read token,
+    /// relative to a token's mixture loss (template answers get none).
     pub aux: f64,
 }
 
@@ -73,7 +74,7 @@ impl Default for TrainConfig {
             init: None,
             jump: true,
             p_reread: 1.0 / 729.0,
-            aux: 0.5,
+            aux: 1.0,
         }
     }
 }
@@ -122,8 +123,10 @@ impl Induction {
 
     /// Feed a window; the induction candidate of every position.
     pub fn window(&mut self, x: &[u32]) -> Vec<IndCand> {
-        if self.tokens.len() + x.len() > 2 * self.limit {
-            let drop = self.tokens.len() - self.limit;
+        // Keep about `limit` tokens (the memory's window), rebuilding the
+        // index every ~limit/9 tokens.
+        if self.tokens.len() + x.len() > self.limit + self.limit / 9 {
+            let drop = (self.tokens.len() + x.len()).saturating_sub(self.limit).min(self.tokens.len());
             self.tokens.drain(..drop);
             self.index.clear();
             for p in 0..self.tokens.len() {
@@ -144,7 +147,7 @@ impl Induction {
                         while len < IND_EXT && len <= q && self.tokens[p - len] == self.tokens[q - len] {
                             len += 1;
                         }
-                        best = IndCand { tok: self.tokens[q + 1], len: len as u16, count };
+                        best = IndCand { tok: self.tokens[q + 1], len: len as u16, count, dist: (p - q) as u32 };
                         break;
                     }
                 }
@@ -161,6 +164,9 @@ pub struct StreamMemory {
     pub mem: ContextMemory,
     history: Vec<u32>,
     pub induction: Induction,
+    /// Without the memory: induction over the last 243 tokens only, as the
+    /// engine's ring.
+    local: Induction,
 }
 
 impl StreamMemory {
@@ -174,6 +180,7 @@ impl StreamMemory {
             mem: ContextMemory::new(cfg).expect("valid memory config"),
             history: Vec::new(),
             induction: Induction::new(max_tokens),
+            local: Induction::new(243),
         }
     }
 
@@ -301,7 +308,14 @@ impl Runner {
                 .concat();
             (MemBatch::from_rows(&per, dim, device)?.with_induction(ind), known, n_rows)
         } else {
-            (MemBatch::empty(b, nb, dim, device)?, 0, 0)
+            let ind: Vec<IndCand> = self
+                .memories
+                .par_iter_mut()
+                .enumerate()
+                .map(|(bi, m)| m.local.window(&x[bi * t..(bi + 1) * t]))
+                .collect::<Vec<_>>()
+                .concat();
+            (MemBatch::empty(b, nb, dim, device)?.with_induction(ind), 0, 0)
         };
         let h = self.model.head(&trunk, &mem)?;
         let out = WindowOut {
@@ -501,10 +515,28 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             }
         }
         println!("warm start from {}: {n}/{} tensors", init.display(), data.len());
+        // Steps the old checkpoint lacks start at the optimum for its weights.
+        for (name, q) in model.qtensors() {
+            let step = format!("{name}_step");
+            if !old.contains_key(&step) {
+                if let Some(var) = data.get(&step) {
+                    var.set(&q.optimal_theta()?)?;
+                }
+            }
+        }
     }
     let vars = varmap.all_vars();
     println!("parameters: {}", Model::n_params(&vars));
-    let mut opt = AdamW::new(vars.clone(), ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
+    // Quantization steps θ move 27× slower: Adam normalizes their gradient,
+    // and a crossing of a rounding boundary rescales a whole row.
+    let (steps, weights): (Vec<_>, Vec<_>) = {
+        let data = varmap.data().lock().expect("varmap lock");
+        data.iter().map(|(n, v)| (n.ends_with("_step"), v.clone())).partition(|(is_step, _)| *is_step)
+    };
+    let steps: Vec<candle_core::Var> = steps.into_iter().map(|(_, v)| v).collect();
+    let weights: Vec<candle_core::Var> = weights.into_iter().map(|(_, v)| v).collect();
+    let mut opt = AdamW::new(weights, ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
+    let mut opt_steps = AdamW::new(steps, ParamsAdamW { lr: cfg.lr / 27.0, weight_decay: 0.0, ..Default::default() })?;
 
     let (b, t) = (cfg.batch, cfg.window);
     // Two-trit K/V, exactly as inference stores them.
@@ -529,12 +561,14 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     let clock = Instant::now();
     let (mut sum_loss, mut sum_known, mut sum_blocks, mut n_steps, mut n_logged) =
         (0f64, 0usize, 0usize, 0usize, 0usize);
-    // Mean loss per token kind: plain text, episode answers, re-read spans.
-    let mut by_kind = [(0f64, 0usize); 3];
+    // Mean loss per token kind: plain text, fact answers, re-read spans, templates.
+    let mut by_kind = [(0f64, 0usize); 4];
     let mut timing = [0f64; 4];
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("log.tsv"))?;
     for step in start_step..cfg.steps {
-        opt.set_learning_rate(lr_at(cfg, step, clock.elapsed().as_secs_f64()));
+        let lr = lr_at(cfg, step, clock.elapsed().as_secs_f64());
+        opt.set_learning_rate(lr);
+        opt_steps.set_learning_rate(lr / 27.0);
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
         let mut kinds = Vec::with_capacity(b * t);
@@ -550,7 +584,8 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         // Auxiliary pointer loss where the answer is in the context (episode
         // answers, re-read spans): teaches the pointer to find the row
         // instead of leaning on the vocabulary.
-        let mask: Vec<f32> = kinds.iter().map(|&k| f32::from(k != crate::data::PLAIN)).collect();
+        let mask: Vec<f32> =
+            kinds.iter().map(|&k| f32::from(k == crate::data::ANSWER || k == crate::data::REREAD)).collect();
         let mask = Tensor::from_vec(mask, kinds.len(), &device)?;
         let aux = ((pointer * mask)?.sum_all()? * (cfg.aux / kinds.len() as f64))?;
         let loss = (losses.mean_all()? + aux)?;
@@ -566,6 +601,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             continue;
         }
         opt.step(&grads)?;
+        opt_steps.step(&grads)?;
         let t3 = Instant::now();
         runner.commit(&x, t, &out, next)?;
         for (acc, d) in timing.iter_mut().zip([t1 - t0, t2 - t1, t3 - t2, t3.elapsed()]) {
@@ -586,12 +622,13 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         if (step + 1) % cfg.log_every == 0 {
             let el = clock.elapsed().as_secs_f64();
             let line = format!(
-                "{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{:.0}\t{:.2e}\tfwd {:.1}s bwd {:.1}s opt {:.1}s mem {:.1}s",
+                "{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.3}\t{:.0}\t{:.2e}\tfwd {:.1}s bwd {:.1}s opt {:.1}s mem {:.1}s",
                 step + 1,
                 sum_loss / n_logged as f64,
                 by_kind[0].0 / by_kind[0].1.max(1) as f64,
                 if by_kind[1].1 > 0 { by_kind[1].0 / by_kind[1].1 as f64 } else { f64::NAN },
                 if by_kind[2].1 > 0 { by_kind[2].0 / by_kind[2].1 as f64 } else { f64::NAN },
+                if by_kind[3].1 > 0 { by_kind[3].0 / by_kind[3].1 as f64 } else { f64::NAN },
                 sum_known as f64 / sum_blocks.max(1) as f64,
                 (n_steps * b * t) as f64 / el,
                 lr_at(cfg, step, clock.elapsed().as_secs_f64()),
@@ -604,7 +641,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             use std::io::Write as _;
             writeln!(log, "{line}")?;
             (sum_loss, sum_known, sum_blocks, n_logged) = (0.0, 0, 0, 0);
-            by_kind = [(0.0, 0); 3];
+            by_kind = [(0.0, 0); 4];
             timing = [0.0; 4];
         }
         if (step + 1) % (cfg.log_every * 9) == 0 {
@@ -651,11 +688,11 @@ mod induction_tests {
         let mut ind = Induction::new(1000);
         // 1 2 3 4 5 | 9 9 | 2 3 4 → after "2 3 4" the continuation is 5.
         let out = ind.window(&[1, 2, 3, 4, 5, 9, 9, 2, 3, 4]);
-        assert_eq!(out[9], IndCand { tok: 5, len: 3, count: 1 });
+        assert_eq!(out[9], IndCand { tok: 5, len: 3, count: 1, dist: 6 });
         assert!(out[..9].iter().all(|c| c.len == 0));
         // Across windows, and preferring the longer suffix.
         let out = ind.window(&[7, 1, 2, 3, 4]);
-        assert_eq!(out[4], IndCand { tok: 5, len: 4, count: 1 });
+        assert_eq!(out[4], IndCand { tok: 5, len: 4, count: 1, dist: 11 });
     }
 
     #[test]
@@ -666,7 +703,7 @@ mod induction_tests {
         x.extend(1..=12);
         let out = ind.window(&x);
         // Matched by the 8-token hash, then extended to all 12 tokens.
-        assert_eq!(out[24], IndCand { tok: 99, len: 12, count: 1 });
+        assert_eq!(out[24], IndCand { tok: 99, len: 12, count: 1, dist: 13 });
         // A suffix seen twice before counts two occurrences.
         let out = ind.window(&[50, 10, 11, 12]);
         assert_eq!(out[3].count, 2);
@@ -674,10 +711,10 @@ mod induction_tests {
 
     #[test]
     fn induction_keeps_working_after_trimming() {
-        let mut ind = Induction::new(8);
+        let mut ind = Induction::new(12);
         ind.window(&[1, 2, 3, 4, 5, 6, 7, 8]);
         ind.window(&[10, 11, 12, 13, 14, 15, 16, 17]);
         let out = ind.window(&[11, 12, 13]);
-        assert_eq!(out[2], IndCand { tok: 14, len: 3, count: 1 });
+        assert_eq!(out[2], IndCand { tok: 14, len: 3, count: 1, dist: 7 });
     }
 }

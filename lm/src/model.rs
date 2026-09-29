@@ -106,10 +106,22 @@ pub struct IndCand {
     pub tok: u32,
     pub len: u16,
     pub count: u32,
+    /// Tokens from the current position back to the occurrence's end.
+    pub dist: u32,
 }
 
 impl IndCand {
-    pub const NONE: Self = Self { tok: u32::MAX, len: 0, count: 0 };
+    pub const NONE: Self = Self { tok: u32::MAX, len: 0, count: 0, dist: 0 };
+
+    /// Distance trit: inside the local window (≤ 242), within 3^9 tokens,
+    /// farther.
+    pub fn dist_trit(&self) -> u32 {
+        match self.dist {
+            0..=242 => 0,
+            243..=19_683 => 1,
+            _ => 2,
+        }
+    }
 
     /// Length bin: 0 none, then 3, 4, 5–6, 7–8, 9–13, 14–26, 27+.
     pub fn len_bin(&self) -> u32 {
@@ -242,10 +254,11 @@ pub struct Model {
     gate_w: Tensor,
     gate_b: Tensor,
     gate_verdict: Tensor,
-    /// Induction logit: `ind_len[bin] + ind_count[trit] + ind_verdict[v] +
+    /// Induction logit: `ind_len[bin] + ind_count[trit] + ind_dist[trit] + ind_verdict[v] +
     /// xn·ind_w + ind_p[0]·log p_vocab(candidate) + ind_p[1]·max log p_vocab`.
     ind_len: Tensor,
     ind_count: Tensor,
+    ind_dist: Tensor,
     ind_verdict: Tensor,
     ind_w: Tensor,
     ind_p: Tensor,
@@ -307,6 +320,7 @@ impl Model {
             gate_verdict: zeros(3, "gate_verdict")?,
             ind_len: zeros(LEN_BINS, "ind_len")?,
             ind_count: zeros(3, "ind_count")?,
+            ind_dist: zeros(3, "ind_dist")?,
             ind_verdict: zeros(3, "ind_verdict")?,
             ind_w: zeros(d, "ind_w")?,
             ind_p: zeros(2, "ind_p")?,
@@ -436,6 +450,7 @@ impl Model {
             |f: &dyn Fn(&IndCand) -> u32| Tensor::from_vec(cands.iter().map(f).collect::<Vec<u32>>(), b * t, device);
         let len = self.ind_len.index_select(&u(&|c| c.len_bin())?, 0)?;
         let count = self.ind_count.index_select(&u(&|c| c.count_trit())?, 0)?;
+        let dist = self.ind_dist.index_select(&u(&|c| c.dist_trit())?, 0)?;
         let none = u(&|c| u32::from(c.len == 0))?.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
         let verdict = per_block(&self.ind_verdict.index_select(verdict_ids, 0)?, b, nb, blk)?.flatten_all()?;
         // How probable the vocabulary finds the candidate, and its own best
@@ -449,7 +464,7 @@ impl Model {
         let p1 = self.ind_p.narrow(0, 1, 1)?;
         let feats = (lp_tok.broadcast_mul(&p0)? + lp_max.broadcast_mul(&p1)?)?;
         let state = tr.xn.broadcast_mul(&self.ind_w)?.sum(D::Minus1)?.flatten_all()?;
-        let logit = ((((((len + count)? + verdict)? + state)? + feats)?) + none)?;
+        let logit = (((((((len + count)? + dist)? + verdict)? + state)? + feats)?) + none)?;
         logit.reshape((b, t))
     }
 

@@ -159,8 +159,8 @@ pub struct Episodes {
     ask_name: (Vec<u32>, Vec<Vec<u32>>),
     ask_town: (Vec<u32>, Vec<Vec<u32>>),
     ask_friend: (Vec<u32>, Vec<Vec<u32>>),
-    /// Per pet: the statement (` Мою кошку зовут`), its opening, questions.
-    pets: Vec<(Vec<u32>, Vec<u32>, Vec<Vec<u32>>)>,
+    /// Per pet: the statement line's opening (`\nМою кошку зовут`), questions.
+    pets: Vec<(Vec<u32>, Vec<Vec<u32>>)>,
     who: (Vec<u32>, Vec<u32>),
     my_friend: Vec<u32>,
     dont_know: Vec<u32>,
@@ -236,7 +236,15 @@ impl Episodes {
     pub fn new(tok: &crate::tokenizer::Tokenizer) -> Self {
         let e = |t: &str| tok.encode(t);
         let many = |ts: &[&str]| ts.iter().map(|t| tok.encode(t)).collect::<Vec<_>>();
-        let keys: Vec<Vec<u32>> = KEY_WORDS.iter().map(|w| e(&format!(" {w}"))).collect();
+        let mut keys: Vec<Vec<u32>> = KEY_WORDS.iter().map(|w| e(&format!(" {w}"))).collect();
+        // Plus 2187 invented words, so a secret cannot be guessed from a
+        // small set of familiar answers.
+        let mut krng = snn_memory::rng::SplitMix64::new(0x51ab);
+        keys.extend((0..2187).map(|_| {
+            let n = 2 + krng.below(2) as usize;
+            let w: String = (0..n).map(|_| SYLLABLES[krng.below(SYLLABLES.len() as u64) as usize]).collect();
+            e(&format!(" {w}"))
+        }));
         // 19 683 invented names of 2–4 syllables: a fresh name is almost
         // never one the stream has already met.
         let mut rng = snn_memory::rng::SplitMix64::new(0x9e37);
@@ -257,7 +265,6 @@ impl Episodes {
         .iter()
         .map(|(acc, acc_lower, gen)| {
             (
-                e(&format!(" {acc} зовут")),
                 e(&format!("\n{acc} зовут")),
                 many(&[
                     &format!("\nКак зовут {acc_lower}? —"),
@@ -275,8 +282,8 @@ impl Episodes {
             questions,
             names,
             me: e("\nМеня зовут"),
-            town: e(". Я живу в городе"),
-            friend: e(". Моего друга зовут"),
+            town: e("\nЯ живу в городе"),
+            friend: e("\nМоего друга зовут"),
             ask_name: (
                 e("\nМеня зовут"),
                 many(&["\nКак меня зовут? —", "\nНапомни, как меня зовут? —", "\nМоё имя? —"]),
@@ -296,6 +303,12 @@ impl Episodes {
             end: e(".\n"),
             tok_end: e("."),
         }
+    }
+
+    /// Whether an answer is a template (" мой друг." / " не знаю."), not a
+    /// fact that can be found in the context.
+    pub fn is_template(&self, answer: &[u32]) -> bool {
+        answer == self.my_friend.as_slice() || answer == self.dont_know.as_slice()
     }
 
     /// Tokens of the ".\n" that ends every statement and answer.
@@ -330,10 +343,13 @@ impl Episodes {
             (pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng));
         let has_friend = rng.below(2) == 0;
         let pet = &self.pets[rng.below(self.pets.len() as u64) as usize];
-        // "Меня зовут N. Я живу в городе T. Мою кошку зовут P[. Моего друга зовут F]."
-        let mut intro = [&self.me[..], &name, &self.town, &town, &self.tok_end, &pet.0, &pet_name].concat();
+        // One fact per line, so asking "with the same words" repeats the
+        // line's opening token for token:
+        // "Меня зовут N.\nЯ живу в городе T.\nМою кошку зовут P.[\nМоего друга зовут F.]"
+        let mut intro =
+            [&self.me[..], &name, &self.tok_end, &self.town, &town, &self.tok_end, &pet.0, &pet_name].concat();
         if has_friend {
-            intro.extend([&self.friend[..], &friend].concat());
+            intro.extend([&self.tok_end[..], &self.friend, &friend].concat());
         }
         intro.extend(&self.end);
         let ask = |(own, paraphrases): &(Vec<u32>, Vec<Vec<u32>>), rng: &mut snn_memory::rng::SplitMix64| {
@@ -347,7 +363,7 @@ impl Episodes {
         match rng.below(5) {
             0 => (intro, ask(&self.ask_name, rng), answer(&name)),
             1 => (intro, ask(&self.ask_town, rng), answer(&town)),
-            2 => (intro, ask(&(pet.1.clone(), pet.2.clone()), rng), answer(&pet_name)),
+            2 => (intro, ask(pet, rng), answer(&pet_name)),
             3 if has_friend => (intro, ask(&self.ask_friend, rng), answer(&friend)),
             _ => {
                 // Who is N? The friend, or a name never stated.
@@ -362,11 +378,13 @@ impl Episodes {
     }
 }
 
-/// Token kinds of a stream: plain text, an episode's answer, a re-read
-/// (copyable) span.
+/// Token kinds of a stream: plain text, an episode's answer that is in the
+/// context, a re-read (copyable) span, and a template answer (" не знаю.",
+/// " мой друг.") that must be decided, not copied.
 pub const PLAIN: u8 = 0;
 pub const ANSWER: u8 = 1;
 pub const REREAD: u8 = 2;
+pub const TEMPLATE: u8 = 3;
 
 /// A token stream over a region of the corpus with recall episodes.
 pub struct TaskStream {
@@ -445,7 +463,8 @@ impl TaskStream {
         if let Some(i) = self.questions.iter().position(|q| q.0 == 0) {
             let (_, q, a) = self.questions.swap_remove(i);
             self.pending.extend(q.iter().map(|&t| (t, PLAIN)));
-            self.pending.extend(a.iter().map(|&t| (t, ANSWER)));
+            let kind = if ep.is_template(&a) { TEMPLATE } else { ANSWER };
+            self.pending.extend(a.iter().map(|&t| (t, kind)));
             return self.pending.pop_front().expect("question is not empty");
         }
         if self.p_episode > 0.0 && self.rng.next_f64() < self.p_episode {
