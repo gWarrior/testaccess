@@ -9,9 +9,13 @@
 //! | `F32`     | 32             | 2.46 GB                     |
 //! | `F16`     | 16             | 1.23 GB                     |
 //! | `Ternary` | 1.6 (+ scale)  | 0.13 GB                     |
+//! | `Trit2`   | 3.2 (+ exp)    | 0.25 GB                     |
 //!
 //! `Ternary` uses absmean quantization (as in BitNet b1.58): each row is
 //! stored as trits `round(clamp(x / mean|x|, -1, 1))` plus one `f32` scale.
+//! `Trit2` stores two balanced trits per element (levels −4…4) and one
+//! power-of-two step per row. A row that already lies on such a grid (a
+//! model's two-trit keys) is stored exactly.
 
 use crate::trit::TritVec;
 
@@ -22,6 +26,24 @@ pub enum KvPrecision {
     #[default]
     F16,
     Ternary,
+    Trit2,
+}
+
+/// Power-of-two step exponent for a [`KvPrecision::Trit2`] row: the finest
+/// step that keeps every element within ±4 if the row lies on that grid
+/// (exact), else the MSE-optimal step `2^round(log2(0.669·mean|x|))`.
+pub fn trit2_exponent(row: &[f32]) -> i32 {
+    let max = row.iter().fold(0f32, |m, x| m.max(x.abs()));
+    if max == 0.0 || !max.is_finite() {
+        return 0;
+    }
+    let e = (max as f64 / 4.0).log2().ceil() as i32;
+    let step = 2f64.powi(e);
+    if row.iter().all(|&x| ((x as f64) / step).fract() == 0.0) {
+        return e;
+    }
+    let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len() as f64;
+    (mean * 0.669).max(1e-30).log2().round() as i32
 }
 
 /// IEEE 754 binary16 from `f32`, round to nearest even.
@@ -79,7 +101,15 @@ pub fn f16_to_f32(h: u16) -> f32 {
 enum Rows {
     F32(Vec<f32>),
     F16(Vec<u16>),
-    Ternary { trits: TritVec, scales: Vec<f32> },
+    Ternary {
+        trits: TritVec,
+        scales: Vec<f32>,
+    },
+    /// Two trits per element (`L = 3·t₁ + t₀`), a step exponent per row.
+    Trit2 {
+        trits: TritVec,
+        exps: Vec<i8>,
+    },
 }
 
 /// Append-only matrix of `dim`-wide rows with front eviction.
@@ -95,6 +125,7 @@ impl RowStore {
             KvPrecision::F32 => Rows::F32(Vec::new()),
             KvPrecision::F16 => Rows::F16(Vec::new()),
             KvPrecision::Ternary => Rows::Ternary { trits: TritVec::new(), scales: Vec::new() },
+            KvPrecision::Trit2 => Rows::Trit2 { trits: TritVec::new(), exps: Vec::new() },
         };
         Self { dim, rows, len: 0 }
     }
@@ -117,6 +148,19 @@ impl RowStore {
                 }
                 scales.push(scale);
             }
+            Rows::Trit2 { trits, exps } => {
+                let e = trit2_exponent(row).clamp(-127, 127);
+                let step = 2f32.powi(e);
+                let start = trits.len();
+                trits.extend_zeros(2 * self.dim);
+                for (i, &x) in row.iter().enumerate() {
+                    let l = (x / step).round().clamp(-4.0, 4.0) as i32;
+                    let t0 = (l + 1).rem_euclid(3) - 1;
+                    trits.set(start + 2 * i, t0 as i8);
+                    trits.set(start + 2 * i + 1, ((l - t0) / 3) as i8);
+                }
+                exps.push(e as i8);
+            }
         }
         self.len += 1;
     }
@@ -129,6 +173,13 @@ impl RowStore {
             Rows::Ternary { trits, scales } => {
                 let scale = scales[r];
                 out.iter_mut().enumerate().for_each(|(i, o)| *o = trits.get(s + i) as f32 * scale);
+            }
+            Rows::Trit2 { trits, exps } => {
+                let step = 2f32.powi(exps[r] as i32);
+                let b = 2 * s;
+                out.iter_mut().enumerate().for_each(|(i, o)| {
+                    *o = (3 * trits.get(b + 2 * i + 1) + trits.get(b + 2 * i)) as f32 * step;
+                });
             }
         }
     }
@@ -143,6 +194,10 @@ impl RowStore {
                 *trits = trits.slice(cut, trits.len());
                 scales.drain(..n);
             }
+            Rows::Trit2 { trits, exps } => {
+                *trits = trits.slice(2 * cut, trits.len());
+                exps.drain(..n);
+            }
         }
         self.len -= n;
     }
@@ -156,6 +211,7 @@ impl RowStore {
             Rows::F32(v) => v.capacity() * 4,
             Rows::F16(v) => v.capacity() * 2,
             Rows::Ternary { trits, scales } => trits.bytes() + scales.capacity() * 4,
+            Rows::Trit2 { trits, exps } => trits.bytes() + exps.capacity(),
         }
     }
 }
@@ -276,5 +332,29 @@ mod tests {
         // Ternary absmean keeps the direction of Gaussian rows well enough
         // for attention scoring.
         assert!(roundtrip(KvPrecision::Ternary) > 0.8);
+        assert!(roundtrip(KvPrecision::Trit2) > 0.98);
+    }
+
+    #[test]
+    fn trit2_stores_two_trit_rows_exactly() {
+        let mut rng = SplitMix64::new(3);
+        let mut kv = KvStore::new(81, 81, KvPrecision::Trit2);
+        let mut rows = Vec::new();
+        for e in [-9i32, -3, 0, 4] {
+            let step = 2f32.powi(e);
+            let row: Vec<f32> = (0..81).map(|_| (rng.below(9) as i32 - 4) as f32 * step).collect();
+            kv.push(&row, &row);
+            rows.push(row);
+        }
+        // Rows using only small levels are exact too.
+        let small: Vec<f32> = (0..81).map(|i| [-1.0f32, 0.0, 1.0][i % 3] * 0.25).collect();
+        kv.push(&small, &small);
+        rows.push(small);
+        let (mut k, mut v) = (vec![0.0; 81], vec![0.0; 81]);
+        for (p, row) in rows.iter().enumerate() {
+            assert!(kv.read(p as u64, &mut k, &mut v));
+            assert_eq!(&k, row);
+            assert_eq!(&v, row);
+        }
     }
 }
