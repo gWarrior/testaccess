@@ -1,0 +1,7 @@
+episodes: Who
+memory on  distance     243: exact 4/9  first token 4/9  answer loss 0.788  key found 1/9  weights vocab 0.60 window 0.05 rows 0.01 induction 0.34
+    "мой друг" 4/4, "не знаю" 0/5
+memory on  distance    2187: exact 4/9  first token 4/9  answer loss 0.937  key found 1/9  weights vocab 0.64 window 0.02 rows 0.01 induction 0.33
+    "мой друг" 4/4, "не знаю" 0/5
+memory on  distance   19683: exact 5/9  first token 5/9  answer loss 0.832  key found 1/9  weights vocab 0.59 window 0.04 rows 0.01 induction 0.36
+    "мой друг" 5/5, "не знаю" 0/4
