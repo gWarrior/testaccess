@@ -827,17 +827,26 @@ impl Decoding {
         let penalized: Vec<(u32, f32)> = seen.iter().map(|&t| (t, self.presence)).collect();
         let mut p = parts.probs(self.temperature, self.top_p, &penalized);
         // No 4-gram twice in a reply.
+        let mut banned = Vec::new();
         if reply.len() >= 3 {
             let tail = &reply[reply.len() - 3..];
             for w in reply.windows(4) {
                 if &w[..3] == tail {
                     p[w[3] as usize] = 0.0;
+                    banned.push(w[3]);
                 }
             }
         }
         let total: f32 = p.iter().sum();
         if total <= 0.0 {
-            return parts.logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
+            // Everything allowed was cut: the most likely token not banned.
+            return parts
+                .logits
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !banned.contains(&(*i as u32)))
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i as u32);
         }
         let mut u = rng.next_f64() as f32 * total;
         for (i, &v) in p.iter().enumerate() {
