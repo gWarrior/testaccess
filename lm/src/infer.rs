@@ -37,6 +37,9 @@ pub struct ShiftLinear {
     idx: Vec<u16>,
     steps: Vec<f32>,
     levels: Vec<i8>,
+    /// Levels as i16 rows padded to 32 columns, for the VNNI kernel.
+    #[cfg(feature = "vnni")]
+    w16: Vec<i16>,
 }
 
 impl ShiftLinear {
@@ -54,7 +57,28 @@ impl ShiftLinear {
             }
         }
         let steps = exps.iter().map(|&e| 2f32.powi(e as i32)).collect();
-        Self { rows, cols, top, offs, idx, steps, levels: levels.to_vec() }
+        #[cfg(feature = "vnni")]
+        let w16 = {
+            let pc = vnni::padded(cols);
+            let mut w = vec![0i16; rows * pc];
+            for r in 0..rows {
+                for c in 0..cols {
+                    w[r * pc + c] = levels[r * cols + c] as i16;
+                }
+            }
+            w
+        };
+        Self {
+            rows,
+            cols,
+            top,
+            offs,
+            idx,
+            steps,
+            levels: levels.to_vec(),
+            #[cfg(feature = "vnni")]
+            w16,
+        }
     }
 
     /// `step · Σₖ k·(Σx[+k] − Σx[−k])`: additions per level, then small
@@ -73,6 +97,15 @@ impl ShiftLinear {
 
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
         debug_assert_eq!(x.len(), self.cols);
+        #[cfg(feature = "vnni")]
+        if vnni::available() {
+            return self.apply_vnni(x);
+        }
+        self.apply_shift_add(x)
+    }
+
+    /// The portable kernel: additions per level (see [`row`](Self::row)).
+    pub fn apply_shift_add(&self, x: &[f32]) -> Vec<f32> {
         if self.rows >= 2187 {
             (0..self.rows).into_par_iter().map(|r| self.row(r, x)).collect()
         } else {
@@ -80,9 +113,101 @@ impl ShiftLinear {
         }
     }
 
+    /// AVX-512 VNNI kernel: `x` is split into two i16 vectors, the high
+    /// part `round(x/s)` and the remainder in units of `s/32768` (together
+    /// ~30 bits, as exact as f32 for these sums); each row is two integer
+    /// dot products with the i16 levels (`vpdpwssd`), scaled by the row's
+    /// power-of-two step. The sums cannot overflow i32: 32767 · 13 · cols
+    /// < 2³¹ for cols ≤ 5000.
+    #[cfg(feature = "vnni")]
+    pub fn apply_vnni(&self, x: &[f32]) -> Vec<f32> {
+        let pc = vnni::padded(self.cols);
+        let (hi, lo, scale) = vnni::quantize(x, pc);
+        let row = |r: usize| {
+            let w = &self.w16[r * pc..(r + 1) * pc];
+            // SAFETY: `vnni::available()` checked the CPU features; the
+            // slices hold `pc` elements, a multiple of 32.
+            let (dh, dl) = unsafe { (vnni::dot(&hi, w), vnni::dot(&lo, w)) };
+            ((dh as f64 + dl as f64 / 32768.0) * scale as f64) as f32 * self.steps[r]
+        };
+        if self.rows >= 2187 {
+            (0..self.rows).into_par_iter().map(row).collect()
+        } else {
+            (0..self.rows).map(row).collect()
+        }
+    }
+
     /// Dequantized row (embedding lookup).
     pub fn dense_row(&self, r: usize) -> Vec<f32> {
         self.levels[r * self.cols..(r + 1) * self.cols].iter().map(|&l| l as f32 * self.steps[r]).collect()
+    }
+}
+
+/// Integer kernels on AVX-512 VNNI (cargo feature `vnni`; checked at run
+/// time, the shift-add kernel is used on other CPUs).
+#[cfg(feature = "vnni")]
+pub mod vnni {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    /// Whether this CPU has AVX-512 VNNI (and BW for the loads).
+    pub fn available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *OK.get_or_init(|| {
+                is_x86_feature_detected!("avx512f")
+                    && is_x86_feature_detected!("avx512bw")
+                    && is_x86_feature_detected!("avx512vnni")
+            })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+
+    /// Columns rounded up to a whole 512-bit register of i16.
+    pub fn padded(cols: usize) -> usize {
+        cols.div_ceil(32) * 32
+    }
+
+    /// `x ≈ s·(hi + lo/32768)` with i16 `hi`, `lo` (padded with zeros to
+    /// `pc`) and the scale `s`.
+    pub fn quantize(x: &[f32], pc: usize) -> (Vec<i16>, Vec<i16>, f32) {
+        let max = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let (mut hi, mut lo) = (vec![0i16; pc], vec![0i16; pc]);
+        if max == 0.0 || !max.is_finite() {
+            return (hi, lo, 0.0);
+        }
+        let inv = 32767.0 / max as f64;
+        for ((h, l), &v) in hi.iter_mut().zip(lo.iter_mut()).zip(x) {
+            let u = v as f64 * inv;
+            let r = u.round();
+            *h = r as i16;
+            *l = ((u - r) * 32768.0).round().clamp(-32767.0, 32767.0) as i16;
+        }
+        (hi, lo, max / 32767.0)
+    }
+
+    /// `Σ x·w` over i16 vectors whose length is a multiple of 32.
+    ///
+    /// # Safety
+    /// The CPU must support AVX-512 F, BW and VNNI ([`available`]).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    pub unsafe fn dot(x: &[i16], w: &[i16]) -> i32 {
+        debug_assert!(x.len() == w.len() && x.len() % 32 == 0);
+        let mut acc = _mm512_setzero_si512();
+        for i in (0..x.len()).step_by(32) {
+            let a = _mm512_loadu_si512(x.as_ptr().add(i) as *const _);
+            let b = _mm512_loadu_si512(w.as_ptr().add(i) as *const _);
+            acc = _mm512_dpwssd_epi32(acc, a, b);
+        }
+        _mm512_reduce_add_epi32(acc)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn dot(_: &[i16], _: &[i16]) -> i32 {
+        unreachable!("VNNI is x86-64 only")
     }
 }
 
@@ -761,6 +886,26 @@ mod tests {
     use crate::model::{MemBatch, Model};
     use candle_core::{DType, Device, Tensor};
     use candle_nn::{VarBuilder, VarMap};
+
+    #[cfg(feature = "vnni")]
+    #[test]
+    fn vnni_kernel_matches_shift_add() {
+        if !vnni::available() {
+            eprintln!("no AVX-512 VNNI on this CPU: skipped");
+            return;
+        }
+        let mut rng = snn_memory::rng::SplitMix64::new(3);
+        for (rows, cols, top) in [(81, 256, 4i8), (256, 1458, 4), (6561, 256, 13), (7, 33, 4)] {
+            let levels: Vec<i8> = (0..rows * cols).map(|_| rng.below(2 * top as u64 + 1) as i8 - top).collect();
+            let exps: Vec<i8> = (0..rows).map(|_| rng.below(5) as i8 - 7).collect();
+            let m = ShiftLinear::new(rows, cols, &levels, &exps);
+            let x: Vec<f32> = (0..cols).map(|_| rng.next_f64() as f32 * 2.0 - 1.0).collect();
+            let (a, b) = (m.apply_shift_add(&x), m.apply_vnni(&x));
+            let scale = a.iter().fold(0f32, |s, v| s.max(v.abs()));
+            let err = a.iter().zip(&b).fold(0f32, |e, (p, q)| e.max((p - q).abs()));
+            assert!(err <= 1e-6 * scale.max(1e-6), "{rows}×{cols}: err {err} of {scale}");
+        }
+    }
 
     #[test]
     fn decoding_tempers_only_the_vocabulary_and_bans_repeated_4grams() {

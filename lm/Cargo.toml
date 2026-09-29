@@ -5,6 +5,11 @@ edition = "2021"
 description = "Ternary HadamRNN language model with SNN long-context memory"
 license = "MIT OR Apache-2.0"
 
+[features]
+# AVX-512 VNNI integer kernel for the ternary matrices of the inference
+# engine (checked at run time; other CPUs keep the shift-add kernel).
+vnni = []
+
 [dependencies]
 snn-memory = { path = ".." }
 candle-core = "0.9"
