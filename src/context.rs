@@ -932,11 +932,20 @@ impl ContextMemory {
         // which alone would take the rows of the next places).
         let spans: Vec<&RetrievedSpan> = r.spans.iter().filter(|s| s.in_window).collect();
         let cap = if spans.len() > 1 { self.cfg.chunk_size as u64 } else { u64::MAX };
-        for span in spans {
-            let len = span.end() - span.start;
-            let from = span.start + len.saturating_sub(cap) / 2;
-            for pos in from..(from + cap.min(len)) {
-                push(&mut rows, pos, if span.lexical { 0 } else { 1 });
+        // Lexical places come first by confidence but leave a chunk of rows
+        // to the semantic ones, which would otherwise never make the limit.
+        let semantic = spans.iter().any(|s| !s.lexical);
+        let lexical_limit = if semantic { limit.saturating_sub(self.cfg.chunk_size) } else { limit };
+        for pass in [true, false] {
+            for span in spans.iter().filter(|s| s.lexical == pass) {
+                let len = span.end() - span.start;
+                let from = span.start + len.saturating_sub(cap) / 2;
+                for pos in from..(from + cap.min(len)) {
+                    if pass && rows.positions.len() >= lexical_limit {
+                        break;
+                    }
+                    push(&mut rows, pos, if span.lexical { 0 } else { 1 });
+                }
             }
         }
         rows.confidence = r.spans.iter().map(|s| s.confidence).fold(0.0, f32::max);
