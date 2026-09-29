@@ -103,7 +103,8 @@ impl Default for TrainConfig {
             p_episode: 1.0 / 729.0,
             aux: 1.0,
             aux_fact: 3.0,
-            aux_sem: 0.1,
+            // Per answer (once), as heavy as one fact token's pointer loss.
+            aux_sem: 1.0,
             micro: 3,
             // Short runs (a few thousand steps): a 243-step horizon.
             ema: 1.0 - 1.0 / 243.0,
@@ -637,8 +638,8 @@ impl Runner {
     /// probe's tokens, with gradient — against the mean key of the 9-token
     /// unit of its statement (read from the memory, detached) and 26 other
     /// units: first those the semantic index brought for the block instead
-    /// (the confusable ones), then random units of the memory. All centered
-    /// by the memory's key center: `−ln softmax(cos / τ)`, τ = 1/9. Teaches
+    /// (the confusable ones), then random units of the memory. All centred
+    /// by the candidates' mean: `−ln softmax(cos / τ)`, τ = 1/9. Teaches
     /// the keys of a question line to resemble its statement's, so the
     /// semantic index can find a statement by a paraphrase. Returns the sum
     /// over answers, their count and how many ranked the statement first.
@@ -655,12 +656,15 @@ impl Runner {
         let (mut probes, mut cands) = (Vec::new(), Vec::<f32>::new());
         let (mut key, mut value) = (vec![0f32; dim], vec![0f32; dim]);
         for r in 0..b * t {
-            if kinds[r] != crate::data::ANSWER || src[r] == crate::data::NO_SRC {
+            // Once per answer: its first token (the later ones would count
+            // the same probe again).
+            let first = r % t == 0 || kinds[r - 1] != crate::data::ANSWER;
+            if kinds[r] != crate::data::ANSWER || src[r] == crate::data::NO_SRC || !first {
                 continue;
             }
             let (bi, ti) = (r / t, r % t);
             let mem = &self.memories[bi].mem;
-            let (Some(center), Some(kv)) = (mem.semantic_center(), mem.kv()) else { continue };
+            let Some(kv) = mem.kv() else { continue };
             // The block's read: the probe ends at the block's first token.
             let s0 = (ti / block) * block;
             let window = &x[bi * t + (s0 + 1).saturating_sub(crate::model::PROBE)..=bi * t + s0];
@@ -683,7 +687,7 @@ impl Runner {
                     }
                     m.iter_mut().zip(key.iter()).for_each(|(a, k)| *a += k / unit as f32);
                 }
-                Some(m.iter().zip(center).map(|(a, c)| a - c).collect())
+                Some(m)
             };
             let Some(pos) = mean_of(pos_unit, &mut key, &mut value) else { continue };
             let mut units = vec![pos_unit];
@@ -721,7 +725,7 @@ impl Runner {
             if units.len() < 27 {
                 continue;
             }
-            probes.push((bi, s0 + 1 - len, len, center.to_vec()));
+            probes.push((bi, s0 + 1 - len, len));
             cands.extend(rows);
         }
         if probes.is_empty() {
@@ -731,14 +735,16 @@ impl Runner {
         let dev = out.trunk.k.device();
         let p = probes
             .iter()
-            .map(|(bi, from, len, center)| {
-                let k = out.trunk.k.get(*bi)?.narrow(0, *from, *len)?.mean(0)?;
-                k - Tensor::from_vec(center.clone(), dim, dev)?
-            })
+            .map(|(bi, from, len)| out.trunk.k.get(*bi)?.narrow(0, *from, *len)?.mean(0))
             .collect::<Result<Vec<_>>>()?;
         let p = Tensor::stack(&p, 0)?; // (n, dim)
-        let p = p.broadcast_div(&(p.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-6)?)?;
         let c = Tensor::from_vec(cands, (n, 27, dim), dev)?;
+        // Centred by the candidates' own mean: what the keys share (a large
+        // common component that also drifts in training) says nothing.
+        let mu = c.mean_keepdim(1)?; // (n, 1, dim)
+        let c = c.broadcast_sub(&mu)?;
+        let p = (p - mu.squeeze(1)?)?;
+        let p = p.broadcast_div(&(p.sqr()?.sum_keepdim(1)?.sqrt()? + 1e-6)?)?;
         let c = c.broadcast_div(&(c.sqr()?.sum_keepdim(2)?.sqrt()? + 1e-6)?)?;
         // cos / τ with τ = 1/9; the statement is candidate 0.
         let logits = (c.matmul(&p.unsqueeze(2)?)?.squeeze(2)? * 9.0)?;
