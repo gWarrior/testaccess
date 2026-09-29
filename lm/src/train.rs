@@ -913,8 +913,14 @@ pub fn train(
     let n = (b * t) as f64;
     for step in start_step..cfg.steps {
         let lr = lr_at(cfg, step, elapsed());
-        for (o, (_, mult)) in opts.iter_mut().zip(OPT_GROUPS) {
+        for (o, (name, mult)) in opts.iter_mut().zip(OPT_GROUPS) {
             o.lr = lr * mult;
+            // The K/V step settles during warm-up and then stays: crossing a
+            // rounding boundary later would double every new key's step at
+            // once while the memory still holds keys on the old grid.
+            if name == "kv" && step >= cfg.warmup {
+                o.lr = 0.0;
+            }
         }
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
@@ -1009,6 +1015,16 @@ pub fn train(
         if !loss_value.is_finite() || !norm.is_finite() {
             // Never let a non-finite update into the weights.
             println!("step {}: skipped (loss {loss_value}, grad norm {norm})", step + 1);
+            // Still stop on time or a signal, with the state saved.
+            if stop.load(std::sync::atomic::Ordering::Relaxed)
+                || (cfg.time_limit > 0 && elapsed() >= cfg.time_limit as f64)
+            {
+                save_resume(&resume, &varmap, &ema, &opts, &runners, step + 1, elapsed())?;
+                varmap.save(&ckpt)?;
+                std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
+                println!("stopped at step {} after a skipped step; resume state saved", step + 1);
+                break;
+            }
             continue;
         }
         for o in &mut opts {
