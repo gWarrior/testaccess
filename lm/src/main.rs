@@ -382,6 +382,9 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             }
             _ => {}
         }
+        // Taiga has no question marks at all: a "?" was only ever seen in
+        // episodes, where it announced a template answer.
+        let line = &line.replace('?', "");
         let prompt = if dialog {
             format!("- {line}\n-")
         } else if line.ends_with(['.', '!', '?', '»', '…', '"']) {

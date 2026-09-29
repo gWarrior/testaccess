@@ -295,18 +295,18 @@ impl Episodes {
             (
                 e(&format!("\n{acc} зовут")),
                 many(&[
-                    &format!("\nКак зовут {acc_lower}? -"),
-                    &format!("\nКличка {gen}? -"),
-                    &format!("\nНапомни, как зовут {acc_lower}? -"),
+                    &format!("\nКак зовут {acc_lower} -"),
+                    &format!("\nКличка {gen} -"),
+                    &format!("\nНапомни, как зовут {acc_lower} -"),
                     // Held out: only the evaluation asks this way (another
                     // construction, not just another first word).
-                    &format!("\nИмя у {gen} какое? -"),
+                    &format!("\nИмя у {gen} какое -"),
                 ]),
             )
         })
         .collect();
         let intros = many(&["\nСекретное слово -", "\nЗапомни пароль:", "\nКод доступа:"]);
-        let questions = many(&["\nКакое было секретное слово? -", "\nКакой был пароль? -", "\nНапомни код доступа:"]);
+        let questions = many(&["\nКакое было секретное слово -", "\nКакой был пароль -", "\nНапомни код доступа:"]);
         Self {
             keys,
             intros,
@@ -317,28 +317,28 @@ impl Episodes {
             friend: e("\nМоего друга зовут"),
             ask_name: (
                 e("\nМеня зовут"),
-                many(&["\nКак меня зовут? -", "\nНапомни, как меня зовут? -", "\nМоё имя? -", "\nИмя у меня какое? -"]),
+                many(&["\nКак меня зовут -", "\nНапомни, как меня зовут -", "\nМоё имя -", "\nИмя у меня какое -"]),
             ),
             ask_town: (
                 e("\nЯ живу в городе"),
                 many(&[
-                    "\nВ каком городе я живу? -",
-                    "\nГде я живу? -",
-                    "\nНапомни, в каком городе я живу? -",
-                    "\nНазови мой город? -",
+                    "\nВ каком городе я живу -",
+                    "\nГде я живу -",
+                    "\nНапомни, в каком городе я живу -",
+                    "\nНазови мой город -",
                 ]),
             ),
             ask_friend: (
                 e("\nМоего друга зовут"),
                 many(&[
-                    "\nКак зовут моего друга? -",
-                    "\nИмя моего друга? -",
-                    "\nНапомни, как зовут моего друга? -",
-                    "\nДруг мой - кто он по имени? -",
+                    "\nКак зовут моего друга -",
+                    "\nИмя моего друга -",
+                    "\nНапомни, как зовут моего друга -",
+                    "\nДруг мой - кто он по имени -",
                 ]),
             ),
             pets,
-            who: (e("\nКто такой"), e("? -")),
+            who: (e("\nКто такой"), e(" -")),
             my_friend: e(" мой друг.\n"),
             dont_know: e(" не знаю.\n"),
             end: e(".\n"),
@@ -706,7 +706,7 @@ mod episode_tests {
             ans.extend_from_slice(&a[..81]);
         }
         let text = tok.decode(&all);
-        let asked = text.matches("?").count() + text.matches("Напомни").count();
+        let asked = text.matches(" -").count() + text.matches("Напомни").count();
         assert!(asked >= 2, "questions were asked: {text}");
         assert!(ans.iter().any(|&a| a == ANSWER), "answer tokens are flagged");
         // Some flagged answer repeats a token that appeared earlier (a fact;
