@@ -262,9 +262,12 @@ pub const PROBE: usize = 9;
 /// the space of the keys the memory stores (unlike the head's query),
 /// so the SNN memory's semantic index can compare them.
 pub fn probe_key(keys: &[f32], dim: usize, n: usize) -> Vec<f32> {
-    let rows = keys.len() / dim;
-    let n = n.min(rows).max(1);
+    let rows = keys.len() / dim.max(1);
     let mut mean = vec![0f32; dim];
+    if rows == 0 {
+        return mean;
+    }
+    let n = n.min(rows).max(1);
     for r in rows - n..rows {
         for (m, k) in mean.iter_mut().zip(&keys[r * dim..(r + 1) * dim]) {
             *m += k;
