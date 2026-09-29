@@ -966,6 +966,7 @@ mod tests {
     fn engine_matches_the_training_model_with_ternary_state() {
         engine_matches(1);
         engine_matches(2);
+        engine_matches(3);
     }
 
     #[test]
