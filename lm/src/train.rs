@@ -274,7 +274,10 @@ impl StreamMemory {
             mem: ContextMemory::new(Self::config(dim, max_tokens, precision)).expect("valid memory config"),
             history: Vec::new(),
             induction: Induction::new(max_tokens),
-            local: Induction::new(243),
+            // Two windows: every position of the current window can look
+            // LOCAL tokens back (a limit of one window dropped the previous
+            // window entirely, so the ablation saw only the current one).
+            local: Induction::new(2 * 243),
         }
     }
 
@@ -493,7 +496,13 @@ impl Runner {
                 .memories
                 .par_iter_mut()
                 .enumerate()
-                .map(|(bi, m)| m.local.window(&x[bi * t..(bi + 1) * t]))
+                .map(|(bi, m)| {
+                    // As the engine's ring: occurrences at most LOCAL tokens back
+                    // (the most recent one is the nearest, so none nearer is lost).
+                    let mut c = m.local.window(&x[bi * t..(bi + 1) * t]);
+                    c.iter_mut().filter(|c| c.dist as usize > crate::model::LOCAL).for_each(|c| *c = IndCand::NONE);
+                    c
+                })
                 .collect::<Vec<_>>()
                 .concat();
             (MemBatch::empty(b, nb, dim, device)?.with_induction(ind), 0, 0)
