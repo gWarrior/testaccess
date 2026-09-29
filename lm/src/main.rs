@@ -113,6 +113,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         val_every: arg(args, "--val-every", &d.val_every.to_string()).parse().expect("--val-every"),
         parallel: arg(args, "--parallel", &d.parallel.to_string()).parse().expect("--parallel"),
         beta2: arg(args, "--beta2", &d.beta2.to_string()).parse().expect("--beta2"),
+        auto_steps: arg(args, "--quant-steps", "auto") == "auto",
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");

@@ -66,6 +66,10 @@ pub struct TrainConfig {
     /// Adam's second-moment decay: 0.99 adapts within a short run (a few
     /// hundred steps), 0.999 averages over ~1000 steps.
     pub beta2: f64,
+    /// Row steps of the weights: `auto` sets each row's θ to the MSE optimum
+    /// of its current latents after every update (a power of two from
+    /// mean |w|, BitNet style); `learned` trains θ by LSQ at lr/27.
+    pub auto_steps: bool,
 }
 
 impl Default for TrainConfig {
@@ -99,6 +103,9 @@ impl Default for TrainConfig {
             val_every: 729,
             parallel: std::thread::available_parallelism().map_or(1, |n| n.get()),
             beta2: 0.99,
+            // A learned θ lagged behind latents that double over a run: a
+            // quarter of mlp.w2 / cell.wu weights ended up clipped (analyst 7).
+            auto_steps: true,
         }
     }
 }
@@ -779,6 +786,11 @@ pub fn train(
         }
     }
     let mut opt = AdamW::new(weights, cfg.lr)?;
+    // With automatic steps θ follows the latents (see `anchor_steps`).
+    if cfg.auto_steps {
+        steps.clear();
+        anchor_steps(&model, &varmap)?;
+    }
     let mut opt_steps = AdamW::new(steps, cfg.lr / 27.0)?;
     let mut opt_kv = AdamW::new(kv, cfg.lr / 3.0)?;
     for o in [&mut opt, &mut opt_steps, &mut opt_kv] {
@@ -954,6 +966,9 @@ pub fn train(
         opt.step(&grads)?;
         opt_steps.step(&grads)?;
         opt_kv.step(&grads)?;
+        if cfg.auto_steps {
+            anchor_steps(&model, &varmap)?;
+        }
         // Early on the average follows the weights (horizon grows with the step).
         let d = cfg.ema.min((1.0 + step as f64) / (10.0 + step as f64));
         for (_, v, e) in &mut ema {
@@ -1096,6 +1111,17 @@ pub fn train(
         if time_up {
             println!("time limit reached at step {}", step + 1);
             break;
+        }
+    }
+    Ok(())
+}
+
+/// Set every weight row's step to the MSE optimum of its latents.
+fn anchor_steps(model: &Model, varmap: &VarMap) -> Result<()> {
+    let data = varmap.data().lock().expect("varmap lock");
+    for (name, q) in model.qtensors() {
+        if let Some(var) = data.get(&format!("{name}_step")) {
+            var.set(&q.optimal_theta()?)?;
         }
     }
     Ok(())
