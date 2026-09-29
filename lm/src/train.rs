@@ -61,6 +61,8 @@ pub struct TrainConfig {
     /// Validation loss (memory on, 9 streams × 27 windows) of the weights
     /// and of their average every this many steps, into val.tsv (0 = off).
     pub val_every: usize,
+    /// Groups of `micro` streams computed at once (default: the CPU cores).
+    pub parallel: usize,
 }
 
 impl Default for TrainConfig {
@@ -91,6 +93,7 @@ impl Default for TrainConfig {
             micro: 3,
             ema: 1.0 - 1.0 / 729.0,
             val_every: 729,
+            parallel: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
 }
@@ -786,6 +789,9 @@ pub fn train(
     // graph of one group is freed before the next, so the peak memory of a
     // step is a third of the whole batch's.
     let micro = cfg.micro.clamp(1, b);
+    // Groups running at once (their graphs are alive together: peak memory
+    // grows with it).
+    let parallel = cfg.parallel.max(1);
     assert!(b % micro == 0, "batch {b} is not a multiple of micro {micro}");
     // Two-trit K/V, exactly as inference stores them.
     let mut runners = (0..b / micro)
@@ -859,7 +865,10 @@ pub fn train(
         let mut grads: Option<candle_core::backprop::GradStore> = None;
         let mut loss_value = 0f32;
         let mut lv = Vec::with_capacity(b * t);
-        for (gi, runner) in runners.iter_mut().enumerate() {
+        // One group: forward, losses, backward, commit. Groups are
+        // independent (own streams, memories, state), so `parallel` of them
+        // run at once; their gradients are summed in group order.
+        let run_group = |gi: usize, runner: &mut Runner| -> Result<GroupOut> {
             let r = gi * micro * t..(gi + 1) * micro * t;
             let (xs, ys, ks) = (&x[r.clone()], &y[r.clone()], &kinds[r]);
             let t0 = Instant::now();
@@ -875,6 +884,7 @@ pub fn train(
                 .zip(&findable)
                 .map(|(&k, &f)| f32::from((k == crate::data::ANSWER || k == crate::data::REREAD) && f))
                 .collect();
+            let mut found = (0, 0);
             for (&k, &f) in ks.iter().zip(&findable) {
                 if k == crate::data::ANSWER {
                     found.0 += usize::from(f);
@@ -885,31 +895,44 @@ pub fn train(
             let aux = ((pointer * mask)?.sum_all()? * (cfg.aux / n))?;
             let loss = ((losses.sum_all()? / n)? + aux)?;
             let t1 = Instant::now();
-            loss_value += loss.to_scalar::<f32>()?;
-            let g = loss.backward()?;
+            let loss_value = loss.to_scalar::<f32>()?;
+            let grads = loss.backward()?;
             let t2 = Instant::now();
-            grads = Some(match grads {
-                None => g,
-                Some(mut total) => {
-                    for v in &vars {
-                        if let Some(gv) = g.get(v.as_tensor()) {
-                            let sum = match total.remove(v.as_tensor()) {
-                                Some(tv) => (tv + gv)?,
-                                None => gv.clone(),
-                            };
-                            total.insert(v.as_tensor(), sum);
-                        }
-                    }
-                    total
-                }
-            });
-            lv.extend(losses.to_vec1::<f32>()?);
-            sum_known += out.known;
-            sum_blocks += out.blocks;
+            let lv = losses.to_vec1::<f32>()?;
+            let (known, blocks) = (out.known, out.blocks);
             // Commit now: the group's graph is freed before the next group.
             runner.commit(xs, t, &out, next)?;
-            for (acc, d) in timing.iter_mut().zip([t1 - t0, t2 - t1]) {
-                *acc += d.as_secs_f64();
+            Ok(GroupOut { grads, loss: loss_value, lv, known, blocks, found, time: [t1 - t0, t2 - t1] })
+        };
+        for (ci, chunk) in runners.chunks_mut(parallel).enumerate() {
+            let outs: Vec<Result<GroupOut>> =
+                chunk.par_iter_mut().enumerate().map(|(j, r)| run_group(ci * parallel + j, r)).collect();
+            for o in outs {
+                let o = o?;
+                grads = Some(match grads {
+                    None => o.grads,
+                    Some(mut total) => {
+                        for v in &vars {
+                            if let Some(gv) = o.grads.get(v.as_tensor()) {
+                                let sum = match total.remove(v.as_tensor()) {
+                                    Some(tv) => (tv + gv)?,
+                                    None => gv.clone(),
+                                };
+                                total.insert(v.as_tensor(), sum);
+                            }
+                        }
+                        total
+                    }
+                });
+                loss_value += o.loss;
+                lv.extend(o.lv);
+                sum_known += o.known;
+                sum_blocks += o.blocks;
+                found.0 += o.found.0;
+                found.1 += o.found.1;
+                for (acc, d) in timing.iter_mut().zip(o.time) {
+                    *acc += d.as_secs_f64() / parallel as f64;
+                }
             }
         }
         let mut grads = grads.expect("at least one group");
@@ -1068,6 +1091,17 @@ pub fn train(
         }
     }
     Ok(())
+}
+
+/// What one group of streams returns from a step.
+struct GroupOut {
+    grads: candle_core::backprop::GradStore,
+    loss: f32,
+    lv: Vec<f32>,
+    known: usize,
+    blocks: usize,
+    found: (usize, usize),
+    time: [std::time::Duration; 2],
 }
 
 /// What `state.txt` of a resume directory records.

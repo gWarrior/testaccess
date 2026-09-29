@@ -111,6 +111,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         micro: arg(args, "--micro", &d.micro.to_string()).parse().expect("--micro"),
         ema: arg(args, "--ema", &d.ema.to_string()).parse().expect("--ema"),
         val_every: arg(args, "--val-every", &d.val_every.to_string()).parse().expect("--val-every"),
+        parallel: arg(args, "--parallel", &d.parallel.to_string()).parse().expect("--parallel"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");
