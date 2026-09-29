@@ -346,10 +346,10 @@ impl Episodes {
         }
     }
 
-    /// Whether an answer is a template (" мой друг." / " не знаю."), not a
-    /// fact that can be found in the context.
+    /// Whether an answer is a template (" не знаю."), not a fact that can
+    /// be found in the context (" мой друг." is stated: "F - мой друг.").
     pub fn is_template(&self, answer: &[u32]) -> bool {
-        answer == self.my_friend.as_slice() || answer == self.dont_know.as_slice()
+        answer == self.dont_know.as_slice()
     }
 
     /// Whether an answer is " не знаю." (the fact was never stated).
@@ -373,6 +373,14 @@ impl Episodes {
 
     /// `(intro tokens, question tokens, answer tokens)` of a random episode.
     pub fn sample(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let (intro, q, a, _) = self.sample_tagged(rng);
+        (intro, q, a)
+    }
+
+    /// [`sample`](Self::sample) with the episode's type: 0 secret, 1 name,
+    /// 2 town, 3 pet, 4 friend ("Кто такой N" shares the friend line). Two
+    /// open episodes of one type would make the question ambiguous.
+    pub fn sample_tagged(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>, u8) {
         // A third asked with the statement's own words: the induction column
         // answers those by itself; paraphrases are what has to be learned.
         let same_words = rng.below(3) == 0;
@@ -381,11 +389,13 @@ impl Episodes {
             if same_words {
                 // The question is the statement's own opening.
                 let kind = self.intros.iter().position(|i| intro.starts_with(i)).unwrap_or(0);
-                return (intro, self.intros[kind].clone(), a);
+                return (intro, self.intros[kind].clone(), a, 0);
             }
-            return (intro, q, a);
+            return (intro, q, a, 0);
         }
-        self.sample_person(rng, same_words, None)
+        let which = rng.below(5);
+        let (intro, q, a) = self.sample_person(rng, same_words, Some(which));
+        (intro, q, a, [1, 2, 3, 4, 4][which as usize])
     }
 
     /// A person episode: `which` = 0 name, 1 town, 2 pet, 3 friend, 4 "Кто
@@ -422,17 +432,19 @@ impl Episodes {
         let (name, town, pet_name, friend) =
             (pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng));
         let which = which.unwrap_or_else(|| rng.below(5));
-        let has_friend = which == 3 || rng.below(2) == 0;
         let pet = &self.pets[rng.below(self.pets.len() as u64) as usize];
-        // One fact per line, so asking "with the same words" repeats the
-        // line's opening token for token:
-        // "Меня зовут N.\nЯ живу в городе T.\nМою кошку зовут P.[\nМоего друга зовут F.]"
-        let mut intro =
-            [&self.me[..], &name, &self.tok_end, &self.town, &town, &self.tok_end, &pet.0, &pet_name].concat();
-        if has_friend {
-            intro.extend([&self.tok_end[..], &self.friend, &friend].concat());
-        }
-        intro.extend(&self.end);
+        // Only the asked fact is stated (the other facts of a person would be
+        // stated again by later episodes and make questions ambiguous), on
+        // its own line, so asking "with the same words" repeats the line's
+        // opening token for token.
+        let intro = match which {
+            0 => [&self.me[..], &name, &self.end].concat(),
+            1 => [&self.town[..], &town, &self.end].concat(),
+            2 => [&pet.0[..], &pet_name, &self.end].concat(),
+            // "Моего друга зовут F. F - мой друг.": the answer to "Кто такой
+            // F" is stated, so it is copied from the statement like any fact.
+            _ => [&self.friend[..], &friend, &self.tok_end, &friend, &self.who.1, &self.my_friend].concat(),
+        };
         // The last paraphrase of every list is held out for evaluation.
         let ask = |(own, paraphrases): &(Vec<u32>, Vec<Vec<u32>>), rng: &mut snn_memory::rng::SplitMix64| {
             if same_words {
@@ -448,10 +460,10 @@ impl Episodes {
             0 => (intro, ask(&self.ask_name, rng), answer(&name)),
             1 => (intro, ask(&self.ask_town, rng), answer(&town)),
             2 => (intro, ask(pet, rng), answer(&pet_name)),
-            3 if has_friend => (intro, ask(&self.ask_friend, rng), answer(&friend)),
+            3 => (intro, ask(&self.ask_friend, rng), answer(&friend)),
             _ => {
                 // Who is N? The friend, or a name never stated.
-                let (who, a) = if has_friend && rng.below(2) == 0 {
+                let (who, a) = if rng.below(2) == 0 {
                     (friend, self.my_friend.clone())
                 } else {
                     (pick(&self.names, rng), self.dont_know.clone())
@@ -485,7 +497,7 @@ pub struct TaskStream {
     pending: std::collections::VecDeque<(u32, u8, Src)>,
     /// Questions waiting for their distance: (tokens left, question, answer).
     /// Questions waiting: (tokens left, question, answer, statement span).
-    questions: Vec<(usize, Vec<u32>, Vec<u32>, Src)>,
+    questions: Vec<(usize, Vec<u32>, Vec<u32>, Src, u8)>,
     carry: Option<(u32, u8, Src)>,
     /// Tokens emitted so far: the stream position of the next token.
     emitted: u64,
@@ -564,20 +576,23 @@ impl TaskStream {
             q.0 = q.0.saturating_sub(1);
         }
         if let Some(i) = self.questions.iter().position(|q| q.0 == 0) {
-            let (_, q, a, src) = self.questions.swap_remove(i);
+            let (_, q, a, src, _) = self.questions.swap_remove(i);
             self.pending.extend(q.iter().map(|&t| (t, PLAIN, NO_SRC)));
             let (kind, src) = if ep.is_template(&a) { (TEMPLATE, NO_SRC) } else { (ANSWER, src) };
             self.pending.extend(a.iter().map(|&t| (t, kind, src)));
             return self.pending.pop_front().expect("question is not empty");
         }
-        if self.p_episode > 0.0 && self.rng.next_f64() < self.p_episode {
-            let (intro, q, a) = ep.sample(&mut self.rng);
+        let episode = self.p_episode > 0.0 && self.rng.next_f64() < self.p_episode;
+        let sampled = episode.then(|| ep.sample_tagged(&mut self.rng));
+        // Not while a question of the same type is open: it would be asked
+        // about two statements.
+        if let Some((intro, q, a, tag)) = sampled.filter(|e| self.questions.iter().all(|q| q.4 != e.3)) {
             let (lo, hi) = self.distance;
             let d = ((lo as f64).ln() + self.rng.next_f64() * ((hi as f64).ln() - (lo as f64).ln())).exp() as usize;
             // The intro starts now: the statement spans these positions.
             let src = (self.emitted, self.emitted + intro.len() as u64);
             self.pending.extend(intro.into_iter().map(|t| (t, PLAIN, NO_SRC)));
-            self.questions.push((d.max(1), q, a, src));
+            self.questions.push((d.max(1), q, a, src, tag));
             return self.pending.pop_front().expect("intro is not empty");
         }
         let t = tokens[self.start + self.pos % self.len] as u32;
@@ -674,12 +689,13 @@ mod episode_tests {
         for _ in 0..200 {
             let (intro, question, answer) = ep.sample(&mut rng);
             assert!(!question.is_empty());
-            if answer == ep.dont_know || answer == ep.my_friend {
-                // "Кто такой N?": the answer is about N, not a copy.
+            if answer == ep.dont_know {
+                // "Кто такой N": a name never stated.
                 assert!(question.starts_with(&ep.who.0) && question.ends_with(&ep.who.1));
                 continue;
             }
-            let key = &answer[..answer.len() - ep.end.len()];
+            // Facts and " мой друг." are in the statement.
+            let key = if answer == ep.my_friend { &answer[..] } else { &answer[..answer.len() - ep.end.len()] };
             assert!(intro.windows(key.len()).any(|w| w == key), "{}", tok.decode(&intro));
         }
         let (intro, q, a) = ep.sample(&mut snn_memory::rng::SplitMix64::new(11));
