@@ -63,6 +63,9 @@ pub struct TrainConfig {
     pub val_every: usize,
     /// Groups of `micro` streams computed at once (default: the CPU cores).
     pub parallel: usize,
+    /// Adam's second-moment decay: 0.99 adapts within a short run (a few
+    /// hundred steps), 0.999 averages over ~1000 steps.
+    pub beta2: f64,
 }
 
 impl Default for TrainConfig {
@@ -91,9 +94,11 @@ impl Default for TrainConfig {
             p_episode: 1.0 / 729.0,
             aux: 1.0,
             micro: 3,
-            ema: 1.0 - 1.0 / 729.0,
+            // Short runs (a few thousand steps): a 243-step horizon.
+            ema: 1.0 - 1.0 / 243.0,
             val_every: 729,
             parallel: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            beta2: 0.99,
         }
     }
 }
@@ -776,6 +781,9 @@ pub fn train(
     let mut opt = AdamW::new(weights, cfg.lr)?;
     let mut opt_steps = AdamW::new(steps, cfg.lr / 27.0)?;
     let mut opt_kv = AdamW::new(kv, cfg.lr / 3.0)?;
+    for o in [&mut opt, &mut opt_steps, &mut opt_kv] {
+        o.beta2 = cfg.beta2;
+    }
     if let Some(r) = &resumed {
         let saved = candle_core::safetensors::load(resume.join("optim.safetensors"), &device)?;
         for (o, name, t) in [(&mut opt, "w", r.t[0]), (&mut opt_steps, "s", r.t[1]), (&mut opt_kv, "kv", r.t[2])] {
