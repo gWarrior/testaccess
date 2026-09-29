@@ -238,7 +238,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let top_k: usize = arg(args, "--top-k", "27").parse().expect("--top-k");
     let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
     let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
-    let copy: f32 = arg(args, "--copy", "0.5").parse().expect("--copy");
+    let copy: f32 = arg(args, "--copy", "0").parse().expect("--copy");
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
