@@ -318,7 +318,8 @@ impl Runner {
         } else if col < t + out.m {
             out.far_next[(bi * nb + ti / block) * out.m + (col - t)]
         } else if col == t + out.m {
-            out.ind_tok[bi * t + ti]
+            // No candidates without the memory (the column is masked).
+            out.ind_tok.get(bi * t + ti).copied().unwrap_or(u32::MAX)
         } else {
             u32::MAX
         }
