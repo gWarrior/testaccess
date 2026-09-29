@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::attention::{attend, Attended};
 use crate::clock::{Clock, SystemClock};
-use crate::config::MemoryConfig;
+use crate::config::{DynamicsConfig, MemoryConfig};
 use crate::encoder::{FlyHashEncoder, NGramEncoder};
 use crate::kv::{KvPrecision, KvStore};
 use crate::memory::{BatchOptions, RecallOptions, SnnMemory, Stats, Verdict};
@@ -99,7 +99,16 @@ impl Default for ContextConfig {
                 reject_threshold: 1.0 / 9.0,
                 ..base.clone()
             },
-            semantic: MemoryConfig { max_ensemble: 81, ..base },
+            // One pass, no LIF dynamics: a centred mean key is a weak cue
+            // (a statement's key is only partly the key of its question),
+            // so the attractor would suppress exactly the matches wanted.
+            semantic: MemoryConfig {
+                max_ensemble: 81,
+                recall_threshold: 1.0 / 9.0,
+                reject_threshold: 1.0 / 9.0,
+                dynamics: DynamicsConfig { enabled: false, ..DynamicsConfig::default() },
+                ..base
+            },
         }
     }
 }
@@ -124,7 +133,79 @@ impl Persist for Chunk {
 const CONTEXT_MAGIC: &[u8; 4] = b"SNNC";
 /// Full snapshots ([`ContextMemory::save_full`]).
 const FULL_MAGIC: &[u8; 4] = b"SNCF";
-const FULL_VERSION: u32 = 1;
+/// 2: the key centre of the semantic index is part of the state.
+const FULL_VERSION: u32 = 2;
+
+/// Keys (3^7) averaged into the centre of the semantic code space before it
+/// is fixed. Until then no chunk enters the semantic index.
+pub const SEMANTIC_CENTER_AFTER: u64 = 2_187;
+/// Candidates the semantic index returns per probe.
+pub const SEMANTIC_TOP_K: usize = 27;
+/// Distinct places (the newest) kept of the semantic candidates.
+pub const SEMANTIC_PLACES: usize = 3;
+
+/// The mean of the first [`SEMANTIC_CENTER_AFTER`] keys appended. A model's
+/// keys share a large common component; pooled over a few tokens it
+/// dominates every chunk, and the spike codes of all chunks look alike.
+/// Subtracting the mean leaves what distinguishes them.
+#[derive(Clone, Debug)]
+struct KeyCenter {
+    sum: Vec<f64>,
+    count: u64,
+    /// `sum / count`, once `count` reached [`SEMANTIC_CENTER_AFTER`].
+    center: Option<Vec<f32>>,
+}
+
+impl KeyCenter {
+    fn new(dim: usize) -> Self {
+        Self { sum: vec![0.0; dim], count: 0, center: None }
+    }
+
+    /// Accumulate rows of `keys` until the centre is fixed.
+    fn add(&mut self, keys: &[f32]) {
+        if self.center.is_some() {
+            return;
+        }
+        for row in keys.chunks_exact(self.sum.len()) {
+            if self.count >= SEMANTIC_CENTER_AFTER {
+                break;
+            }
+            self.sum.iter_mut().zip(row).for_each(|(s, &k)| *s += k as f64);
+            self.count += 1;
+        }
+        if self.count >= SEMANTIC_CENTER_AFTER {
+            self.freeze();
+        }
+    }
+
+    fn freeze(&mut self) {
+        let n = self.count as f64;
+        self.center = Some(self.sum.iter().map(|&s| (s / n) as f32).collect());
+    }
+
+    /// `frozen u8 | count u64 | sum f64*`.
+    fn write(&self, out: &mut Vec<u8>) {
+        out.push(self.center.is_some() as u8);
+        out.extend_from_slice(&self.count.to_le_bytes());
+        for s in &self.sum {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+
+    fn read(dim: usize, input: &mut &[u8]) -> Result<Self, MemoryError> {
+        let frozen = persist::read_u8(input)? != 0;
+        let count = persist::read_u64(input)?;
+        let sum: Vec<f64> = persist::read_u64s(input, dim)?.into_iter().map(f64::from_bits).collect();
+        if count > SEMANTIC_CENTER_AFTER || frozen != (count == SEMANTIC_CENTER_AFTER) {
+            return Err(persist::corrupt("inconsistent key centre"));
+        }
+        let mut c = Self { sum, count, center: None };
+        if frozen {
+            c.freeze();
+        }
+        Ok(c)
+    }
+}
 
 /// The configuration a full snapshot's state depends on; everything else
 /// (thresholds, `top_k`, dynamics, ...) may change between save and restore.
@@ -225,9 +306,11 @@ fn get_chunk(window: &[u32], base: u64, input: &mut &[u8]) -> Result<Chunk, Memo
 pub enum Probe<'a> {
     /// A token fragment (lexical memory).
     Tokens(&'a [u32]),
-    /// A query key of `key_dim` (semantic memory).
+    /// A key of `key_dim` (semantic memory): the mean attention key `K` of
+    /// the probe's tokens, in the space of the keys given to
+    /// [`append_kv`](ContextMemory::append_kv).
     Key(&'a [f32]),
-    /// Both, results merged.
+    /// Both, results merged; the verdict is the lexical one.
     Both(&'a [u32], &'a [f32]),
 }
 
@@ -338,6 +421,8 @@ pub struct ContextMemory {
     census: HashMap<u64, u32>,
     census_from: u64,
     census_n: usize,
+    /// Centre of the semantic keys (with a semantic index only).
+    center: Option<KeyCenter>,
 }
 
 impl ContextMemory {
@@ -358,6 +443,7 @@ impl ContextMemory {
         }
         let census_n = *enc.ngrams().last().expect("encoder has n-gram sizes");
         let lexical = SnnMemory::new(enc, cfg.lexical.clone())?;
+        let center = cfg.kv.as_ref().filter(|k| k.semantic_index).map(|k| KeyCenter::new(k.key_dim));
         let (semantic, kv) = match &cfg.kv {
             Some(k) => {
                 let semantic = if k.semantic_index {
@@ -385,6 +471,7 @@ impl ContextMemory {
             census: HashMap::new(),
             census_from: 0,
             census_n,
+            center,
         })
     }
 
@@ -423,6 +510,18 @@ impl ContextMemory {
         self.kv.as_ref()
     }
 
+    /// The fixed centre of the semantic keys, once
+    /// [`SEMANTIC_CENTER_AFTER`] keys were appended.
+    pub fn semantic_center(&self) -> Option<&[f32]> {
+        self.center.as_ref().and_then(|c| c.center.as_deref())
+    }
+
+    /// Keys averaged into the semantic centre so far (at most
+    /// [`SEMANTIC_CENTER_AFTER`]); `0` without a semantic index.
+    pub fn semantic_center_count(&self) -> u64 {
+        self.center.as_ref().map_or(0, |c| c.count)
+    }
+
     // ----- writing --------------------------------------------------------
 
     /// Append tokens (contexts without a K/V store). Returns new chunks.
@@ -445,6 +544,9 @@ impl ContextMemory {
             return Err(MemoryError::DimensionMismatch { expected: n * dv, got: values.len() });
         }
         kv.push(keys, values);
+        if let Some(c) = &mut self.center {
+            c.add(keys);
+        }
         self.append_tokens(tokens)
     }
 
@@ -490,19 +592,24 @@ impl ContextMemory {
         let opts = BatchOptions { link_sequence: true, after: self.last.map(|l| l.0), ..Default::default() };
         let lex_ids = self.lexical.learn_batch(&inputs, Some(chunks.clone()), &opts)?;
 
-        let sem_ids: Vec<Option<MemoryId>> = match (&mut self.semantic, &self.kv) {
-            (Some(sem), Some(kv)) => {
-                let dk = kv.key_dim();
+        // Semantic code of a chunk: the centred mean key of its first stride
+        // (each stride of the stream is pooled by exactly one chunk; a mean
+        // over the whole chunk would blur three places into one). Nothing is
+        // written before the centre is fixed.
+        let center = self.center.as_ref().and_then(|c| c.center.as_deref());
+        let sem_ids: Vec<Option<MemoryId>> = match (&mut self.semantic, &self.kv, center) {
+            (Some(sem), Some(kv), Some(center)) => {
+                let (dk, st) = (kv.key_dim(), self.cfg.stride as u64);
                 let (mut key, mut value) = (vec![0f32; dk], vec![0f32; kv.value_dim()]);
                 let pooled: Vec<Vec<f32>> = starts
                     .iter()
                     .map(|&s| {
-                        let mut mean = vec![0f32; dk];
-                        for p in s..s + cs {
+                        let mut sum = vec![0f32; dk];
+                        for p in s..s + st {
                             kv.read(p, &mut key, &mut value);
-                            mean.iter_mut().zip(&key).for_each(|(m, k)| *m += k);
+                            sum.iter_mut().zip(&key).for_each(|(m, k)| *m += k);
                         }
-                        mean
+                        sum.iter().zip(center).map(|(m, c)| m / st as f32 - c).collect()
                     })
                     .collect();
                 let inputs: Vec<Input> = pooled.iter().map(|m| Input::Dense(m)).collect();
@@ -576,9 +683,15 @@ impl ContextMemory {
     // ----- reading --------------------------------------------------------
 
     /// Retrieve the chunks matching a probe, most confident first.
+    ///
+    /// Tokens go to the lexical index (`top_k` chunks). A key goes, centred,
+    /// to the semantic index: of its [`SEMANTIC_TOP_K`] candidates the
+    /// [`SEMANTIC_PLACES`] newest distinct places are kept (chunks less than
+    /// a chunk apart are one place). The verdict is the lexical one whenever
+    /// tokens were probed; the semantic one only for [`Probe::Key`]. Before
+    /// the key centre is fixed the semantic index is empty and not probed.
     pub fn retrieve(&mut self, probe: Probe<'_>, top_k: usize) -> Result<Retrieval, MemoryError> {
-        let opts = RecallOptions { top_k, ..RecallOptions::default() };
-        let mut verdicts = Vec::new();
+        let mut verdict = Verdict::Unknown;
         let mut hits: Vec<(f32, MemoryId, Chunk, bool)> = Vec::new();
         let (tokens, key) = match probe {
             Probe::Tokens(t) => (Some(t), None),
@@ -586,23 +699,45 @@ impl ContextMemory {
             Probe::Both(t, k) => (Some(t), Some(k)),
         };
         if let Some(t) = tokens.filter(|t| !t.is_empty()) {
+            let opts = RecallOptions { top_k, ..RecallOptions::default() };
             let r = self.lexical.recall(Input::Tokens(t), &opts)?;
-            verdicts.push(r.verdict);
+            verdict = r.verdict;
             hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?, true))));
         }
         if let Some(k) = key {
-            let sem = self.semantic.as_mut().ok_or(MemoryError::InvalidConfig("no semantic index".into()))?;
-            let r = sem.recall(Input::Dense(k), &opts)?;
-            verdicts.push(r.verdict);
-            hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?, false))));
+            if self.semantic.is_none() {
+                return Err(MemoryError::InvalidConfig("no semantic index".into()));
+            }
+            let dk = self.kv.as_ref().map_or(0, KvStore::key_dim);
+            if k.len() != dk {
+                return Err(MemoryError::DimensionMismatch { expected: dk, got: k.len() });
+            }
+            let cue: Option<Vec<f32>> =
+                self.semantic_center().map(|center| k.iter().zip(center).map(|(k, c)| k - c).collect());
+            if let Some(cue) = cue {
+                let opts = RecallOptions { top_k: SEMANTIC_TOP_K, ..RecallOptions::default() };
+                let sem = self.semantic.as_mut().expect("checked above");
+                let r = sem.recall(Input::Dense(&cue), &opts)?;
+                if tokens.is_none() {
+                    verdict = r.verdict;
+                }
+                let mut found: Vec<(f32, MemoryId, Chunk)> =
+                    r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?))).collect();
+                // Newest first; among chunks of one place the newest stands for it.
+                found.sort_by(|a, b| b.2.start.cmp(&a.2.start));
+                let cs = self.cfg.chunk_size as u64;
+                let mut places: Vec<(f32, MemoryId, Chunk)> = Vec::with_capacity(SEMANTIC_PLACES);
+                for h in found {
+                    if places.len() == SEMANTIC_PLACES {
+                        break;
+                    }
+                    if places.iter().all(|p| p.2.start.abs_diff(h.2.start) >= cs) {
+                        places.push(h);
+                    }
+                }
+                hits.extend(places.into_iter().map(|(c, id, chunk)| (c, id, chunk, false)));
+            }
         }
-        let verdict = if verdicts.contains(&Verdict::Known) {
-            Verdict::Known
-        } else if !verdicts.is_empty() && verdicts.iter().all(|&v| v == Verdict::Absent) {
-            Verdict::Absent
-        } else {
-            Verdict::Unknown
-        };
         Ok(Retrieval { verdict, spans: self.spans_of(hits) })
     }
 
@@ -815,7 +950,9 @@ impl ContextMemory {
     }
 
     /// Start a new conversation: forget the window, keep pinned chunks.
-    /// Positions keep increasing so old pinned chunks never collide.
+    /// Positions keep increasing so old pinned chunks never collide. The
+    /// semantic key centre is kept (it is a property of the model's keys,
+    /// and pinned semantic engrams were coded relative to it).
     pub fn reset(&mut self) {
         let end = self.position();
         self.lexical.reset_fast_memory();
@@ -852,6 +989,11 @@ impl ContextMemory {
             }
             None => out.extend_from_slice(&0u64.to_le_bytes()),
         }
+        // Optional tail: the semantic key centre (snapshots without it, from
+        // before it existed, start a fresh one).
+        if let Some(c) = &self.center {
+            c.write(&mut out);
+        }
         out
     }
 
@@ -877,6 +1019,12 @@ impl ContextMemory {
                     sem.restore(part)?;
                 }
                 None => return Err(MemoryError::InvalidConfig("snapshot has a semantic index".into())),
+            }
+        }
+        if !input.is_empty() {
+            match &mut ctx.center {
+                Some(c) => *c = KeyCenter::read(c.sum.len(), &mut input)?,
+                None => return Err(MemoryError::InvalidConfig("snapshot has a semantic key centre".into())),
             }
         }
         if !input.is_empty() {
@@ -922,6 +1070,8 @@ impl ContextMemory {
     ///                   last: u8 [lexical u64, semantic u64 (0 = none)]
     ///                   tokens (count u64, u32*) | chunks (count u64,
     ///                   (start, lexical, semantic u64)*)
+    ///                   [with a semantic index: key centre: frozen u8 |
+    ///                   count u64 | sum f64 * key_dim]
     /// lexical section:  len u64 | SNN memory image
     /// semantic section: len u64 | SNN memory image (len 0 = none)
     /// K/V section:      len u64 | K/V image (len 0 = none)
@@ -964,6 +1114,9 @@ impl ContextMemory {
             for x in [c.start, c.lexical, c.semantic.unwrap_or(0)] {
                 out.extend_from_slice(&x.to_le_bytes());
             }
+        }
+        if let Some(c) = &self.center {
+            c.write(&mut out);
         }
         persist::end_section(&mut out, sec);
 
@@ -1027,6 +1180,9 @@ impl ContextMemory {
         let tokens = persist::read_u32s(&mut state, n)?;
         let n = read_u64(&mut state)? as usize;
         let recs = persist::read_u64s(&mut state, n.checked_mul(3).ok_or_else(|| corrupt("bad chunk count"))?)?;
+        if let Some(c) = &mut ctx.center {
+            *c = KeyCenter::read(c.sum.len(), &mut state)?;
+        }
         if !state.is_empty() {
             return Err(corrupt("trailing bytes in context state"));
         }
@@ -1126,6 +1282,27 @@ fn find_all(hay: &[u32], needle: &[u32], base: u64, out: &mut Vec<u64>) {
     for (i, w) in hay.windows(needle.len()).enumerate() {
         if w == needle {
             out.push(base + i as u64);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_snapshots_of_version_1_are_refused() {
+        let cfg = ContextConfig { max_tokens: 243, kv: Some(KvConfig::new(9, 3)), ..Default::default() };
+        let mut ctx = ContextMemory::new(cfg.clone()).unwrap();
+        ctx.append_kv(&[1; 81], &[0.5; 81 * 9], &[0.5; 81 * 3]).unwrap();
+        let mut bytes = ctx.save_full();
+        bytes.truncate(bytes.len() - 8);
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let sum = persist::checksum64(&bytes);
+        bytes.extend_from_slice(&sum.to_le_bytes());
+        match ContextMemory::restore_full(cfg, &bytes) {
+            Err(MemoryError::Corrupt(msg)) => assert!(msg.contains("version 1"), "{msg}"),
+            other => panic!("expected a version error, got {:?}", other.map(|_| ())),
         }
     }
 }

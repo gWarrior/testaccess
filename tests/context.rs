@@ -185,11 +185,12 @@ fn read_head_attends_over_retrieved_tokens() {
     let tail: Vec<u64> = rows.positions.iter().zip(&rows.sources).filter(|r| *r.1 == 2).map(|r| *r.0).collect();
     assert!(tail.iter().all(|&p| p + 27 > end && p < end), "{tail:?} vs {end}");
 
-    // Semantic probe: the mean key of a chunk retrieves that chunk.
+    // Semantic probe: the mean key of a chunk's first stride retrieves that
+    // chunk.
     let chunk_start = 2_700usize;
     let mut mean = vec![0f32; dk];
-    for p in chunk_start..chunk_start + 27 {
-        mean.iter_mut().zip(&keys[p * dk..(p + 1) * dk]).for_each(|(m, k)| *m += k);
+    for p in chunk_start..chunk_start + 9 {
+        mean.iter_mut().zip(&keys[p * dk..(p + 1) * dk]).for_each(|(m, k)| *m += k / 9.0);
     }
     let r = ctx.retrieve(Probe::Key(&mean), 3).unwrap();
     assert_eq!(r.verdict, Verdict::Known);
@@ -392,6 +393,25 @@ fn fill(ctx: &mut ContextMemory, clock: &ManualClock, seed: u64, pieces: usize) 
     pinned_at
 }
 
+/// Mean of the stored keys of `[at, at + n)`.
+fn mean_key(ctx: &ContextMemory, at: u64, n: u64) -> Vec<f32> {
+    let kv = ctx.kv().unwrap();
+    let (mut k, mut v) = (vec![0.0; kv.key_dim()], vec![0.0; kv.value_dim()]);
+    let mut mean = vec![0.0; kv.key_dim()];
+    for p in at..at + n {
+        assert!(kv.read(p, &mut k, &mut v));
+        mean.iter_mut().zip(&k).for_each(|(m, k)| *m += k / n as f32);
+    }
+    mean
+}
+
+/// A span as `(start, tokens, confidence bits, chunks, lexical)`.
+type SpanKey = (u64, Vec<u32>, u32, Vec<u64>, bool);
+
+fn spans_key(r: &snn_memory::Retrieval) -> Vec<SpanKey> {
+    r.spans.iter().map(|s| (s.start, s.tokens.clone(), s.confidence.to_bits(), s.chunks.clone(), s.lexical)).collect()
+}
+
 fn full_snapshot_roundtrip(kv: Option<KvConfig>) {
     let clock = ManualClock::new(1_000.0);
     let (cfg, mut a) = clocked(kv, 6_561, &clock);
@@ -418,6 +438,24 @@ fn full_snapshot_roundtrip(kv: Option<KvConfig>) {
     let found = b.locate(frag).unwrap();
     assert_eq!(a.locate(frag).unwrap(), found);
     assert!(found.positions.contains(&(chunk.start + 3)), "{found:?}");
+
+    // The semantic key centre comes back, and semantic search agrees.
+    let bits = |c: Option<&[f32]>| c.map(|c| c.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+    assert_eq!(bits(a.semantic_center()), bits(b.semantic_center()));
+    assert_eq!(a.semantic_center_count(), b.semantic_center_count());
+    if a.semantic().is_some() {
+        assert!(a.semantic_center().is_some(), "{} keys seen", a.semantic_center_count());
+        let kv = a.kv().unwrap();
+        let dk = kv.key_dim();
+        let at = (a.window().0 + 900) / 9 * 9;
+        let key = mean_key(&a, at, 9);
+        let ra = a.retrieve(Probe::Key(&key), 3).unwrap();
+        let rb = b.retrieve(Probe::Key(&key), 3).unwrap();
+        assert_eq!(ra.verdict, rb.verdict);
+        assert_eq!(spans_key(&ra), spans_key(&rb));
+        assert!(ra.spans.iter().any(|s| !s.lexical && s.start <= at && s.end() >= at + 9), "{:?}", spans_key(&ra));
+        assert_eq!(key.len(), dk);
+    }
 
     lockstep(&mut a, &mut b, &clock, 11, 120);
     assert!(a.save_full() == b.save_full(), "same state after the same operations");
@@ -616,4 +654,230 @@ fn rows_cover_several_places() {
     for &p in &at {
         assert!(rows.positions.iter().any(|&r| r >= p && r < p + 9), "phrase at {p} not in rows");
     }
+}
+
+// ----- semantic index ----------------------------------------------------------
+
+use snn_memory::context::SEMANTIC_CENTER_AFTER;
+use snn_memory::{Encoder, FlyHashEncoder, Input};
+
+/// A context with an F32 K/V store of `dk`-dim keys and a semantic index.
+fn semantic_context(dk: usize) -> ContextMemory {
+    let kv = KvConfig { precision: KvPrecision::F32, ..KvConfig::new(dk, 9) };
+    ContextMemory::new(ContextConfig { max_tokens: 59_049, kv: Some(kv), ..Default::default() }).unwrap()
+}
+
+/// Keys that share a large common component, as a model's keys do:
+/// `common + shift + N(0, 1)` per row.
+fn biased_keys(rng: &mut SplitMix64, n: usize, common: &[f32], shift: &[f32]) -> Vec<f32> {
+    (0..n)
+        .flat_map(|_| common.iter().zip(shift).map(|(c, s)| c + s + rng.normal() as f32).collect::<Vec<_>>())
+        .collect()
+}
+
+/// Append `n` filler tokens with keys `common + noise`.
+fn append_filler(ctx: &mut ContextMemory, rng: &mut SplitMix64, n: usize, common: &[f32]) {
+    let zero = vec![0.0; common.len()];
+    let keys = biased_keys(rng, n, common, &zero);
+    ctx.append_kv(&text(rng, n), &keys, &vec![0.0; n * 9]).unwrap();
+}
+
+/// Append a "place": `n` tokens whose keys are `common + shift + noise`.
+fn append_place(ctx: &mut ContextMemory, rng: &mut SplitMix64, n: usize, common: &[f32], shift: &[f32]) -> u64 {
+    assert_eq!(ctx.position() % 9, 0, "places start a stride");
+    let at = ctx.position();
+    let keys = biased_keys(rng, n, common, shift);
+    ctx.append_kv(&text(rng, n), &keys, &vec![0.0; n * 9]).unwrap();
+    at
+}
+
+/// A large common component (norm 9 per dimension) and a place direction
+/// (norm 1 per dimension).
+fn directions(rng: &mut SplitMix64, dk: usize) -> (Vec<f32>, Vec<f32>) {
+    let common = (0..dk).map(|_| if rng.below(2) == 0 { 9.0 } else { -9.0 }).collect();
+    let shift = (0..dk).map(|_| rng.normal() as f32).collect();
+    (common, shift)
+}
+
+fn add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b).map(|(a, b)| a + b).collect()
+}
+
+#[test]
+fn semantic_index_waits_for_the_key_centre() {
+    let dk = 27;
+    let mut rng = SplitMix64::new(21);
+    let mut ctx = semantic_context(dk);
+    let n = SEMANTIC_CENTER_AFTER as usize - 27;
+    let keys: Vec<f32> = (0..(n + 81) * dk).map(|_| 3.0 + rng.normal() as f32).collect();
+    let tokens = text(&mut rng, n + 81);
+    ctx.append_kv(&tokens[..n], &keys[..n * dk], &vec![0.0; n * 9]).unwrap();
+
+    assert_eq!(ctx.semantic_center(), None);
+    assert_eq!(ctx.semantic_center_count(), n as u64);
+    let before = ctx.stats();
+    assert!(before.chunks > 200);
+    assert_eq!(before.semantic.as_ref().unwrap().fast_memories, 0, "nothing indexed before the centre");
+    let key = &keys[..dk];
+    let r = ctx.retrieve(Probe::Key(key), 3).unwrap();
+    assert!(r.spans.is_empty());
+    assert_eq!(r.verdict, Verdict::Unknown);
+    // Lexical retrieval works meanwhile.
+    let r = ctx.retrieve(Probe::Both(&tokens[900..909], key), 3).unwrap();
+    assert_eq!(r.verdict, Verdict::Known);
+    assert!(r.spans.iter().all(|s| s.lexical));
+
+    ctx.append_kv(&tokens[n..], &keys[n * dk..], &vec![0.0; 81 * 9]).unwrap();
+    assert_eq!(ctx.semantic_center_count(), SEMANTIC_CENTER_AFTER);
+    // The centre is the mean of exactly the first 3^7 keys.
+    let center = ctx.semantic_center().expect("fixed");
+    for (d, &c) in center.iter().enumerate() {
+        let m = (0..SEMANTIC_CENTER_AFTER as usize).map(|i| keys[i * dk + d] as f64).sum::<f64>()
+            / SEMANTIC_CENTER_AFTER as f64;
+        assert!((c as f64 - m).abs() < 1e-5, "dim {d}: {c} vs {m}");
+    }
+    let after = ctx.stats();
+    let new = after.chunks - before.chunks;
+    assert_eq!(new, 9);
+    assert_eq!(after.semantic.as_ref().unwrap().fast_memories, new, "chunks after the centre are indexed");
+
+    // Later keys do not move it; reset keeps it.
+    let fixed = center.to_vec();
+    append_filler(&mut ctx, &mut rng, 243, &vec![50.0; dk]);
+    assert_eq!(ctx.semantic_center(), Some(&fixed[..]));
+    ctx.reset();
+    assert_eq!(ctx.semantic_center(), Some(&fixed[..]));
+}
+
+#[test]
+fn centred_semantic_search_finds_a_similar_place() {
+    let dk = 27;
+    let mut rng = SplitMix64::new(22);
+    let (common, shift) = directions(&mut rng, dk);
+    let mut ctx = semantic_context(dk);
+    append_filler(&mut ctx, &mut rng, 2_187 + 729, &common);
+    let at = append_place(&mut ctx, &mut rng, 9, &common, &shift);
+    append_filler(&mut ctx, &mut rng, 729, &common);
+
+    // The caller's key: the mean key of its probe tokens.
+    let probe = add(&common, &shift);
+    let r = ctx.retrieve(Probe::Key(&probe), 3).unwrap();
+    assert_eq!(r.verdict, Verdict::Known);
+    assert!(
+        r.spans.iter().any(|s| !s.lexical && s.start <= at && s.end() >= at + 9),
+        "place at {at}: {:?}",
+        r.spans.iter().map(|s| (s.start, s.end(), s.confidence)).collect::<Vec<_>>()
+    );
+    let rows = ctx.retrieve_rows(Probe::Key(&probe), 3, 81).unwrap();
+    let i = rows.positions.iter().position(|&p| p == at).expect("place rows");
+    assert_eq!(rows.sources[i], 1, "semantic match");
+
+    // Without the centre the codes of every stride look alike: the probe's
+    // spike code overlaps a filler stride as much as the place, while
+    // centred it overlaps only the place.
+    let center = ctx.semantic_center().unwrap().to_vec();
+    let enc = FlyHashEncoder::new(dk, 19_683, 81, 27, 7).unwrap();
+    let code = |v: &[f32]| {
+        let mut out = Vec::new();
+        enc.encode(Input::Dense(v), &mut out).unwrap();
+        out
+    };
+    let overlap = |a: &[u32], b: &[u32]| a.iter().filter(|x| b.contains(x)).count();
+    let centred = |v: &[f32]| v.iter().zip(&center).map(|(v, c)| v - c).collect::<Vec<_>>();
+    let place = mean_key(&ctx, at, 9);
+    let filler = mean_key(&ctx, at + 81, 9);
+    let raw = (code(&probe), code(&place), code(&filler));
+    assert!(overlap(&raw.0, &raw.2) >= 41, "raw probe vs filler: {}", overlap(&raw.0, &raw.2));
+    let cen = (code(&centred(&probe)), code(&centred(&place)), code(&centred(&filler)));
+    assert!(overlap(&cen.0, &cen.1) >= 27, "centred probe vs place: {}", overlap(&cen.0, &cen.1));
+    assert!(overlap(&cen.0, &cen.2) < 9, "centred probe vs filler: {}", overlap(&cen.0, &cen.2));
+}
+
+#[test]
+fn semantic_hits_keep_the_three_newest_places() {
+    let dk = 27;
+    let mut rng = SplitMix64::new(23);
+    let (common, shift) = directions(&mut rng, dk);
+    let mut ctx = semantic_context(dk);
+    append_filler(&mut ctx, &mut rng, 2_187 + 729, &common);
+    let mut places = Vec::new();
+    for i in 0..5 {
+        // The newest place spans two strides: two matching chunks, one place.
+        let n = if i == 4 { 18 } else { 9 };
+        places.push(append_place(&mut ctx, &mut rng, n, &common, &shift));
+        append_filler(&mut ctx, &mut rng, 243, &common);
+    }
+    let r = ctx.retrieve(Probe::Key(&add(&common, &shift)), 9).unwrap();
+    let mut starts: Vec<u64> = r.spans.iter().map(|s| s.start).collect();
+    starts.sort_unstable();
+    assert!(r.spans.iter().all(|s| !s.lexical && s.in_window));
+    assert_eq!(starts, vec![places[2], places[3], places[4] + 9], "{places:?}");
+}
+
+#[test]
+fn verdict_comes_from_the_lexical_probe() {
+    let dk = 27;
+    let mut rng = SplitMix64::new(24);
+    let (common, shift) = directions(&mut rng, dk);
+    let mut ctx = semantic_context(dk);
+    append_filler(&mut ctx, &mut rng, 2_187 + 729, &common);
+    let at = append_place(&mut ctx, &mut rng, 9, &common, &shift);
+    append_filler(&mut ctx, &mut rng, 729, &common);
+    let key = add(&common, &shift);
+
+    // Tokens never seen, a key that matches: semantic spans, lexical verdict.
+    let unseen: Vec<u32> = (90_001..90_010).collect();
+    let lexical = ctx.retrieve(Probe::Tokens(&unseen), 3).unwrap().verdict;
+    assert_ne!(lexical, Verdict::Known);
+    let r = ctx.retrieve(Probe::Both(&unseen, &key), 3).unwrap();
+    assert_eq!(r.verdict, lexical);
+    assert!(r.spans.iter().any(|s| !s.lexical && s.start <= at && s.end() >= at + 9));
+    // A pure key probe answers with the semantic verdict.
+    assert_eq!(ctx.retrieve(Probe::Key(&key), 3).unwrap().verdict, Verdict::Known);
+
+    // Tokens that are there, a key that matches nothing specific: Known.
+    let seen = ctx.tokens(at + 243, at + 252).unwrap().to_vec();
+    let r = ctx.retrieve(Probe::Both(&seen, &common), 3).unwrap();
+    assert_eq!(r.verdict, Verdict::Known);
+    assert!(r.spans.iter().any(|s| s.lexical && s.start <= at + 243 && s.end() >= at + 252));
+}
+
+#[test]
+fn full_snapshot_carries_an_unfixed_key_centre() {
+    let clock = ManualClock::new(0.0);
+    let kv = KvConfig { precision: KvPrecision::Trit2, ..KvConfig::new(81, 81) };
+    let (cfg, mut a) = clocked(Some(kv), 6_561, &clock);
+    fill(&mut a, &clock, 17, 12);
+    let seen = a.semantic_center_count();
+    assert!(seen > 0 && seen < SEMANTIC_CENTER_AFTER, "{seen}");
+    assert_eq!(a.semantic_center(), None);
+    assert_eq!(a.stats().semantic.unwrap().fast_memories, 0);
+
+    let mut b = ContextMemory::restore_full_with_clock(cfg, &a.save_full(), clock.clone()).unwrap();
+    assert_eq!(b.semantic_center_count(), seen);
+    assert_eq!(b.semantic_center(), None);
+    // Across the threshold in lockstep: the same centre, the same index.
+    lockstep(&mut a, &mut b, &clock, 19, 90);
+    assert!(a.semantic_center().is_some());
+    assert!(a.stats().semantic.unwrap().fast_memories > 0);
+    assert!(a.save_full() == b.save_full());
+}
+
+#[test]
+fn pinned_snapshot_carries_the_key_centre() {
+    let dk = 27;
+    let mut rng = SplitMix64::new(25);
+    let (common, shift) = directions(&mut rng, dk);
+    let mut ctx = semantic_context(dk);
+    append_filler(&mut ctx, &mut rng, 2_187 + 81, &common);
+    let at = append_place(&mut ctx, &mut rng, 9, &common, &shift);
+    append_filler(&mut ctx, &mut rng, 81, &common);
+    assert!(ctx.pin(at, at + 9).unwrap() >= 1);
+    let center = ctx.semantic_center().unwrap().to_vec();
+
+    let cfg = ctx.config().clone();
+    let mut next = ContextMemory::restore(cfg, &ctx.save_pinned()).unwrap();
+    assert_eq!(next.semantic_center(), Some(&center[..]));
+    let r = next.retrieve(Probe::Key(&add(&common, &shift)), 3).unwrap();
+    assert!(r.spans.iter().any(|s| !s.in_window && s.start <= at && s.end() >= at + 9), "pinned place found");
 }
