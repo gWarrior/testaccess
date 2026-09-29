@@ -172,8 +172,12 @@ impl candle_core::CustomOp2 for Quant {
                     let i = r * cols + c;
                     let x = wv[i] / step;
                     let inside = x.abs() <= lv + 0.5;
-                    // Clipped STE for the weight.
-                    gw[c] = if inside { gv[i] } else { 0.0 };
+                    // Clipped STE for the weight, except towards the grid: a
+                    // latent past the top level still gets the gradient that
+                    // pulls it back in (else Adam's drift kills it for good —
+                    // 3% of weights at step 243, 8% at 729).
+                    let inward = (x > 0.0) == (gv[i] > 0.0);
+                    gw[c] = if inside || inward { gv[i] } else { 0.0 };
                     // dq/ds (LSQ), then ds/dθ = s·ln2 through the rounding.
                     let dq = if inside { x.round().clamp(-lv, lv) - x } else { x.signum() * lv };
                     dt += gv[i] * dq;
@@ -718,17 +722,21 @@ mod tests {
     }
 
     #[test]
-    fn step_learns_by_lsq_and_clipped_weights_get_no_gradient() {
+    fn step_learns_by_lsq_and_clipped_weights_get_only_inward_gradient() {
         let (vm, w) = qtensor(3, 81, 1.0, LEVELS);
         // Push one weight far outside the range.
         let mut v = w.w.to_vec2::<f32>().unwrap();
         v[0][0] = 1e3;
         vm.data().lock().unwrap()["w"].set(&Tensor::new(v, &Device::Cpu).unwrap()).unwrap();
+        // Σq² pulls every weight towards zero: the clipped one gets it too.
         let loss = w.q().unwrap().sqr().unwrap().sum_all().unwrap();
         let grads = loss.backward().unwrap();
         let gw = grads.get(&w.w).unwrap().to_vec2::<f32>().unwrap();
-        assert_eq!(gw[0][0], 0.0, "a clipped weight gets no gradient");
+        assert!(gw[0][0] > 0.0, "a clipped weight is pulled back in");
         assert!(gw[1].iter().any(|&g| g != 0.0));
+        // −Σq² pushes outwards: the clipped weight gets nothing.
+        let away = w.q().unwrap().sqr().unwrap().sum_all().unwrap().neg().unwrap().backward().unwrap();
+        assert_eq!(away.get(&w.w).unwrap().to_vec2::<f32>().unwrap()[0][0], 0.0, "no push further out");
         let gt = grads.get(&w.theta).unwrap().to_vec1::<f32>().unwrap();
         assert!(gt.iter().all(|g| g.is_finite()) && gt.iter().any(|&g| g != 0.0), "{gt:?}");
     }
