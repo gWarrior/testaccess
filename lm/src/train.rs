@@ -256,6 +256,7 @@ pub struct WindowOut {
     /// Pointer attention `(B, T, T + M + 2)` and its null column `(B, T)`.
     pub point: Tensor,
     pub gate: Tensor,
+    pub log_point: Tensor,
     /// Token after each memory row and its position `(B, nb, M)`, and `M`.
     pub far_next: Vec<u32>,
     pub far_pos: Vec<u64>,
@@ -329,6 +330,7 @@ impl Runner {
             logits: h.logits,
             point: h.point,
             gate: h.gate,
+            log_point: h.log_point,
             far_next: mem.next,
             far_pos: mem.pos,
             ind: mem.ind,
@@ -392,13 +394,15 @@ impl Runner {
                 }
             }
         }
-        let hit = Tensor::from_vec(hit, (b, t, l), out.point.device())?;
-        let copy = (&out.point * hit)?.sum(2)?.flatten_all()?;
+        // In log space throughout: ln(copy mass) is the log-sum-exp of the
+        // hit columns of ln point, ln a_null its null column.
+        let miss: Vec<f32> = hit.iter().map(|&h| if h > 0.0 { 0.0 } else { -1e9 }).collect();
+        let miss = Tensor::from_vec(miss, (b, t, l), out.point.device())?;
+        let c = (&out.log_point + miss)?.log_sum_exp(2)?.flatten_all()?;
         let ce = token_losses(&out.logits, y)?;
-        let g = out.gate.flatten_all()?;
+        let log_g = out.log_point.narrow(2, l - 1, 1)?.flatten_all()?;
         // −ln(a_null·e^−ce + c), as a log-sum-exp of the two branches.
-        let a = ((g + 1e-9)?.log()? - ce)?;
-        let c = (copy + 1e-9)?.log()?;
+        let a = (log_g - ce)?;
         let both = Tensor::stack(&[&a, &c], 1)?;
         let mx = both.max_keepdim(1)?.detach();
         let lse = (both.broadcast_sub(&mx)?.exp()?.sum_keepdim(1)?.log()? + mx)?;

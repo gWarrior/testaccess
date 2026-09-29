@@ -155,6 +155,7 @@ pub struct Engine {
     gate_verdict: Vec<f32>,
     /// Ablation: all weight on the vocabulary, no copying.
     pub no_pointer: bool,
+    kv_step: Vec<f32>,
     ind_len: Vec<f32>,
     ind_count: Vec<f32>,
     ind_dist: Vec<f32>,
@@ -243,6 +244,7 @@ impl Engine {
             gate_b: vec("gate_b")?[0],
             gate_verdict: vec("gate_verdict")?,
             no_pointer: false,
+            kv_step: vec("kv_step")?,
             ind_len: vec("ind_len")?,
             ind_count: vec("ind_count")?,
             ind_dist: vec("ind_dist")?,
@@ -445,7 +447,7 @@ impl Engine {
         let xn = rms_gain(&x, &self.nm);
         let q = self.mq.apply(&xn);
         // Keys and values as two-trit vectors, as in training.
-        let (k, v) = (quant_act_vec(&self.mk.apply(&xn)), quant_act_vec(&self.mv.apply(&xn)));
+        let (k, v) = (quant_vec(&self.mk.apply(&xn), self.kv_step[0]), quant_vec(&self.mv.apply(&xn), self.kv_step[1]));
         s.recent.push_back(token);
         if s.recent.len() > crate::model::PROBE {
             s.recent.pop_front();
@@ -478,7 +480,12 @@ impl Engine {
         s.ring.push_back((token, k, v));
         let scale = 1.0 / (m as f32).sqrt();
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() * scale;
-        let mut scores: Vec<f32> = s.ring.iter().map(|(_, k, _)| dot(&q, k)).collect();
+        // Local attention over the last RING tokens (the current one and 242
+        // before it), as in training; the ring holds up to 8 more awaiting
+        // their move into the memory.
+        let off = s.ring.len().saturating_sub(RING);
+        let local = s.ring.len() - off;
+        let mut scores: Vec<f32> = s.ring.iter().skip(off).map(|(_, k, _)| dot(&q, k)).collect();
         let n_rows = s.rows.next.len();
         scores.extend((0..n_rows).map(|i| dot(&q, &s.rows.keys[i * m..(i + 1) * m])));
         let mx = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -488,12 +495,12 @@ impl Engine {
             z += *sc;
         }
         let mut o = vec![0f32; m];
-        for (i, (_, _, vv)) in s.ring.iter().enumerate() {
+        for (i, (_, _, vv)) in s.ring.iter().skip(off).enumerate() {
             let w = scores[i] / z;
             o.iter_mut().zip(vv).for_each(|(a, b)| *a += w * b);
         }
         for i in 0..n_rows {
-            let w = scores[s.ring.len() + i] / z;
+            let w = scores[local + i] / z;
             o.iter_mut().zip(&s.rows.values[i * m..(i + 1) * m]).for_each(|(a, b)| *a += w * b);
         }
         let mo = self.mo.apply(&o);
@@ -512,7 +519,7 @@ impl Engine {
             // reply never copies from itself.
             let first = s.pos + 1 - s.ring.len() as u64;
             let n_ring = s.ring.len() - 1;
-            let mut sc: Vec<(u32, f32)> = (0..n_ring)
+            let mut sc: Vec<(u32, f32)> = (off..n_ring)
                 .filter(|&i| first + i as u64 + 1 < s.reply_start)
                 .map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1)))
                 .collect();
@@ -547,10 +554,10 @@ impl Engine {
             gate = (null - mx).exp() / z;
             copy = sc.into_iter().filter(|e| e.0 != u32::MAX).map(|(t, v)| (t, (v - mx).exp() / z)).collect();
         }
-        // Tokens leave the local ring into the SNN memory nine at a time
-        // (the chunk stride), so every memory token is in a chunk, as in
-        // training, where whole windows are written.
-        if s.ring.len() > RING {
+        // Tokens leave the ring into the SNN memory nine at a time (the chunk
+        // stride), so every memory token is in a chunk, as in training where
+        // whole windows are written, and always older than the local window.
+        if s.ring.len() > RING + 8 {
             let (mut ts, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new());
             for _ in 0..9 {
                 let (t, k, v) = s.ring.pop_front().expect("ring is not empty");
@@ -577,9 +584,10 @@ impl Engine {
     }
 }
 
-/// Two-trit quantization of an activation row, as [`crate::layers::quant_act`].
-fn quant_act_vec(x: &[f32]) -> Vec<f32> {
-    let step = crate::layers::act_step(x, crate::layers::LEVELS);
+/// Two-trit quantization with the learned step `2^round(θ)`, as
+/// [`crate::layers::quant_shared`].
+fn quant_vec(x: &[f32], theta: f32) -> Vec<f32> {
+    let step = 2f32.powi(theta.round() as i32);
     let lv = crate::layers::LEVELS as f32;
     x.iter().map(|&v| (v / step).round().clamp(-lv, lv) * step).collect()
 }

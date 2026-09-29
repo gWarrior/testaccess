@@ -99,50 +99,23 @@ impl QTensor {
     }
 }
 
-/// Quantize an activation (e.g. a memory key) to `levels` per side along
-/// its last dimension, step `2^round(log2(c·mean|x|))` per row, as the SNN
-/// memory stores it; the gradient passes straight through.
-pub fn quant_act(x: &Tensor, levels: i32) -> Result<Tensor> {
-    x.contiguous()?.apply_op1(QuantAct { levels })
+/// Quantize an activation (e.g. a memory key) to `levels` per side with
+/// one learned step `2^round(θ)` for the whole tensor (`θ`: shape `(1,)`).
+/// The step does not depend on the data, so training and the engine, which
+/// compute the activation along different float paths, always agree on it;
+/// every row lies on the same power-of-two grid, which the K/V store keeps
+/// exactly. Gradients: clipped straight-through for `x`, LSQ for `θ`.
+pub fn quant_shared(x: &Tensor, theta: &Tensor, levels: i32) -> Result<Tensor> {
+    let dims = x.dims().to_vec();
+    let cols = *dims.last().expect("rank >= 1");
+    let rows = x.elem_count() / cols;
+    let th = theta.broadcast_as(rows)?.contiguous()?;
+    x.reshape((rows, cols))?.contiguous()?.apply_op2(&th, Quant { levels })?.reshape(dims)
 }
 
-/// The per-row step of [`quant_act`] (shared with the K/V store).
-pub fn act_step(row: &[f32], levels: i32) -> f32 {
-    let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len().max(1) as f64;
-    2f64.powi((mean * step_ratio(levels)).max(1e-30).log2().round() as i32) as f32
-}
-
-struct QuantAct {
-    levels: i32,
-}
-
-impl candle_core::CustomOp1 for QuantAct {
-    fn name(&self) -> &'static str {
-        "quant-act"
-    }
-
-    fn cpu_fwd(
-        &self,
-        s: &candle_core::CpuStorage,
-        l: &candle_core::Layout,
-    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        use rayon::prelude::*;
-        let x = cpu_tensor(s, l)?.flatten_all()?.to_vec1::<f32>()?;
-        let cols = *l.shape().dims().last().expect("rank >= 1");
-        let lv = self.levels as f32;
-        let mut out = vec![0f32; x.len()];
-        out.par_chunks_mut(cols).zip(x.par_chunks(cols)).for_each(|(o, row)| {
-            let step = act_step(row, self.levels);
-            for (o, &v) in o.iter_mut().zip(row) {
-                *o = (v / step).round().clamp(-lv, lv) * step;
-            }
-        });
-        Ok((candle_core::CpuStorage::F32(out), l.shape().clone()))
-    }
-
-    fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad: &Tensor) -> Result<Option<Tensor>> {
-        Ok(Some(grad.clone()))
-    }
+/// Initial θ of [`quant_shared`] for activations with mean |x| ≈ `mean_abs`.
+pub fn shared_theta0(mean_abs: f64, levels: i32) -> f64 {
+    (step_ratio(levels) * mean_abs).log2()
 }
 
 /// Quantize rows of `w` with steps `2^round(θ)`.

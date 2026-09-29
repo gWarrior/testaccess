@@ -31,7 +31,9 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 
-use crate::layers::{quant_act, HadamCell, Mlp, QTensor, Retention, RmsNorm, TLinear, LEVELS, LEVELS3};
+use crate::layers::{
+    quant_shared, shared_theta0, HadamCell, Mlp, QTensor, Retention, RmsNorm, TLinear, LEVELS, LEVELS3,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -265,6 +267,8 @@ pub struct Model {
     mk: TLinear,
     mv: TLinear,
     mo: TLinear,
+    /// Learned steps `2^round(θ)` of the two-trit memory keys and values.
+    kv_step: Tensor,
     verdict: Tensor,
     nout: RmsNorm,
     /// Pointer query (keys are the memory keys `mk`, so the SNN memory's
@@ -297,6 +301,8 @@ pub struct HeadOut {
     pub point: Tensor,
     /// Weight of the vocabulary distribution, the null column `(B, T)`.
     pub gate: Tensor,
+    /// `ln point`, exact even where a weight underflows.
+    pub log_point: Tensor,
 }
 
 /// Per-block values `(B, nb)` repeated over each block's positions `(B, T)`.
@@ -331,6 +337,8 @@ impl Model {
             mk: TLinear::new(vb.clone(), "mk", d, m)?,
             mv: TLinear::new(vb.clone(), "mv", d, m)?,
             mo: TLinear::new(vb.clone(), "mo", m, d)?,
+            // Keys/values start with mean |x| ≈ 0.8 (unit-variance projections).
+            kv_step: vb.get_with_hints(2, "kv_step", Init::Const(shared_theta0(0.8, LEVELS)))?,
             verdict: vb.get_with_hints((3, d), "verdict", Init::Const(0.0))?,
             nout: RmsNorm::new(vb.clone(), "nout", d)?,
             pq: TLinear::new(vb.clone(), "pq", d, m)?,
@@ -383,8 +391,8 @@ impl Model {
         let xn = self.nm.forward(&x)?;
         let q = self.mq.forward(&xn)?;
         // Keys and values as the SNN memory stores them: two trits each.
-        let k = quant_act(&self.mk.forward(&xn)?, LEVELS)?;
-        let v = quant_act(&self.mv.forward(&xn)?, LEVELS)?;
+        let k = quant_shared(&self.mk.forward(&xn)?, &self.kv_step.narrow(0, 0, 1)?, LEVELS)?;
+        let v = quant_shared(&self.mv.forward(&xn)?, &self.kv_step.narrow(0, 1, 1)?, LEVELS)?;
         Ok((Trunk { x, xn, q, k, v }, next))
     }
 
@@ -472,16 +480,16 @@ impl Model {
         let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + &gv)?;
         let ind = self.induction_logit(tr, mem, &logits, &verdict_ids, b, t, nb, blk)?;
         let cols = Tensor::cat(&[&p_prev, &p_local, &p_far, &ind.unsqueeze(2)?, &null.unsqueeze(2)?], 2)?;
-        let point = candle_nn::ops::softmax(&cols, D::Minus1)?;
-        let point = if self.ablation.no_pointer {
+        let log_point = if self.ablation.no_pointer {
             let l = 2 * t + mm + 2;
-            let null: Vec<f32> = (0..b * t * l).map(|i| if i % l == l - 1 { 1.0 } else { 0.0 }).collect();
+            let null: Vec<f32> = (0..b * t * l).map(|i| if i % l == l - 1 { 0.0 } else { -1e9 }).collect();
             Tensor::from_vec(null, (b, t, l), device)?
         } else {
-            point
+            candle_nn::ops::log_softmax(&cols, D::Minus1)?
         };
+        let point = log_point.exp()?;
         let gate = point.narrow(2, 2 * t + mm + 1, 1)?.squeeze(2)?;
-        Ok(HeadOut { logits, point, gate })
+        Ok(HeadOut { logits, point, gate, log_point })
     }
 
     /// The induction column's logit `(B, T)`, `-1e9` where nothing matched.
