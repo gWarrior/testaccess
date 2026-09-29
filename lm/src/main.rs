@@ -312,6 +312,7 @@ fn chat(args: &[String]) -> std::io::Result<()> {
         top_p: arg(args, "--top-p", &d.top_p.to_string()).parse().expect("--top-p"),
         presence: arg(args, "--presence", &d.presence.to_string()).parse().expect("--presence"),
         copy: arg(args, "--copy", &d.copy.to_string()).parse().expect("--copy"),
+        spare: Vec::new(),
     };
     let max_new: usize = arg(args, "--max-tokens", "81").parse().expect("--max-tokens");
     let memory_tokens: usize = arg(args, "--memory", "300000").parse().expect("--memory");
@@ -322,6 +323,8 @@ fn chat(args: &[String]) -> std::io::Result<()> {
     let packed =
         snn_lm::pack::PackedModel::load(std::io::BufReader::new(std::fs::File::open(dir.join("model.snnt"))?))?;
     let tok = load_tokenizer(&dir);
+    // Tokens of at most two letters are spared the presence penalty.
+    decoding.spare = (0..tok.vocab_size() as u32).map(|i| tok.decode(&[i]).trim().chars().count() <= 2).collect();
     let mut engine = snn_lm::infer::Engine::from_packed(&packed).map_err(std::io::Error::other)?;
     engine.no_pointer = arg(args, "--pointer", "on") == "off";
     let precision = kv_precision(args);
@@ -424,14 +427,17 @@ fn chat(args: &[String]) -> std::io::Result<()> {
             recent.push(t);
             let text = tok.decode(&out);
             parts = engine.step_parts(&mut session, t);
-            // A line break ends the answer, but not before it has begun.
-            if text.ends_with('\n') && !text.trim().is_empty() {
+            // A line break ends the answer, but not before it has begun; in
+            // dialogue so does ", -" (the author's words follow: ", - сказал он").
+            if (text.ends_with('\n') || (dialog && text.trim_end().ends_with(", -"))) && !text.trim().is_empty() {
                 break;
             }
         }
         // The token limit can cut a multibyte character in half.
         session.reply_start = u64::MAX;
-        println!("{}", tok.decode(&out).trim().trim_end_matches('\u{FFFD}'));
+        let shown = tok.decode(&out);
+        let shown = shown.trim().trim_end_matches('\u{FFFD}');
+        println!("{}", if dialog { shown.trim_end_matches(", -") } else { shown });
         // Close the turn so the model sees a clean line break.
         if !tok.decode(&out).ends_with('\n') {
             for t in tok.encode("\n") {

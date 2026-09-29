@@ -804,11 +804,15 @@ pub struct Decoding {
     pub presence: f32,
     /// Weight of the induction copy at a match of 8 tokens or more.
     pub copy: f32,
+    /// Tokens the presence penalty spares (by id; empty = none): short
+    /// function tokens — " я", ",", " и" — recur in any sentence, and
+    /// penalizing them drove replies into "я, я, я".
+    pub spare: Vec<bool>,
 }
 
 impl Default for Decoding {
     fn default() -> Self {
-        Self { temperature: 0.8, top_p: 0.9, presence: 0.5, copy: 0.5 }
+        Self { temperature: 0.8, top_p: 0.9, presence: 0.5, copy: 0.5, spare: Vec::new() }
     }
 }
 
@@ -835,7 +839,11 @@ impl Decoding {
         let mut seen: Vec<u32> = reply.to_vec();
         seen.sort_unstable();
         seen.dedup();
-        let penalized: Vec<(u32, f32)> = seen.iter().map(|&t| (t, self.presence)).collect();
+        let penalized: Vec<(u32, f32)> = seen
+            .iter()
+            .filter(|&&t| !self.spare.get(t as usize).copied().unwrap_or(false))
+            .map(|&t| (t, self.presence))
+            .collect();
         let mut p = parts.probs(self.temperature, self.top_p, &penalized);
         // No 4-gram the model has already said.
         let mut banned = Vec::new();
@@ -940,7 +948,7 @@ mod tests {
         let p = parts.probs(1.0, 0.5, &[]);
         assert!(p[1] == 0.0 && p[2] == 0.0 && p[0] > 0.59);
         // After "0 1 2 … 0 1 2", token 3 would repeat the 4-gram "0 1 2 3".
-        let d = Decoding { temperature: 1.0, top_p: 1.0, presence: 0.0, copy: 0.0 };
+        let d = Decoding { temperature: 1.0, top_p: 1.0, presence: 0.0, copy: 0.0, spare: Vec::new() };
         let only3 = Parts { logits: vec![0.0; 4], gate: 0.0, copy: vec![(3, 1.0)] };
         let mut rng = snn_memory::rng::SplitMix64::new(1);
         let none = std::collections::HashSet::new();
