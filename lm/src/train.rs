@@ -844,9 +844,12 @@ pub fn train(
             }
             Ok(())
         };
-        if cfg.val_every > 0 && ((step + 1) % cfg.val_every == 0 || step + 1 == cfg.steps) && !val.is_empty() {
+        // The last step, by count or by the time limit.
+        let time_up = cfg.time_limit > 0 && clock.elapsed().as_secs() >= cfg.time_limit;
+        let last = step + 1 == cfg.steps || time_up;
+        if cfg.val_every > 0 && ((step + 1) % cfg.val_every == 0 || last) && !val.is_empty() {
             let t0 = Instant::now();
-            let last = crate::eval::val_loss_fitted(model.clone(), val, 9, 27, cfg.memory, KvPrecision::Trit2)?;
+            let now = crate::eval::val_loss_fitted(model.clone(), val, 9, 27, cfg.memory, KvPrecision::Trit2)?;
             let avg = if ema.is_empty() {
                 f64::NAN
             } else {
@@ -861,20 +864,17 @@ pub fn train(
                 drop(data);
                 crate::eval::val_loss_fitted(m, val, 9, 27, cfg.memory, KvPrecision::Trit2)?
             };
-            println!("val: step {} loss {last:.4} ema {avg:.4} ({:.0}s)", step + 1, t0.elapsed().as_secs_f64());
+            println!("val: step {} loss {now:.4} ema {avg:.4} ({:.0}s)", step + 1, t0.elapsed().as_secs_f64());
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("val.tsv"))?;
             use std::io::Write as _;
-            writeln!(f, "{}\t{last:.4}\t{avg:.4}", step + 1)?;
+            writeln!(f, "{}\t{now:.4}\t{avg:.4}", step + 1)?;
         }
-        if (step + 1) % cfg.ckpt_every == 0 || step + 1 == cfg.steps {
+        if (step + 1) % cfg.ckpt_every == 0 || last {
             save_ema()?;
             varmap.save(&ckpt)?;
             std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
         }
-        if cfg.time_limit > 0 && clock.elapsed().as_secs() >= cfg.time_limit {
-            save_ema()?;
-            varmap.save(&ckpt)?;
-            std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
+        if time_up {
             println!("time limit reached at step {}", step + 1);
             break;
         }
