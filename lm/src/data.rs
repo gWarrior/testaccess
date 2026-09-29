@@ -165,12 +165,12 @@ mod tests {
 /// Long-range recall episodes woven into a token stream. Each states
 /// something once and asks for it `D` tokens later:
 ///
-/// * a secret word: `Секретное слово — X.` … `Какое было секретное слово? — X.`
-///   or, copyable, `Секретное слово — X.`;
+/// * a secret word: `Секретное слово - X.` … `Какое было секретное слово? - X.`
+///   or, copyable, `Секретное слово - X.`;
 /// * facts of an invented person — name, town, pet, sometimes a friend —
 ///   asked with the statement's own words (`Меня зовут` → name) or with
-///   one of several paraphrased questions (`Как меня зовут? —` → name);
-/// * `Кто такой N? —`: ` мой друг.` if N was named as the friend, ` не
+///   one of several paraphrased questions (`Как меня зовут? -` → name);
+/// * `Кто такой N? -`: ` мой друг.` if N was named as the friend, ` не
 ///   знаю.` for a name never stated (the memory's "точно нет").
 ///
 /// The answer can only be produced by remembering the statement.
@@ -295,18 +295,18 @@ impl Episodes {
             (
                 e(&format!("\n{acc} зовут")),
                 many(&[
-                    &format!("\nКак зовут {acc_lower}? —"),
-                    &format!("\nКличка {gen}? —"),
-                    &format!("\nНапомни, как зовут {acc_lower}? —"),
+                    &format!("\nКак зовут {acc_lower}? -"),
+                    &format!("\nКличка {gen}? -"),
+                    &format!("\nНапомни, как зовут {acc_lower}? -"),
                     // Held out: only the evaluation asks this way (another
                     // construction, not just another first word).
-                    &format!("\nИмя у {gen} какое? —"),
+                    &format!("\nИмя у {gen} какое? -"),
                 ]),
             )
         })
         .collect();
-        let intros = many(&["\nСекретное слово —", "\nЗапомни пароль:", "\nКод доступа:"]);
-        let questions = many(&["\nКакое было секретное слово? —", "\nКакой был пароль? —", "\nНапомни код доступа:"]);
+        let intros = many(&["\nСекретное слово -", "\nЗапомни пароль:", "\nКод доступа:"]);
+        let questions = many(&["\nКакое было секретное слово? -", "\nКакой был пароль? -", "\nНапомни код доступа:"]);
         Self {
             keys,
             intros,
@@ -317,28 +317,28 @@ impl Episodes {
             friend: e("\nМоего друга зовут"),
             ask_name: (
                 e("\nМеня зовут"),
-                many(&["\nКак меня зовут? —", "\nНапомни, как меня зовут? —", "\nМоё имя? —", "\nИмя у меня какое? —"]),
+                many(&["\nКак меня зовут? -", "\nНапомни, как меня зовут? -", "\nМоё имя? -", "\nИмя у меня какое? -"]),
             ),
             ask_town: (
                 e("\nЯ живу в городе"),
                 many(&[
-                    "\nВ каком городе я живу? —",
-                    "\nГде я живу? —",
-                    "\nНапомни, в каком городе я живу? —",
-                    "\nНазови мой город? —",
+                    "\nВ каком городе я живу? -",
+                    "\nГде я живу? -",
+                    "\nНапомни, в каком городе я живу? -",
+                    "\nНазови мой город? -",
                 ]),
             ),
             ask_friend: (
                 e("\nМоего друга зовут"),
                 many(&[
-                    "\nКак зовут моего друга? —",
-                    "\nИмя моего друга? —",
-                    "\nНапомни, как зовут моего друга? —",
-                    "\nДруг мой — кто он по имени? —",
+                    "\nКак зовут моего друга? -",
+                    "\nИмя моего друга? -",
+                    "\nНапомни, как зовут моего друга? -",
+                    "\nДруг мой - кто он по имени? -",
                 ]),
             ),
             pets,
-            who: (e("\nКто такой"), e("? —")),
+            who: (e("\nКто такой"), e("? -")),
             my_friend: e(" мой друг.\n"),
             dont_know: e(" не знаю.\n"),
             end: e(".\n"),
