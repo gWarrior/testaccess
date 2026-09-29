@@ -60,7 +60,7 @@ impl QTensor {
     }
 
     pub fn q(&self) -> Result<Tensor> {
-        self.w.contiguous()?.apply_op2(&self.theta.contiguous()?, Quant { levels: self.levels })
+        self.w.contiguous()?.apply_op2(&self.theta.contiguous()?, Quant { levels: self.levels, rows_sharing: 1 })
     }
 
     /// Integer levels and per-row exponents (the packed form).
@@ -110,7 +110,7 @@ pub fn quant_shared(x: &Tensor, theta: &Tensor, levels: i32) -> Result<Tensor> {
     let cols = *dims.last().expect("rank >= 1");
     let rows = x.elem_count() / cols;
     let th = theta.broadcast_as(rows)?.contiguous()?;
-    x.reshape((rows, cols))?.contiguous()?.apply_op2(&th, Quant { levels })?.reshape(dims)
+    x.reshape((rows, cols))?.contiguous()?.apply_op2(&th, Quant { levels, rows_sharing: rows })?.reshape(dims)
 }
 
 /// Initial θ of [`quant_shared`] for activations with mean |x| ≈ `mean_abs`.
@@ -118,9 +118,11 @@ pub fn shared_theta0(mean_abs: f64, levels: i32) -> f64 {
     (step_ratio(levels) * mean_abs).log2()
 }
 
-/// Quantize rows of `w` with steps `2^round(θ)`.
+/// Quantize rows of `w` with steps `2^round(θ)`. `rows_sharing` rows share
+/// one θ (a broadcast): the LSQ gradient is scaled by `1/√rows_sharing` too.
 struct Quant {
     levels: i32,
+    rows_sharing: usize,
 }
 
 impl candle_core::CustomOp2 for Quant {
@@ -157,8 +159,8 @@ impl candle_core::CustomOp2 for Quant {
         let tv = theta.detach().to_vec1::<f32>()?;
         let gv = g.detach().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
         let lv = self.levels as f32;
-        // LSQ gradient scale: 1 / sqrt(cols · levels).
-        let scale = 1.0 / ((cols as f32) * lv).sqrt();
+        // LSQ gradient scale: 1 / sqrt(elements per step · levels).
+        let scale = 1.0 / ((cols * self.rows_sharing) as f32 * lv).sqrt();
         let mut gw = vec![0f32; rows * cols];
         let gt: Vec<f32> = gw
             .par_chunks_mut(cols)
@@ -191,6 +193,7 @@ pub fn ste_sign(w: &Tensor) -> Result<Tensor> {
 }
 
 /// Linear map `x · Wᵀ` with a two-trit weight.
+#[derive(Clone)]
 pub struct TLinear {
     pub w: QTensor,
 }
@@ -260,6 +263,7 @@ pub fn matmul_2d(x: &Tensor, w: &Tensor) -> Result<Tensor> {
 }
 
 /// Root-mean-square normalisation with a learned gain.
+#[derive(Clone)]
 pub struct RmsNorm {
     w: Tensor,
 }
@@ -310,6 +314,7 @@ pub fn hadamard(n: usize, device: &Device) -> Result<Tensor> {
 /// learned binary sign per unit and `g ∈ (0, 1)` a learned gain. With
 /// `g = 1` the recurrence is exactly orthogonal, which keeps gradients from
 /// exploding or vanishing over long sequences.
+#[derive(Clone)]
 pub struct HadamCell {
     wu: TLinear,
     wz: TLinear,
@@ -449,6 +454,7 @@ impl candle_core::CustomOp2 for HadamScan {
 ///
 /// Computed in parallel inside a window (`O(T²)` with a decay mask) with
 /// the state carried between windows, so the cost per token is constant.
+#[derive(Clone)]
 pub struct Retention {
     wq: TLinear,
     wk: TLinear,
@@ -524,6 +530,7 @@ impl Retention {
 }
 
 /// Gated MLP (SwiGLU).
+#[derive(Clone)]
 pub struct Mlp {
     w1: TLinear,
     w3: TLinear,

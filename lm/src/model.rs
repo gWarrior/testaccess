@@ -57,6 +57,7 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone)]
 struct Layer {
     n1: RmsNorm,
     cell: HadamCell,
@@ -257,6 +258,9 @@ pub const PROBE: usize = 9;
 /// Bins of the induction match length (see [`IndCand::len_bin`]).
 pub const LEN_BINS: usize = 8;
 
+/// Cloning shares every parameter (tensors are reference-counted), so
+/// clones accumulate gradients into the same variables.
+#[derive(Clone)]
 pub struct Model {
     pub cfg: Config,
     pub ablation: Ablation,

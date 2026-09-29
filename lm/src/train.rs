@@ -48,6 +48,9 @@ pub struct TrainConfig {
     /// Probability per token of a re-reading episode and of an episode.
     pub p_reread: f64,
     pub p_episode: f64,
+    /// Streams per group (gradients accumulate over groups; peak memory
+    /// scales with the group).
+    pub micro: usize,
     /// Weight of the auxiliary pointer loss per answer / re-read token,
     /// relative to a token's mixture loss (template answers get none).
     pub aux: f64,
@@ -78,6 +81,7 @@ impl Default for TrainConfig {
             p_reread: 1.0 / 2187.0,
             p_episode: 1.0 / 729.0,
             aux: 1.0,
+            micro: 3,
         }
     }
 }
@@ -103,13 +107,17 @@ pub const IND_EXT: usize = 27;
 /// Keeps the last `limit` tokens.
 pub struct Induction {
     tokens: Vec<u32>,
-    /// n-gram hash → (last end position, occurrences).
-    index: std::collections::HashMap<u64, (u32, u32)>,
+    /// 32-bit n-gram fingerprint → (last end position, occurrences). A
+    /// match is verified token by token, so a fingerprint collision can only
+    /// merge two counts; 32-bit keys make the index 2.7× smaller.
+    index: std::collections::HashMap<u32, (u32, u32)>,
     limit: usize,
 }
 
-pub fn ngram_key(g: &[u32]) -> u64 {
-    g.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ g.len() as u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100_0000_01b3))
+pub fn ngram_key(g: &[u32]) -> u32 {
+    let h =
+        g.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ g.len() as u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100_0000_01b3));
+    (h ^ (h >> 32)) as u32
 }
 
 impl Induction {
@@ -377,6 +385,12 @@ impl Runner {
         }
     }
 
+    /// Whether some pointer column holds each target `(B·T)`.
+    pub fn findable(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Vec<bool> {
+        let Ok((b, t, l)) = out.point.dims3() else { return vec![false; y.len()] };
+        (0..b * t).map(|r| (0..l).any(|col| self.column_token(out, x, t, r / t, r % t, col) == y[r])).collect()
+    }
+
     /// Per-token loss of the mixture `a_null·p_vocab + Σ a·[next]`, `(B·T,)`.
     pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
         Ok(self.losses_and_pointer(out, x, y)?.0)
@@ -474,6 +488,14 @@ impl Runner {
     }
 }
 
+/// Resident memory of this process in GB (Linux).
+fn rss_gb() -> f64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<f64>().ok()))
+        .map_or(0.0, |pages| pages * 4096.0 / 1e9)
+}
+
 /// Per-token cross entropy `(N,)` of logits `(B, T, V)` against targets.
 pub fn token_losses(logits: &Tensor, targets: &[u32]) -> Result<Tensor> {
     let (b, t, v) = logits.dims3()?;
@@ -521,6 +543,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     let device = Device::Cpu;
     std::fs::create_dir_all(&cfg.out)?;
     std::fs::write(cfg.out.join("model.cfg"), format!("ternary_h={}\n", u8::from(mcfg.ternary_h)))?;
+    println!("rss at start (corpus loaded): {:.2} GB", rss_gb());
     let mut varmap = VarMap::new();
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), mcfg.clone())?;
     let ckpt = cfg.out.join("model.safetensors");
@@ -556,20 +579,36 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     println!("parameters: {}", Model::n_params(&vars));
     // Quantization steps θ move 27× slower: Adam normalizes their gradient,
     // and a crossing of a rounding boundary rescales a whole row.
-    let (steps, weights): (Vec<_>, Vec<_>) = {
-        let data = varmap.data().lock().expect("varmap lock");
-        data.iter().map(|(n, v)| (n.ends_with("_step"), v.clone())).partition(|(is_step, _)| *is_step)
-    };
-    let steps: Vec<candle_core::Var> = steps.into_iter().map(|(_, v)| v).collect();
-    let weights: Vec<candle_core::Var> = weights.into_iter().map(|(_, v)| v).collect();
+    // The K/V step (one θ for many activations) moves at lr/3.
+    let (mut weights, mut steps, mut kv) = (Vec::new(), Vec::new(), Vec::new());
+    for (n, v) in varmap.data().lock().expect("varmap lock").iter() {
+        if n == "kv_step" {
+            kv.push(v.clone());
+        } else if n.ends_with("_step") {
+            steps.push(v.clone());
+        } else {
+            weights.push(v.clone());
+        }
+    }
     let mut opt = AdamW::new(weights, ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
     let mut opt_steps = AdamW::new(steps, ParamsAdamW { lr: cfg.lr / 27.0, weight_decay: 0.0, ..Default::default() })?;
+    let mut opt_kv = AdamW::new(kv, ParamsAdamW { lr: cfg.lr / 3.0, weight_decay: 0.0, ..Default::default() })?;
 
     let (b, t) = (cfg.batch, cfg.window);
+    // Streams run in groups of `micro` (gradients accumulate): the autograd
+    // graph of one group is freed before the next, so the peak memory of a
+    // step is a third of the whole batch's.
+    let micro = cfg.micro.clamp(1, b);
+    assert!(b % micro == 0, "batch {b} is not a multiple of micro {micro}");
     // Two-trit K/V, exactly as inference stores them.
-    let mut runner = Runner::new(model, b, cfg.memory, cfg.max_tokens, KvPrecision::Trit2, &device)?;
-    runner.top_k = cfg.top_k;
-    runner.rows = cfg.rows;
+    let mut runners = (0..b / micro)
+        .map(|_| {
+            let mut r = Runner::new(model.clone(), micro, cfg.memory, cfg.max_tokens, KvPrecision::Trit2, &device)?;
+            r.top_k = cfg.top_k;
+            r.rows = cfg.rows;
+            Ok(r)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let ep = Episodes::new(tok);
     let region = tokens.len() / b;
     let mut streams: Vec<TaskStream> =
@@ -578,8 +617,9 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         s.jump = cfg.jump;
         s.p_reread = cfg.p_reread;
         s.p_episode = cfg.p_episode;
-        // Episodes and re-reading reach as far as the training memory.
-        s.distance = (27, cfg.max_tokens.max(243));
+        // Episodes and re-reading reach as far as the training memory,
+        // minus two windows, so a statement is still in memory when asked.
+        s.distance = (27, cfg.max_tokens.saturating_sub(2 * 243).max(243));
     }
     // Resuming fast-forwards the streams, so data is not repeated.
     for s in &mut streams {
@@ -588,17 +628,22 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         }
     }
 
+    println!("rss after setup: {:.2} GB", rss_gb());
     let clock = Instant::now();
     let (mut sum_loss, mut sum_known, mut sum_blocks, mut n_steps, mut n_logged) =
         (0f64, 0usize, 0usize, 0usize, 0usize);
     // Mean loss per token kind: plain text, fact answers, re-read spans, templates.
     let mut by_kind = [(0f64, 0usize); 4];
+    // Fact answers some pointer column could copy.
+    let mut found = (0usize, 0usize);
     let mut timing = [0f64; 4];
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("log.tsv"))?;
+    let n = (b * t) as f64;
     for step in start_step..cfg.steps {
         let lr = lr_at(cfg, step, clock.elapsed().as_secs_f64());
         opt.set_learning_rate(lr);
         opt_steps.set_learning_rate(lr / 27.0);
+        opt_kv.set_learning_rate(lr / 3.0);
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
         let mut kinds = Vec::with_capacity(b * t);
@@ -608,44 +653,80 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             y.extend_from_slice(&w[1..]);
             kinds.extend_from_slice(&k[1..]);
         }
-        let t0 = Instant::now();
-        let (out, next) = runner.forward(&x, t, &device)?;
-        let (losses, pointer) = runner.losses_and_pointer(&out, &x, &y)?;
-        // Auxiliary pointer loss where the answer is in the context (episode
-        // answers, re-read spans): teaches the pointer to find the row
-        // instead of leaning on the vocabulary.
-        let mask: Vec<f32> =
-            kinds.iter().map(|&k| f32::from(k == crate::data::ANSWER || k == crate::data::REREAD)).collect();
-        let mask = Tensor::from_vec(mask, kinds.len(), &device)?;
-        let aux = ((pointer * mask)?.sum_all()? * (cfg.aux / kinds.len() as f64))?;
-        let loss = (losses.mean_all()? + aux)?;
-        let t1 = Instant::now();
-        let loss_value = loss.to_scalar::<f32>()?;
-        let mut grads = loss.backward()?;
+        let mut grads: Option<candle_core::backprop::GradStore> = None;
+        let mut loss_value = 0f32;
+        let mut lv = Vec::with_capacity(b * t);
+        for (gi, runner) in runners.iter_mut().enumerate() {
+            let r = gi * micro * t..(gi + 1) * micro * t;
+            let (xs, ys, ks) = (&x[r.clone()], &y[r.clone()], &kinds[r]);
+            let t0 = Instant::now();
+            let (out, next) = runner.forward(xs, t, &device)?;
+            let (losses, pointer) = runner.losses_and_pointer(&out, xs, ys)?;
+            // Auxiliary pointer loss where the answer is in the context (fact
+            // answers, re-read spans) and some column holds it — otherwise it
+            // would pull the pointer towards uniform: teaches the pointer to
+            // find the row instead of leaning on the vocabulary.
+            let findable = runner.findable(&out, xs, ys);
+            let mask: Vec<f32> = ks
+                .iter()
+                .zip(&findable)
+                .map(|(&k, &f)| f32::from((k == crate::data::ANSWER || k == crate::data::REREAD) && f))
+                .collect();
+            for (&k, &f) in ks.iter().zip(&findable) {
+                if k == crate::data::ANSWER {
+                    found.0 += usize::from(f);
+                    found.1 += 1;
+                }
+            }
+            let mask = Tensor::from_vec(mask, ks.len(), &device)?;
+            let aux = ((pointer * mask)?.sum_all()? * (cfg.aux / n))?;
+            let loss = ((losses.sum_all()? / n)? + aux)?;
+            let t1 = Instant::now();
+            loss_value += loss.to_scalar::<f32>()?;
+            let g = loss.backward()?;
+            let t2 = Instant::now();
+            grads = Some(match grads {
+                None => g,
+                Some(mut total) => {
+                    for v in &vars {
+                        if let Some(gv) = g.get(v.as_tensor()) {
+                            let sum = match total.remove(v.as_tensor()) {
+                                Some(tv) => (tv + gv)?,
+                                None => gv.clone(),
+                            };
+                            total.insert(v.as_tensor(), sum);
+                        }
+                    }
+                    total
+                }
+            });
+            lv.extend(losses.to_vec1::<f32>()?);
+            sum_known += out.known;
+            sum_blocks += out.blocks;
+            // Commit now: the group's graph is freed before the next group.
+            runner.commit(xs, t, &out, next)?;
+            for (acc, d) in timing.iter_mut().zip([t1 - t0, t2 - t1]) {
+                *acc += d.as_secs_f64();
+            }
+        }
+        let mut grads = grads.expect("at least one group");
         let t2 = Instant::now();
         let norm = clip(&mut grads, &vars, cfg.clip)?;
         if !loss_value.is_finite() || !norm.is_finite() {
             // Never let a non-finite update into the weights.
             println!("step {}: skipped (loss {loss_value}, grad norm {norm})", step + 1);
-            runner.commit(&x, t, &out, next)?;
             continue;
         }
         opt.step(&grads)?;
         opt_steps.step(&grads)?;
-        let t3 = Instant::now();
-        runner.commit(&x, t, &out, next)?;
-        for (acc, d) in timing.iter_mut().zip([t1 - t0, t2 - t1, t3 - t2, t3.elapsed()]) {
-            *acc += d.as_secs_f64();
-        }
+        opt_kv.step(&grads)?;
+        timing[2] += t2.elapsed().as_secs_f64();
 
-        let lv = losses.to_vec1::<f32>()?;
         sum_loss += lv.iter().map(|&l| l as f64).sum::<f64>() / lv.len() as f64;
         for (l, &k) in lv.iter().zip(&kinds) {
             by_kind[k as usize].0 += *l as f64;
             by_kind[k as usize].1 += 1;
         }
-        sum_known += out.known;
-        sum_blocks += out.blocks;
         n_steps += 1;
         n_logged += 1;
 
@@ -672,12 +753,14 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             writeln!(log, "{line}")?;
             (sum_loss, sum_known, sum_blocks, n_logged) = (0.0, 0, 0, 0);
             by_kind = [(0.0, 0); 4];
+            println!("answers findable: {:.3} | rss {:.2} GB", found.0 as f64 / found.1.max(1) as f64, rss_gb());
+            found = (0, 0);
             timing = [0.0; 4];
         }
         if (step + 1) % (cfg.log_every * 9) == 0 {
             let (mut zero, mut clipped, mut err, mut n) = (0.0, 0.0, 0.0, 0.0);
             let (mut drift, mut rows) = (0usize, 0usize);
-            for (_, q) in runner.model.qtensors() {
+            for (_, q) in runners[0].model.qtensors() {
                 let (z, c, e) = q.health()?;
                 (zero, clipped, err, n) = (zero + z, clipped + c, err + e, n + 1.0);
                 // Rows whose learned exponent differs from the MSE-optimal one.
@@ -695,7 +778,7 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
                 })
             };
             println!(
-                "head: {} | {} | {} | {} | {} | {} | {} | {}",
+                "head: {} | {} | {} | {} | {} | {} | {} | {} | {}",
                 show("gate_verdict"),
                 show("ind_verdict"),
                 show("far_verdict"),
@@ -703,7 +786,8 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
                 show("ind_len"),
                 show("ind_count"),
                 show("ind_dist"),
-                show("ind_p")
+                show("ind_p"),
+                show("kv_step")
             );
             drop(data);
             println!(

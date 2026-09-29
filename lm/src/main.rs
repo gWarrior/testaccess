@@ -108,6 +108,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         p_reread: arg(args, "--p-reread", &d.p_reread.to_string()).parse().expect("--p-reread"),
         max_tokens: arg(args, "--mem-train", &d.max_tokens.to_string()).parse().expect("--mem-train"),
         aux: arg(args, "--aux", &d.aux.to_string()).parse().expect("--aux"),
+        micro: arg(args, "--micro", &d.micro.to_string()).parse().expect("--micro"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");

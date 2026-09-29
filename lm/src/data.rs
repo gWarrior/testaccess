@@ -53,15 +53,43 @@ pub fn write_tokens(path: &Path, docs: &[Vec<u32>]) -> io::Result<usize> {
 
 /// Token ids loaded from a `u16` file.
 pub struct TokenFile {
-    pub tokens: Vec<u16>,
+    pub tokens: Tokens,
+}
+
+/// Token ids of a prepared file: memory-mapped (on little-endian hosts),
+/// so a 440M-token corpus lives in the OS page cache, shared by every
+/// process, instead of 0.9 GB of private memory per training run.
+pub enum Tokens {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u16>),
+}
+
+impl std::ops::Deref for Tokens {
+    type Target = [u16];
+
+    fn deref(&self) -> &[u16] {
+        match self {
+            // SAFETY: the map is page-aligned (so aligned for u16), read-only
+            // and lives as long as `self`; its length is truncated to whole
+            // u16s; the file's little-endian u16s are native on this host.
+            Self::Mapped(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<u16>(), m.len() / 2) },
+            Self::Owned(v) => v,
+        }
+    }
 }
 
 impl TokenFile {
     pub fn load(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        if cfg!(target_endian = "little") {
+            // SAFETY: the prepared file is not modified while mapped.
+            let map = unsafe { memmap2::Mmap::map(&file)? };
+            return Ok(Self { tokens: Tokens::Mapped(map) });
+        }
         let mut bytes = Vec::new();
-        File::open(path)?.read_to_end(&mut bytes)?;
+        (&file).read_to_end(&mut bytes)?;
         let tokens = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        Ok(Self { tokens })
+        Ok(Self { tokens: Tokens::Owned(tokens) })
     }
 
     pub fn len(&self) -> usize {
@@ -270,8 +298,9 @@ impl Episodes {
                     &format!("\nКак зовут {acc_lower}? —"),
                     &format!("\nКличка {gen}? —"),
                     &format!("\nНапомни, как зовут {acc_lower}? —"),
-                    // Held out: only the evaluation asks this way.
-                    &format!("\nСкажи, как зовут {acc_lower}? —"),
+                    // Held out: only the evaluation asks this way (another
+                    // construction, not just another first word).
+                    &format!("\nИмя у {gen} какое? —"),
                 ]),
             )
         })
@@ -288,12 +317,7 @@ impl Episodes {
             friend: e("\nМоего друга зовут"),
             ask_name: (
                 e("\nМеня зовут"),
-                many(&[
-                    "\nКак меня зовут? —",
-                    "\nНапомни, как меня зовут? —",
-                    "\nМоё имя? —",
-                    "\nСкажи, как меня зовут? —",
-                ]),
+                many(&["\nКак меня зовут? —", "\nНапомни, как меня зовут? —", "\nМоё имя? —", "\nИмя у меня какое? —"]),
             ),
             ask_town: (
                 e("\nЯ живу в городе"),
@@ -310,7 +334,7 @@ impl Episodes {
                     "\nКак зовут моего друга? —",
                     "\nИмя моего друга? —",
                     "\nНапомни, как зовут моего друга? —",
-                    "\nСкажи, как зовут моего друга? —",
+                    "\nДруг мой — кто он по имени? —",
                 ]),
             ),
             pets,
@@ -504,7 +528,7 @@ impl TaskStream {
         let out = self.next_raw(tokens, ep);
         if self.p_reread > 0.0 {
             self.past.push_back(out.0);
-            if self.past.len() > self.distance.1 + 81 {
+            if self.past.len() > self.distance.1 {
                 self.past.pop_front();
             }
         }
