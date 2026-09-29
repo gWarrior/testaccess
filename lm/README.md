@@ -72,13 +72,80 @@ h_t = tanh(h_{t−1} · diag(s) H / √d ⊙ g + W_u x_t),   y_t = h_t ⊙ σ(W_
 ```bash
 lm/data/fetch.sh                                        # корпус (см. lm/data/README.md)
 cargo run --release -p snn-lm -- prepare                # BPE + токенизация
-cargo run --release -p snn-lm -- train --hours 3        # обучение
+scripts/build-native.sh                                 # необязательно: сборка под этот CPU
+cargo run --release -p snn-lm -- train --hours 3 --out /home/user/data/v4a  # обучение (повтор команды — продолжение)
 cargo run --release -p snn-lm -- ngram --tokens 6000000 # биграмм / триграмм на тех же данных
 cargo run --release -p snn-lm -- eval                   # лосс на валидации с памятью и без
 cargo run --release -p snn-lm -- recall                 # секретное слово на 243 … 300 000 токенов
 cargo run --release -p snn-lm -- export                 # → lm/model/model.snnt
 cargo run --release -p snn-lm -- chat                   # консольный диалог
 ```
+
+Подробная инструкция (корпус, сборка, запуск, возобновление): [docs/training.md](../docs/training.md).
+
+## Флаги
+
+Все команды: `snn-lm <команда> [--флаг значение …]`. Пути по умолчанию —
+`/home/user/data/…` (`--data` — каталог `prepare`, `--run` — каталог прогона).
+
+**Сборка (необязательные режимы):**
+
+| Как | Что даёт |
+|---|---|
+| `scripts/build-native.sh` | `-C target-cpu=native` → `target/native/release/snn-lm` (AVX-512 и т.д., +8% к скорости обучения на Xeon); бинарник только для таких же CPU |
+| `--features vnni` | целочисленное ядро тернарных матриц движка на AVX-512 VNNI (int16 × int16 → i32, `vpdpwssd`, активация — старшая часть + остаток, ошибка ≤10⁻⁶), в 7–21 раз быстрее; CPU проверяется при запуске, иначе — ядро «сдвиг-сложение» |
+
+**`prepare`** — корпус → BPE и токены.
+
+| Флаг | По умолчанию | |
+|---|---|---|
+| `--src` | `/home/user/data/taiga` | `*.parquet` Taiga и `extra/*.txt` |
+| `--out` | `/home/user/data/prepared` | куда писать `tokenizer.bpe`, `train.bin`, `val.bin` |
+| `--vocab` | 6561 | размер словаря (3⁸) |
+| `--sample-mb` | 64 | объём выборки для обучения BPE |
+
+**`train`** — обучение (возобновляется той же командой из `<out>/resume/`).
+
+| Флаг | По умолчанию | |
+|---|---|---|
+| `--data`, `--out` | `prepared`, `/home/user/data/run` | данные и каталог прогона |
+| `--hours` | 0 | лимит времени; lr-косинус идёт по времени (0 — по `--steps`) |
+| `--steps` | 59049 | длина расписания в шагах |
+| `--lr`, `--warmup` | 3e-3, 27 | lr весов (шаги θ — lr/27, K/V-шаг — lr/3), разогрев в шагах |
+| `--batch`, `--micro` | 27, 3 | потоков в шаге и в группе накопления градиента (память ∝ `--micro`) |
+| `--seed` | 1 | сид потоков данных |
+| `--layers`, `--mlp` | 4, 1458 | число слоёв и ширина SwiGLU (пишется в `model.cfg`) |
+| `--state-trits` | 0 | квантование состояния HadamRNN: 0 — float, 1 — трит, 2 — два трита |
+| `--memory` | on | SNN-память при обучении |
+| `--mem-train` | 177147 | окно памяти потока при обучении (3¹¹) |
+| `--jump` | on | после документа — прыжок в случайный документ корпуса (с фильтром стихов) |
+| `--p-episode`, `--p-reread` | 1/729, 1/2187 | вероятность эпизода-факта и повторного чтения на токен |
+| `--aux` | 1.0 | вес вспомогательной потери указателя |
+| `--ema` | 1−1/729 | затухание EMA весов (0 — выкл.) |
+| `--val-every` | 729 | замер val-loss весов и EMA + снимок в `snapshots/` (0 — выкл.) |
+| `--log-every` | 9 | строка лога каждые N шагов |
+| `--init` | — | тёплый старт из `model.safetensors` другого прогона |
+
+**Оценка** (`eval`, `recall`, `reread`, `ablate`, `export`) — общие флаги:
+`--data`, `--run`, `--weights last|ema` (последние веса или EMA),
+`--kv trit2|ternary|f16` (точность K/V памяти, по умолчанию trit2).
+
+| Команда | Флаги |
+|---|---|
+| `eval` | `--windows 27` — окон по 243 токена на поток (27 потоков) |
+| `recall` | `--episodes secret\|same\|paraphrase\|who`, `--distances 243,2187,19683,177147,300000`, `--batch 9`, `--memory on\|off` |
+| `reread` | `--file книга.txt`, `--len 2187`, `--passages 9` |
+| `ablate` | `--windows 27` |
+| `ngram` | `--tokens 6000000`, `--val-tokens 1000000`, `--windows 0` (те же позиции, что `eval --windows N`) |
+| `export` | `--out lm/model` → `model.snnt` (SNNT v2) и `tokenizer.bpe` |
+
+**Движок** (`chat`, `probe`, `copyeval`) читает `--model lm/model`.
+
+| Команда | Флаги |
+|---|---|
+| `chat` | `--temp 0.8`, `--top-p 0.9` (только на словарную часть), `--presence 0.5` (штраф за повтор токена ответа), `--copy 0.5` (вес индукционной копии при совпадении ≥ 8 токенов), `--format dialog\|plain` (реплики «— …» или продолжение текста), `--max-tokens 81`, `--memory 300000`, `--context файл` + `--context-tokens`, `--pointer on\|off`, `--kv`, `--seed` |
+| `probe` | `--context файл`, `--probes файл` — что память находит по фрагментам |
+| `copyeval` | `--copy 0.5`, `--tokens 19683`, `--distances …`, `--pointer on\|off` |
 
 ## Результаты
 

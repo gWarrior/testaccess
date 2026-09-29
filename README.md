@@ -91,6 +91,8 @@ let out = ctx.read(Probe::Tokens(&recent_tokens), &query, 9)?; // кросс-в�
 - [docs/concept.md](docs/concept.md) — исходная концепция;
 - [docs/architecture.md](docs/architecture.md) — как концепция реализована и почему;
 - [docs/llm-integration.md](docs/llm-integration.md) — стыковка с рекуррентной LLM.
+- [docs/training.md](docs/training.md) — языковая модель `lm/`: сборка корпуса, запуск и возобновление обучения, оценка;
+- [lm/README.md](lm/README.md#флаги) — модель и справочник всех флагов `snn-lm`.
 
 ## Разработка
 
@@ -99,3 +101,8 @@ cargo test                                    # 65 тестов: MVP §20, жи�
 cargo run --release --example bench           # бенчмарки на 300k (lexical | dense | read | all)
 cargo run --release --example quickstart
 ```
+
+Необязательные режимы сборки языковой модели: `scripts/build-native.sh`
+(`-C target-cpu=native`, отдельный `target/native`) и `--features vnni`
+(ядро AVX-512 VNNI для тернарных матриц движка). Подробнее — в
+[lm/README.md](lm/README.md#флаги).
