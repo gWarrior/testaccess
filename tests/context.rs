@@ -570,3 +570,26 @@ fn full_snapshot_size_and_speed() {
     );
     println!("pinned-only snapshot: {:.2} MB", ctx.save_pinned().len() as f64 / 1e6);
 }
+
+#[test]
+fn equal_matches_go_to_the_newest_chunks() {
+    // The same 9-token phrase in 40 places, each amid different text: a
+    // probe with the phrase scores all ~120 chunks around them alike, more
+    // than the 27 candidates the attractor takes. The candidates must be the
+    // newest, not whichever a partial sort leaves first.
+    let mut rng = SplitMix64::new(9);
+    let phrase = text(&mut rng, 9);
+    let mut ctx = context(59_049);
+    let mut at = Vec::new();
+    for _ in 0..40 {
+        ctx.append(&text(&mut rng, 729)).unwrap();
+        at.push(ctx.position());
+        ctx.append(&phrase).unwrap();
+    }
+    ctx.append(&text(&mut rng, 243)).unwrap();
+    let r = ctx.retrieve(Probe::Tokens(&phrase), 1).unwrap();
+    let span = r.spans.first().expect("a span");
+    // 27 candidates cover the 9 newest occurrences (3 chunks each).
+    let recent = at[at.len() - 9];
+    assert!(span.end() > recent, "{:?}, the 9 newest phrases start at {recent}", (span.start, span.end()));
+}

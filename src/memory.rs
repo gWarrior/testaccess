@@ -658,18 +658,23 @@ impl<P: Clone> SnnMemory<P> {
     }
 
     /// Up to `limit` live candidates (in `ctx`, if given) with the highest
-    /// index scores. Liveness is only checked for the best-scored slots,
-    /// widening the search window by 3x while too few are live.
+    /// index scores; equal scores go to the newest memory (the highest id),
+    /// not to whichever the partial sort happens to leave first — in a long
+    /// context hundreds of chunks share a template's score. Liveness is only
+    /// checked for the best-scored slots, widening the search window by 3x
+    /// while too few are live.
     fn select_live(&self, pool: &mut [(f32, Loc)], now: f64, ctx: Option<ContextId>, limit: usize) -> Vec<(f32, Loc)> {
         let mut out = Vec::with_capacity(limit);
         let (mut start, mut window) = (0, 3 * limit.max(1));
+        let id = |l: &Loc| self.bank(l.tier).meta[l.slot as usize].id;
+        let order = |a: &(f32, Loc), b: &(f32, Loc)| b.0.total_cmp(&a.0).then_with(|| id(&b.1).cmp(&id(&a.1)));
         while out.len() < limit && start < pool.len() {
             let rest = &mut pool[start..];
             let w = window.min(rest.len());
             if w < rest.len() {
-                rest.select_nth_unstable_by(w - 1, |a, b| b.0.total_cmp(&a.0));
+                rest.select_nth_unstable_by(w - 1, order);
             }
-            rest[..w].sort_by(|a, b| b.0.total_cmp(&a.0));
+            rest[..w].sort_by(order);
             for &(score, l) in &rest[..w] {
                 if out.len() == limit {
                     break;
