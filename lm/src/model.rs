@@ -257,6 +257,22 @@ pub struct Ablation {
 /// Tokens in the lexical probe of a memory read.
 pub const PROBE: usize = 9;
 
+/// The line-break token (byte 0x0A).
+pub const NEWLINE: u32 = 10;
+
+/// The lexical probe of a memory read from the last [`PROBE`] tokens: the
+/// current line when at least three of its tokens are there. A question on
+/// a new line ("Кто такой N -") shares few n-grams with the statement it
+/// asks about, and the tail of the previous line made its coverage fall
+/// below the memory's threshold; without it the statement is found.
+/// Training and the engine must probe alike.
+pub fn probe_of(recent: &[u32]) -> &[u32] {
+    match recent.iter().rposition(|&t| t == NEWLINE) {
+        Some(i) if recent.len() - i > 3 => &recent[i + 1..],
+        _ => recent,
+    }
+}
+
 /// Bins of the induction match length (see [`IndCand::len_bin`]).
 pub const LEN_BINS: usize = 8;
 
@@ -651,5 +667,18 @@ mod tests {
         let out2 = model.head(&tr2, &empty).unwrap().logits;
         let d = (out2 - &base).unwrap().abs().unwrap().sum(2).unwrap().to_vec2::<f32>().unwrap();
         assert!(d[0][..8].iter().all(|&x| x < 1e-4), "{:?}", d[0]);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_probe_is_the_current_line_when_it_has_three_tokens() {
+        assert_eq!(probe_of(&[1, 2, NEWLINE, 4, 5, 6]), &[4, 5, 6]);
+        // Too short a line: the whole window.
+        assert_eq!(probe_of(&[1, 2, 3, NEWLINE, 5, 6]), &[1, 2, 3, NEWLINE, 5, 6]);
+        assert_eq!(probe_of(&[1, 2, 3]), &[1, 2, 3]);
     }
 }

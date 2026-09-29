@@ -323,7 +323,7 @@ impl StreamMemory {
             .map(|j| {
                 let s = j * block;
                 let probe_end = off + s + 1;
-                let tokens = &ctx[probe_end.saturating_sub(crate::model::PROBE)..probe_end];
+                let tokens = crate::model::probe_of(&ctx[probe_end.saturating_sub(crate::model::PROBE)..probe_end]);
                 let key = &q[s * dim..(s + 1) * dim];
                 match self.mem.retrieve_rows(Probe::Both(tokens, key), top_k, rows) {
                     Ok(r) => BlockRows {
