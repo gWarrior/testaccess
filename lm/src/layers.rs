@@ -769,13 +769,22 @@ mod tests {
 
     #[test]
     fn hadam_scan_gradients_match_autograd_loop() {
+        scan_matches(false);
+    }
+
+    #[test]
+    fn ternary_hadam_scan_matches_a_straight_through_loop() {
+        scan_matches(true);
+    }
+
+    fn scan_matches(ternary: bool) {
         let dev = Device::Cpu;
         let u = candle_core::Var::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
         let r = candle_core::Var::randn(0f32, 0.3, (8, 8), &dev).unwrap();
         let h0 = Tensor::randn(0f32, 0.5, (2, 8), &dev).unwrap();
         let w = Tensor::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
 
-        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), ternary: false }).unwrap();
+        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), ternary }).unwrap();
         let g1 = (&fast * &w).unwrap().sum_all().unwrap().backward().unwrap();
 
         let mut h = h0.clone();
@@ -785,6 +794,10 @@ mod tests {
                 .unwrap()
                 .tanh()
                 .unwrap();
+            if ternary {
+                // Trits forward, tanh's derivative backward.
+                h = (&h + (h.round().unwrap() - &h).unwrap().detach()).unwrap();
+            }
             hs.push(h.clone());
         }
         let slow = Tensor::stack(&hs, 1).unwrap();

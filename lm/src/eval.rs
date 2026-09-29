@@ -96,6 +96,36 @@ pub fn reread(model: Model, passages: &[Vec<u32>], memory: bool, precision: KvPr
     Ok(acc.map(|(a, l, n)| (a / n.max(1) as f64, l / n.max(1) as f64)))
 }
 
+/// Which episodes a recall test asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpisodeSet {
+    /// A secret word, asked in other words (association).
+    Secret,
+    /// A person's fact, asked with the statement's own words (copying).
+    Same,
+    /// A person's fact, asked with a paraphrased question (association).
+    Paraphrase,
+    /// "Кто такой N?": " мой друг." if N was stated, else " не знаю.".
+    Who,
+}
+
+impl EpisodeSet {
+    fn sample(self, ep: &Episodes, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        match self {
+            Self::Secret => ep.sample_secret(rng),
+            Self::Same => {
+                let which = rng.below(4);
+                ep.sample_person(rng, true, Some(which))
+            }
+            Self::Paraphrase => {
+                let which = rng.below(4);
+                ep.sample_person(rng, false, Some(which))
+            }
+            Self::Who => ep.sample_person(rng, false, Some(4)),
+        }
+    }
+}
+
 /// Recall result at one distance.
 #[derive(Debug, Clone, Default)]
 pub struct Recall {
@@ -113,6 +143,9 @@ pub struct Recall {
     /// Mean pointer weights at the first answer token: vocabulary (null),
     /// window, memory rows, induction column.
     pub weights: [f64; 4],
+    /// For [`EpisodeSet::Who`]: exact answers and episodes for " мой друг."
+    /// and for " не знаю.".
+    pub who: [(usize, usize); 2],
 }
 
 /// Each stream states a secret word once and asks for it (in other words)
@@ -124,6 +157,7 @@ pub fn recall(
     mut model: Model,
     filler: &[u16],
     ep: &Episodes,
+    set: EpisodeSet,
     distances: &[usize],
     batch: usize,
     memory: bool,
@@ -138,7 +172,7 @@ pub fn recall(
         // (tokens, key span, answer start, answer length) per stream.
         let mut streams = Vec::new();
         for b in 0..batch {
-            let (intro, question, answer) = ep.sample_secret(&mut rng);
+            let (intro, question, answer) = set.sample(ep, &mut rng);
             let mut src = (b * 7919 + di * 104_729) % filler.len().max(1);
             let mut take = |n: usize, out: &mut Vec<u32>| {
                 for _ in 0..n {
@@ -148,17 +182,23 @@ pub fn recall(
             };
             let mut seq = Vec::new();
             take(2 * t, &mut seq);
-            // The answer is the key plus ".\n", which also ends the statement.
+            // The key: where the answer stands in the statement (none for a
+            // template answer, which is not in the context).
             let key_len = answer.len() - ep.end_len();
-            let key_end = seq.len() + intro.len() - ep.end_len();
-            let key = (key_end - key_len, key_end);
+            let body = &answer[..key_len];
+            let key = if ep.is_template(&answer) {
+                (usize::MAX / 2, usize::MAX / 2)
+            } else {
+                let at = intro.windows(key_len).rposition(|w| w == body).unwrap_or(0);
+                (seq.len() + at, seq.len() + at + key_len)
+            };
             seq.extend(&intro);
             take((seq.len() + d).saturating_sub(seq.len() + question.len()), &mut seq);
             seq.extend(&question);
             let start = seq.len();
             seq.extend(&answer);
             take(t + 1, &mut seq);
-            streams.push((seq, key, start, answer.len()));
+            streams.push((seq, key, start, answer.len(), ep.is_dont_know(&answer)));
         }
         let len = streams.iter().map(|s| s.0.len()).min().unwrap_or(0);
         let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
@@ -172,7 +212,7 @@ pub fn recall(
                 y.extend_from_slice(&seq[pos + 1..pos + t + 1]);
             }
             let (o, next) = runner.forward(&x, t, &device)?;
-            let needs = streams.iter().any(|&(_, _, s, n)| s < pos + t + 1 && s + n > pos + 1);
+            let needs = streams.iter().any(|&(_, _, s, n, _)| s < pos + t + 1 && s + n > pos + 1);
             if needs {
                 let losses = runner.losses(&o, &x, &y)?.to_vec1::<f32>()?;
                 let pred = runner.predict(&o, &x)?;
@@ -180,7 +220,7 @@ pub fn recall(
                 let point = o.point.flatten_all()?.to_vec1::<f32>()?;
                 let blk = runner.model.cfg.block;
                 let nb = t / blk;
-                for (b, (seq, key, s, n)) in streams.iter().enumerate() {
+                for (b, (seq, key, s, n, _)) in streams.iter().enumerate() {
                     for p in *s..s + n {
                         // Target at sequence position p is predicted at p − 1.
                         if p < pos + 1 || p >= pos + t + 1 {
@@ -217,7 +257,10 @@ pub fn recall(
             runner.commit(&x, t, &o, next)?;
             pos += t;
         }
-        for h in &hits {
+        for (h, st) in hits.iter().zip(&streams) {
+            let who = &mut r.who[usize::from(st.4)];
+            who.0 += usize::from(h.0 && h.3 > 0);
+            who.1 += 1;
             r.exact += usize::from(h.0 && h.3 > 0);
             r.first += usize::from(h.1);
             r.loss += h.2 / h.3.max(1) as f64 / batch as f64;

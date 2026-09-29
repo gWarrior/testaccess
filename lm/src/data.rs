@@ -311,6 +311,11 @@ impl Episodes {
         answer == self.my_friend.as_slice() || answer == self.dont_know.as_slice()
     }
 
+    /// Whether an answer is " не знаю." (the fact was never stated).
+    pub fn is_dont_know(&self, answer: &[u32]) -> bool {
+        answer == self.dont_know.as_slice()
+    }
+
     /// Tokens of the ".\n" that ends every statement and answer.
     pub fn end_len(&self) -> usize {
         self.end.len()
@@ -337,11 +342,24 @@ impl Episodes {
             }
             return (intro, q, a);
         }
+        self.sample_person(rng, same_words, None)
+    }
+
+    /// A person episode: `which` = 0 name, 1 town, 2 pet, 3 friend, 4 "Кто
+    /// такой N?" (random if `None`); asked with the statement's own words or
+    /// with a paraphrased question.
+    pub fn sample_person(
+        &self,
+        rng: &mut snn_memory::rng::SplitMix64,
+        same_words: bool,
+        which: Option<u64>,
+    ) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let pick =
             |v: &[Vec<u32>], rng: &mut snn_memory::rng::SplitMix64| v[rng.below(v.len() as u64) as usize].clone();
         let (name, town, pet_name, friend) =
             (pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng), pick(&self.names, rng));
-        let has_friend = rng.below(2) == 0;
+        let which = which.unwrap_or_else(|| rng.below(5));
+        let has_friend = which == 3 || rng.below(2) == 0;
         let pet = &self.pets[rng.below(self.pets.len() as u64) as usize];
         // One fact per line, so asking "with the same words" repeats the
         // line's opening token for token:
@@ -360,7 +378,7 @@ impl Episodes {
             }
         };
         let answer = |a: &[u32]| [a, &self.end].concat();
-        match rng.below(5) {
+        match which {
             0 => (intro, ask(&self.ask_name, rng), answer(&name)),
             1 => (intro, ask(&self.ask_town, rng), answer(&town)),
             2 => (intro, ask(pet, rng), answer(&pet_name)),

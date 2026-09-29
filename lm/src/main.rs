@@ -195,11 +195,19 @@ fn recall(args: &[String]) -> std::io::Result<()> {
         .map(|x| x.parse().expect("distance"))
         .collect();
     let memory = arg(args, "--memory", "on") == "on";
+    use snn_lm::eval::EpisodeSet;
+    let set = match arg(args, "--episodes", "secret").as_str() {
+        "same" => EpisodeSet::Same,
+        "paraphrase" => EpisodeSet::Paraphrase,
+        "who" => EpisodeSet::Who,
+        _ => EpisodeSet::Secret,
+    };
     let val = load_tokens(&data, "val.bin");
     let ep = snn_lm::data::Episodes::new(&load_tokenizer(&data));
+    println!("episodes: {set:?}");
     let t = Instant::now();
     let res =
-        snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, &distances, batch, memory, kv_precision(args), 7)
+        snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, set, &distances, batch, memory, kv_precision(args), 7)
             .map_err(std::io::Error::other)?;
     for r in res {
         println!(
@@ -219,6 +227,9 @@ fn recall(args: &[String]) -> std::io::Result<()> {
             r.weights[2],
             r.weights[3]
         );
+        if set == EpisodeSet::Who {
+            println!("    \"мой друг\" {}/{}, \"не знаю\" {}/{}", r.who[0].0, r.who[0].1, r.who[1].0, r.who[1].1);
+        }
     }
     println!("({:.0}s)", t.elapsed().as_secs_f64());
     Ok(())

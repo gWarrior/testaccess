@@ -670,6 +670,25 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
                 let (z, c, e) = q.health()?;
                 (zero, clipped, err, n) = (zero + z, clipped + c, err + e, n + 1.0);
             }
+            // Does the model use the ternary verdict and the induction features?
+            let data = varmap.data().lock().expect("varmap lock");
+            let show = |n: &str| {
+                data.get(n).and_then(|v| v.as_tensor().to_vec1::<f32>().ok()).map_or(String::new(), |v| {
+                    format!("{n} [{}]", v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" "))
+                })
+            };
+            println!(
+                "head: {} | {} | {} | {} | {} | {} | {} | {}",
+                show("gate_verdict"),
+                show("ind_verdict"),
+                show("far_verdict"),
+                show("far_source"),
+                show("ind_len"),
+                show("ind_count"),
+                show("ind_dist"),
+                show("ind_p")
+            );
+            drop(data);
             println!(
                 "quant: zero {:.3} clipped {:.4} rel.err {:.3} | grad norm {norm:.3}",
                 zero / n,
