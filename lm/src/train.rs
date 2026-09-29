@@ -542,7 +542,10 @@ fn clip(grads: &mut candle_core::backprop::GradStore, vars: &[candle_core::Var],
 pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::tokenizer::Tokenizer) -> Result<()> {
     let device = Device::Cpu;
     std::fs::create_dir_all(&cfg.out)?;
-    std::fs::write(cfg.out.join("model.cfg"), format!("ternary_h={}\n", u8::from(mcfg.ternary_h)))?;
+    std::fs::write(
+        cfg.out.join("model.cfg"),
+        format!("layers={}\nmlp={}\nstate_trits={}\n", mcfg.layers, mcfg.mlp, mcfg.state_trits),
+    )?;
     println!("rss at start (corpus loaded): {:.2} GB", rss_gb());
     let mut varmap = VarMap::new();
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), mcfg.clone())?;

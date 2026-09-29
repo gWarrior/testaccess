@@ -25,7 +25,7 @@ fn main() {
     let vm = VarMap::new();
     let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
     let x = Var::randn(0f32, 1.0, (b, t, d), &dev).unwrap();
-    let cell = HadamCell::new(vb.pp("c"), d, false).unwrap();
+    let cell = HadamCell::new(vb.pp("c"), d, 0).unwrap();
     let ret = Retention::new(vb.pp("r"), d, 4).unwrap();
     let mlp = Mlp::new(vb.pp("m"), d, 2187).unwrap();
     let emb = Var::randn(0f32, 0.06, (6561, d), &dev).unwrap();

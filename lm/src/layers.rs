@@ -321,7 +321,9 @@ pub struct HadamCell {
     sign: Tensor,
     decay: Tensor,
     h: Tensor,
-    ternary: bool,
+    /// Trits per state element: 0 = f32, 1 = {−1, 0, +1}, 2 = nine levels
+    /// ±4/4 (straight-through).
+    trits: u8,
 }
 
 /// Ternary decays of the Hadamard recurrence: unit `j` keeps `1 − 3^−k`
@@ -332,7 +334,7 @@ pub fn hadam_decays(d: usize) -> Vec<f32> {
 }
 
 impl HadamCell {
-    pub fn new(vb: VarBuilder, d: usize, ternary: bool) -> Result<Self> {
+    pub fn new(vb: VarBuilder, d: usize, trits: u8) -> Result<Self> {
         let device = vb.device().clone();
         Ok(Self {
             // Half the usual input scale keeps tanh out of saturation.
@@ -341,7 +343,7 @@ impl HadamCell {
             sign: vb.get_with_hints(d, "sign", Init::Randn { mean: 0.0, stdev: 1.0 })?,
             decay: Tensor::from_vec(hadam_decays(d), d, &device)?,
             h: hadamard(d, &device)?,
-            ternary,
+            trits,
         })
     }
 
@@ -361,7 +363,7 @@ impl HadamCell {
         let (_, t, _) = x.dims3()?;
         let u = self.wu.forward(x)?.contiguous()?;
         let z = candle_nn::ops::sigmoid(&self.wz.forward(x)?)?;
-        let hs = u.apply_op2(&self.recurrence()?, HadamScan { h0: h0.detach(), ternary: self.ternary })?;
+        let hs = u.apply_op2(&self.recurrence()?, HadamScan { h0: h0.detach(), trits: self.trits })?;
         let last = hs.narrow(1, t - 1, 1)?.squeeze(1)?;
         Ok(((hs * z)?, last))
     }
@@ -377,8 +379,9 @@ impl HadamCell {
 /// matrix product.
 struct HadamScan {
     h0: Tensor,
-    /// Round the state to trits `{−1, 0, +1}` after `tanh` (straight-through).
-    ternary: bool,
+    /// Round the state to `trits` balanced trits after `tanh`
+    /// (straight-through); 0 keeps f32.
+    trits: u8,
 }
 
 fn cpu_tensor(s: &candle_core::CpuStorage, l: &candle_core::Layout) -> Result<Tensor> {
@@ -387,16 +390,34 @@ fn cpu_tensor(s: &candle_core::CpuStorage, l: &candle_core::Layout) -> Result<Te
     Tensor::from_slice(&s.as_slice::<f32>()?[a..b], l.shape(), &Device::Cpu)
 }
 
-fn scan(u: &Tensor, r: &Tensor, h0: &Tensor, ternary: bool) -> Result<Tensor> {
+/// `tanh` output rounded to `trits` trits: levels `±L/L`, `L = (3^trits − 1)/2`.
+pub fn state_round(x: &Tensor, trits: u8) -> Result<Tensor> {
+    match trits {
+        0 => Ok(x.clone()),
+        _ => {
+            let l = ((3i32.pow(trits as u32) - 1) / 2) as f64;
+            x.affine(l, 0.0)?.round()?.affine(1.0 / l, 0.0)
+        }
+    }
+}
+
+/// Scalar version of [`state_round`] (the engine).
+pub fn state_round_f32(x: f32, trits: u8) -> f32 {
+    if trits == 0 {
+        return x;
+    }
+    let l = ((3i32.pow(trits as u32) - 1) / 2) as f32;
+    (x * l).round() / l
+}
+
+fn scan(u: &Tensor, r: &Tensor, h0: &Tensor, trits: u8) -> Result<Tensor> {
     let (_, t, _) = u.dims3()?;
     let ut = u.transpose(0, 1)?.contiguous()?;
     let mut h = h0.clone();
     let mut hs = Vec::with_capacity(t);
     for i in 0..t {
         h = (h.matmul(r)? + ut.get(i)?)?.tanh()?;
-        if ternary {
-            h = h.round()?;
-        }
+        h = state_round(&h, trits)?;
         hs.push(h.clone());
     }
     Tensor::stack(&hs, 1)
@@ -414,7 +435,7 @@ impl candle_core::CustomOp2 for HadamScan {
         s2: &candle_core::CpuStorage,
         l2: &candle_core::Layout,
     ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        let hs = scan(&cpu_tensor(s1, l1)?, &cpu_tensor(s2, l2)?, &self.h0, self.ternary)?;
+        let hs = scan(&cpu_tensor(s1, l1)?, &cpu_tensor(s2, l2)?, &self.h0, self.trits)?;
         Ok((candle_core::CpuStorage::F32(hs.flatten_all()?.to_vec1()?), hs.shape().clone()))
     }
 
@@ -427,7 +448,7 @@ impl candle_core::CustomOp2 for HadamScan {
         let prev = Tensor::cat(&[self.h0.unsqueeze(1)?, res.narrow(1, 0, t - 1)?], 1)?;
         // With trits the state is not tanh's output: recompute tanh from
         // the stored previous state and the input (straight-through).
-        let cs = if self.ternary {
+        let cs = if self.trits > 0 {
             let a = (prev.reshape((b * t, d))?.matmul(&r.detach())?.reshape((b, t, d))? + u.detach())?;
             a.tanh()?.transpose(0, 1)?.contiguous()?
         } else {
@@ -449,6 +470,12 @@ impl candle_core::CustomOp2 for HadamScan {
     }
 }
 
+/// Retention decays `γ_h = 1 − 3^−(h+3)`: horizons of 27, 81, 243, 729
+/// tokens for four heads (the Hadamard cell covers the shortest ones).
+pub fn retention_decays(heads: usize) -> Vec<f32> {
+    (0..heads).map(|h| 1.0 - 3f32.powi(-(h as i32 + 3))).collect()
+}
+
 /// Recurrent (linear) attention with per-head exponential decay
 /// (retention): `S_t = γ S_{t-1} + k_tᵀ v_t`, `o_t = q_t S_t`.
 ///
@@ -459,6 +486,8 @@ pub struct Retention {
     wq: TLinear,
     wk: TLinear,
     wv: TLinear,
+    /// Output gate `silu(x·W_g)` (RetNet's swish gate).
+    wg: TLinear,
     wo: TLinear,
     heads: usize,
     decays: Vec<f64>,
@@ -470,17 +499,18 @@ impl Retention {
             ("ret.wq".into(), &self.wq.w),
             ("ret.wk".into(), &self.wk.w),
             ("ret.wv".into(), &self.wv.w),
+            ("ret.wg".into(), &self.wg.w),
             ("ret.wo".into(), &self.wo.w),
         ]
     }
 
     pub fn new(vb: VarBuilder, d: usize, heads: usize) -> Result<Self> {
-        // γ_h = 1 − 3^{−(h+2)}: 0.889, 0.963, 0.988, 0.996, …
-        let decays = (0..heads).map(|h| 1.0 - 3f64.powi(-(h as i32 + 2))).collect();
+        let decays = retention_decays(heads).into_iter().map(f64::from).collect();
         Ok(Self {
             wq: TLinear::new(vb.clone(), "wq", d, d)?,
             wk: TLinear::new(vb.clone(), "wk", d, d)?,
             wv: TLinear::new(vb.clone(), "wv", d, d)?,
+            wg: TLinear::new(vb.clone(), "wg", d, d)?,
             wo: TLinear::new(vb, "wo", d, d)?,
             heads,
             decays,
@@ -525,6 +555,7 @@ impl Retention {
         let o = rms(&(intra + carried)?)?;
         let s1 = (k.broadcast_mul(&upd)?.t()?.matmul(&v)? + s0.broadcast_mul(&total)?)?;
         let o = o.transpose(1, 2)?.reshape((b, t, d))?;
+        let o = (o * self.wg.forward(x)?.silu()?)?;
         Ok((self.wo.forward(&o)?, s1))
     }
 }
@@ -749,22 +780,23 @@ mod tests {
 
     #[test]
     fn hadam_scan_gradients_match_autograd_loop() {
-        scan_matches(false);
+        scan_matches(0);
     }
 
     #[test]
     fn ternary_hadam_scan_matches_a_straight_through_loop() {
-        scan_matches(true);
+        scan_matches(1);
+        scan_matches(2);
     }
 
-    fn scan_matches(ternary: bool) {
+    fn scan_matches(trits: u8) {
         let dev = Device::Cpu;
         let u = candle_core::Var::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
         let r = candle_core::Var::randn(0f32, 0.3, (8, 8), &dev).unwrap();
         let h0 = Tensor::randn(0f32, 0.5, (2, 8), &dev).unwrap();
         let w = Tensor::randn(0f32, 1.0, (2, 5, 8), &dev).unwrap();
 
-        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), ternary }).unwrap();
+        let fast = u.as_tensor().apply_op2(r.as_tensor(), HadamScan { h0: h0.clone(), trits }).unwrap();
         let g1 = (&fast * &w).unwrap().sum_all().unwrap().backward().unwrap();
 
         let mut h = h0.clone();
@@ -774,9 +806,9 @@ mod tests {
                 .unwrap()
                 .tanh()
                 .unwrap();
-            if ternary {
+            if trits > 0 {
                 // Trits forward, tanh's derivative backward.
-                h = (&h + (h.round().unwrap() - &h).unwrap().detach()).unwrap();
+                h = (&h + (state_round(&h, trits).unwrap() - &h).unwrap().detach()).unwrap();
             }
             hs.push(h.clone());
         }
@@ -797,7 +829,7 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let cell = HadamCell::new(vb, 16, false).unwrap();
+        let cell = HadamCell::new(vb, 16, 0).unwrap();
         let x = Tensor::randn(0f32, 1.0, (2, 9, 16), &dev).unwrap();
         let (y, _) = cell.forward(&x, &Tensor::zeros((2, 16), DType::F32, &dev).unwrap()).unwrap();
         let grads = y.sqr().unwrap().sum_all().unwrap().backward().unwrap();

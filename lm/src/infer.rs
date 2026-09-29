@@ -129,6 +129,7 @@ struct LayerW {
     wq: ShiftLinear,
     wk: ShiftLinear,
     wv: ShiftLinear,
+    wg: ShiftLinear,
     wo: ShiftLinear,
     n3: Vec<f32>,
     w1: ShiftLinear,
@@ -218,6 +219,7 @@ impl Engine {
                     wq: mat(&l("ret.wq"))?,
                     wk: mat(&l("ret.wk"))?,
                     wv: mat(&l("ret.wv"))?,
+                    wg: mat(&l("ret.wg"))?,
                     wo: mat(&l("ret.wo"))?,
                     n3: vec(&l("n3"))?,
                     w1: mat(&l("mlp.w1"))?,
@@ -226,7 +228,7 @@ impl Engine {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let decays = (0..p.cfg.heads).map(|h| 1.0 - 3f32.powi(-(h as i32 + 2))).collect();
+        let decays = crate::layers::retention_decays(p.cfg.heads);
         Ok(Self {
             cfg: p.cfg.clone(),
             emb: mat("emb")?,
@@ -401,7 +403,7 @@ impl Engine {
             let inv_sqrt_d = 1.0 / (d as f32).sqrt();
             for j in 0..d {
                 let c = (r[j] * inv_sqrt_d * l.decay[j] + u[j]).tanh();
-                s.h[li][j] = if self.cfg.ternary_h { c.round() } else { c };
+                s.h[li][j] = crate::layers::state_round_f32(c, self.cfg.state_trits);
                 x[j] += s.h[li][j] * sigmoid(z[j]);
             }
             // Retention: S = γS + kᵀv, o = q·S.
@@ -428,6 +430,10 @@ impl Engine {
                     }
                 }
                 rms(oh);
+            }
+            // RetNet's swish output gate.
+            for (oj, gj) in o.iter_mut().zip(l.wg.apply(&xn)) {
+                *oj *= gj / (1.0 + (-gj).exp());
             }
             for (xi, yi) in x.iter_mut().zip(l.wo.apply(&o)) {
                 *xi += yi;
@@ -623,12 +629,13 @@ mod tests {
 
     #[test]
     fn engine_matches_the_training_model() {
-        engine_matches(false);
+        engine_matches(0);
     }
 
     #[test]
     fn engine_matches_the_training_model_with_ternary_state() {
-        engine_matches(true);
+        engine_matches(1);
+        engine_matches(2);
     }
 
     #[test]
@@ -636,7 +643,7 @@ mod tests {
         // Two windows: the second attends into the first (local window and
         // pointer), the recurrent state is carried, induction spans both.
         let dev = Device::Cpu;
-        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h: false };
+        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, state_trits: 0 };
         let vm = VarMap::new();
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
         for (name, var) in vm.data().lock().unwrap().iter() {
@@ -664,9 +671,9 @@ mod tests {
         }
     }
 
-    fn engine_matches(ternary_h: bool) {
+    fn engine_matches(state_trits: u8) {
         let dev = Device::Cpu;
-        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h };
+        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, state_trits };
         let vm = VarMap::new();
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
         // Non-trivial gains/verdict/head features so every path is exercised.

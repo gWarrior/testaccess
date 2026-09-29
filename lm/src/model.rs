@@ -47,13 +47,15 @@ pub struct Config {
     /// Tokens per memory read (one SNN retrieval per block). The probe is
     /// always the last [`PROBE`] tokens, whatever the block.
     pub block: usize,
-    /// HadamRNN state rounded to trits after `tanh`.
-    pub ternary_h: bool,
+    /// Trits per HadamRNN state element (0 = f32).
+    pub state_trits: u8,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { vocab: 6561, d: 256, layers: 3, heads: 4, mlp: 2187, mem_dim: 81, block: 3, ternary_h: false }
+        // Four layers with a 1458 (2·3^6) wide MLP: as many parameters as
+        // three layers of 2187, one more step of depth.
+        Self { vocab: 6561, d: 256, layers: 4, heads: 4, mlp: 1458, mem_dim: 81, block: 3, state_trits: 0 }
     }
 }
 
@@ -323,7 +325,7 @@ impl Model {
                 let vb = vb.pp(format!("l{i}"));
                 Ok(Layer {
                     n1: RmsNorm::new(vb.clone(), "n1", d)?,
-                    cell: HadamCell::new(vb.pp("cell"), d, cfg.ternary_h)?,
+                    cell: HadamCell::new(vb.pp("cell"), d, cfg.state_trits)?,
                     n2: RmsNorm::new(vb.clone(), "n2", d)?,
                     ret: Retention::new(vb.pp("ret"), d, cfg.heads)?,
                     n3: RmsNorm::new(vb.clone(), "n3", d)?,
@@ -560,7 +562,7 @@ mod tests {
     use candle_nn::VarMap;
 
     fn small() -> Config {
-        Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h: false }
+        Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, state_trits: 0 }
     }
 
     #[test]

@@ -114,7 +114,13 @@ fn train(args: &[String]) -> std::io::Result<()> {
     let tokens = load_tokens(&data, "train.bin");
     let tok = load_tokenizer(&data);
     println!("{cfg:?}");
-    let mcfg = snn_lm::model::Config { ternary_h: arg(args, "--ternary-h", "off") == "on", ..Default::default() };
+    let d = snn_lm::model::Config::default();
+    let mcfg = snn_lm::model::Config {
+        state_trits: arg(args, "--state-trits", "0").parse().expect("--state-trits"),
+        layers: arg(args, "--layers", &d.layers.to_string()).parse().expect("--layers"),
+        mlp: arg(args, "--mlp", &d.mlp.to_string()).parse().expect("--mlp"),
+        ..d
+    };
     snn_lm::train::train(&cfg, mcfg, &tokens.tokens, &tok).map_err(std::io::Error::other)
 }
 
@@ -168,7 +174,17 @@ fn load_model(dir: &std::path::Path) -> snn_lm::model::Model {
 /// The model configuration a run was trained with (`model.cfg`).
 fn model_config(dir: &std::path::Path) -> snn_lm::model::Config {
     let text = std::fs::read_to_string(dir.join("model.cfg")).unwrap_or_default();
-    snn_lm::model::Config { ternary_h: text.contains("ternary_h=1"), ..Default::default() }
+    let field = |k: &str| {
+        text.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).and_then(|v| v.trim().parse::<usize>().ok())
+    };
+    let d = snn_lm::model::Config::default();
+    snn_lm::model::Config {
+        // Runs before the layers/mlp record were 3 × 2187.
+        state_trits: field("state_trits").or(field("ternary_h")).unwrap_or(0) as u8,
+        layers: field("layers").unwrap_or(3),
+        mlp: field("mlp").unwrap_or(2187),
+        ..d
+    }
 }
 
 fn eval(args: &[String]) -> std::io::Result<()> {
