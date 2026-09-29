@@ -195,16 +195,18 @@ pub fn recall(
                             hits[b].1 = ok;
                             let row = &point[(b * t + i) * l..(b * t + i + 1) * l];
                             let m = o.m;
-                            r.weights[0] += row[t + m + 1] as f64 / batch as f64;
-                            r.weights[1] += row[..t].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
-                            r.weights[2] += row[t..t + m].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
-                            r.weights[3] += row[t + m] as f64 / batch as f64;
+                            // Columns: previous and current window, rows, induction, null.
+                            r.weights[0] += row[2 * t + m + 1] as f64 / batch as f64;
+                            r.weights[1] += row[..2 * t].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
+                            r.weights[2] += row[2 * t..2 * t + m].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
+                            r.weights[3] += row[2 * t + m] as f64 / batch as f64;
                             // Found: a row (or a window position) whose next token is the key's first.
                             let (k0, k1) = (key.0 as u64, key.1 as u64);
                             let block = i / blk;
                             let rows = &o.far_pos[(b * nb + block) * m..(b * nb + block + 1) * m];
-                            let in_rows = rows.iter().any(|&q| q + 1 >= k0 && q < k1);
-                            let in_window = key.0 >= pos;
+                            // A row copies the key's first token if its next is inside the key.
+                            let in_rows = rows.iter().any(|&q| q != u64::MAX && q + 1 >= k0 && q + 1 < k1);
+                            let in_window = key.0 + crate::model::LOCAL >= p;
                             if in_rows || in_window {
                                 r.found += 1;
                             }

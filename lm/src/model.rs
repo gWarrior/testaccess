@@ -165,7 +165,18 @@ pub struct MemBatch {
     pub m: usize,
     /// Induction candidates `(B·T)`.
     pub ind: Vec<IndCand>,
+    /// The previous window's keys and values `(B, T, mem_dim)`, detached:
+    /// with them every position sees the last [`LOCAL`] tokens, as the
+    /// engine's ring does.
+    pub prev: Option<(Tensor, Tensor)>,
+    /// Absolute position of the window's first token (rows inside the
+    /// local window are masked: they are already local).
+    pub start: u64,
 }
+
+/// Earlier tokens every position attends to locally (the engine's ring
+/// holds the current token and these).
+pub const LOCAL: usize = 242;
 
 impl MemBatch {
     /// Build from per-(stream, block) rows, padding to the longest set.
@@ -205,7 +216,16 @@ impl MemBatch {
             pos,
             m,
             ind: Vec::new(),
+            prev: None,
+            start: 0,
         })
+    }
+
+    /// Attach the previous window's keys/values and this window's start.
+    pub fn with_prev(mut self, prev: Option<(Tensor, Tensor)>, start: u64) -> Self {
+        self.prev = prev;
+        self.start = start;
+        self
     }
 
     /// Attach the window's induction candidates `(B·T)`.
@@ -271,9 +291,9 @@ pub struct Model {
 pub struct HeadOut {
     /// Vocabulary logits `(B, T, V)`.
     pub logits: Tensor,
-    /// Pointer attention `(B, T, L)` over `L = T + M + 2` columns: the
-    /// window (strictly earlier positions), the block's memory rows, the
-    /// induction column and the null.
+    /// Pointer attention `(B, T, L)` over `L = 2T + M + 2` columns: the
+    /// previous window, the current window (strictly earlier positions), the
+    /// block's memory rows, the induction column and the null.
     pub point: Tensor,
     /// Weight of the vocabulary distribution, the null column `(B, T)`.
     pub gate: Tensor,
@@ -377,19 +397,52 @@ impl Model {
         let device = tr.q.device();
         let verdict_ids = mem.verdict.flatten_all()?;
 
-        let causal = Tensor::tril2(t, DType::F32, device)?.affine(1e9, -1e9)?;
+        // Local attention over the last LOCAL tokens: the previous window's
+        // positions j > i (so the distance stays ≤ LOCAL) and the current
+        // window up to i (the pointer: strictly before i).
+        let (pk, pv, has_prev) = match &mem.prev {
+            Some((k, v)) => (k.clone(), v.clone(), true),
+            None => {
+                (Tensor::zeros((b, t, m), DType::F32, device)?, Tensor::zeros((b, t, m), DType::F32, device)?, false)
+            }
+        };
+        let mask = |f: &dyn Fn(usize, usize) -> bool| -> Result<Tensor> {
+            let v: Vec<f32> = (0..t * t).map(|k| if f(k / t, k % t) { 0.0 } else { -1e9 }).collect();
+            Tensor::from_vec(v, (t, t), device)
+        };
+        // Previous-window position j is i + t − j tokens back.
+        let prev_mask = mask(&|i, j| has_prev && j + LOCAL >= i + t)?;
+        let causal = mask(&|i, j| j <= i)?;
+        let strict = mask(&|i, j| j < i)?;
+        // Memory rows already inside the local window are masked per query.
+        let mm = mem.m;
+        let mut inside = vec![0f32; b * t * mm];
+        for bi in 0..b {
+            for i in 0..t {
+                let limit = (mem.start + i as u64).saturating_sub(LOCAL as u64);
+                let rows = &mem.pos[(bi * nb + i / blk) * mm..(bi * nb + i / blk + 1) * mm];
+                for (r, &p) in rows.iter().enumerate() {
+                    if p != u64::MAX && p >= limit {
+                        inside[(bi * t + i) * mm + r] = -1e9;
+                    }
+                }
+            }
+        }
+        let inside = Tensor::from_vec(inside, (b, t, mm), device)?;
+
+        let prev_sc = tr.q.matmul(&pk.t()?)?.affine(scale, 0.0)?.broadcast_add(&prev_mask)?;
         let local = tr.q.matmul(&tr.k.t()?)?.affine(scale, 0.0)?.broadcast_add(&causal)?;
         let qb = tr.q.reshape((b, nb, blk, m))?;
         let far = qb
             .matmul(&mem.keys.transpose(2, 3)?.contiguous()?)?
             .affine(scale, 0.0)?
-            .broadcast_add(&mem.mask.unsqueeze(2)?)?;
-        let mm = far.dim(D::Minus1)?;
-        let far = far.reshape((b, t, mm))?;
+            .broadcast_add(&mem.mask.unsqueeze(2)?)?
+            .reshape((b, t, mm))?;
+        let far = (far + &inside)?;
         // `softmax_last_dim` has no backward in candle 0.9: use the composite.
-        let att = candle_nn::ops::softmax(&Tensor::cat(&[&local, &far], 2)?, D::Minus1)?;
-        let o_local = att.narrow(2, 0, t)?.matmul(&tr.v)?;
-        let o_far = att.narrow(2, t, mm)?.reshape((b, nb, blk, mm))?.matmul(&mem.values)?.reshape((b, t, m))?;
+        let att = candle_nn::ops::softmax(&Tensor::cat(&[&prev_sc, &local, &far], 2)?, D::Minus1)?;
+        let o_local = (att.narrow(2, 0, t)?.matmul(&pv)? + att.narrow(2, t, t)?.matmul(&tr.v)?)?;
+        let o_far = att.narrow(2, 2 * t, mm)?.reshape((b, nb, blk, mm))?.matmul(&mem.values)?.reshape((b, t, m))?;
         let o = self.mo.forward(&(o_local + o_far)?)?;
 
         let verdict = self.verdict.index_select(&verdict_ids, 0)?.reshape((b, nb, 1, self.cfg.d))?;
@@ -398,10 +451,10 @@ impl Model {
         let emb = self.emb.q()?;
         let logits = crate::layers::linear(&self.nout.forward(&x)?, &emb)?;
 
-        // Pointer: strictly earlier window positions, memory rows, induction, null.
+        // Pointer: the local window (previous and current), memory rows,
+        // induction, null.
         let pq = self.pq.forward(&tr.xn)?;
-        let strict: Vec<f32> = (0..t * t).map(|i| if i % t < i / t { 0.0 } else { -1e9 }).collect();
-        let strict = Tensor::from_vec(strict, (t, t), device)?;
+        let p_prev = pq.matmul(&pk.t()?)?.affine(scale, 0.0)?.broadcast_add(&prev_mask)?;
         let p_local = pq.matmul(&tr.k.t()?)?.affine(scale, 0.0)?.broadcast_add(&strict)?;
         let row_bias = self
             .far_source
@@ -414,19 +467,20 @@ impl Model {
             .affine(scale, 0.0)?
             .broadcast_add(&(mem.mask.clone() + row_bias)?.unsqueeze(2)?)?
             .reshape((b, t, mm))?;
+        let p_far = (p_far + inside)?;
         let gv = per_block(&self.gate_verdict.index_select(&verdict_ids, 0)?, b, nb, blk)?;
         let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + &gv)?;
         let ind = self.induction_logit(tr, mem, &logits, &verdict_ids, b, t, nb, blk)?;
-        let cols = Tensor::cat(&[&p_local, &p_far, &ind.unsqueeze(2)?, &null.unsqueeze(2)?], 2)?;
+        let cols = Tensor::cat(&[&p_prev, &p_local, &p_far, &ind.unsqueeze(2)?, &null.unsqueeze(2)?], 2)?;
         let point = candle_nn::ops::softmax(&cols, D::Minus1)?;
         let point = if self.ablation.no_pointer {
-            let l = t + mm + 2;
+            let l = 2 * t + mm + 2;
             let null: Vec<f32> = (0..b * t * l).map(|i| if i % l == l - 1 { 1.0 } else { 0.0 }).collect();
             Tensor::from_vec(null, (b, t, l), device)?
         } else {
             point
         };
-        let gate = point.narrow(2, t + mm + 1, 1)?.squeeze(2)?;
+        let gate = point.narrow(2, 2 * t + mm + 1, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
     }
 
@@ -521,8 +575,10 @@ mod tests {
             pos: vec![0],
             source: vec![0],
         };
-        let h = model.head(&tr, &MemBatch::from_rows(&rows, 9, &dev).unwrap()).unwrap();
-        let loss = (h.logits.sqr().unwrap().mean_all().unwrap() + h.point.narrow(2, 0, 9).unwrap().sum_all().unwrap())
+        // Memory rows are older than the local window.
+        let mem = MemBatch::from_rows(&rows, 9, &dev).unwrap().with_prev(None, 1000);
+        let h = model.head(&tr, &mem).unwrap();
+        let loss = (h.logits.sqr().unwrap().mean_all().unwrap() + h.point.narrow(2, 9, 9).unwrap().sum_all().unwrap())
             .unwrap();
         let grads = loss.backward().unwrap();
         for (name, var) in vm.data().lock().unwrap().iter() {
@@ -547,10 +603,12 @@ mod tests {
         let base = head.logits;
         assert_eq!(base.dims(), &[2, 9, 81]);
 
-        // The pointer sees strictly earlier positions only (and the null).
+        // The pointer sees strictly earlier positions only (and the null);
+        // there is no previous window yet.
         let point = head.point.to_vec3::<f32>().unwrap();
         for (t, row) in point[0].iter().enumerate() {
-            assert!(row[t..9].iter().all(|&a| a == 0.0), "position {t}: {row:?}");
+            assert!(row[..9].iter().all(|&a| a == 0.0), "position {t}: {row:?}");
+            assert!(row[9 + t..18].iter().all(|&a| a == 0.0), "position {t}: {row:?}");
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         }
 
@@ -564,7 +622,7 @@ mod tests {
             pos: vec![0],
             source: vec![1],
         };
-        let mem = MemBatch::from_rows(&rows, 9, &dev).unwrap();
+        let mem = MemBatch::from_rows(&rows, 9, &dev).unwrap().with_prev(None, 1000);
         let with = model.head(&tr, &mem).unwrap().logits;
         let diff = (with - &base).unwrap().abs().unwrap().sum(2).unwrap().to_vec2::<f32>().unwrap();
         assert!(diff[0][..3].iter().all(|&d| d == 0.0), "{:?}", diff[0]);

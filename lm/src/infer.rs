@@ -547,11 +547,19 @@ impl Engine {
             gate = (null - mx).exp() / z;
             copy = sc.into_iter().filter(|e| e.0 != u32::MAX).map(|(t, v)| (t, (v - mx).exp() / z)).collect();
         }
-        // Tokens leave the local ring into the SNN memory.
+        // Tokens leave the local ring into the SNN memory nine at a time
+        // (the chunk stride), so every memory token is in a chunk, as in
+        // training, where whole windows are written.
         if s.ring.len() > RING {
-            let (t, k, v) = s.ring.pop_front().expect("ring is not empty");
+            let (mut ts, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..9 {
+                let (t, k, v) = s.ring.pop_front().expect("ring is not empty");
+                ts.push(t);
+                ks.extend(k);
+                vs.extend(v);
+            }
             if let Some(mem) = &mut s.memory {
-                let _ = mem.append_kv(&[t], &k, &v);
+                let _ = mem.append_kv(&ts, &ks, &vs);
             }
         }
         s.pos += 1;
@@ -615,6 +623,39 @@ mod tests {
         engine_matches(true);
     }
 
+    #[test]
+    fn engine_matches_the_runner_across_windows() {
+        // Two windows: the second attends into the first (local window and
+        // pointer), the recurrent state is carried, induction spans both.
+        let dev = Device::Cpu;
+        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h: false };
+        let vm = VarMap::new();
+        let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
+        for (name, var) in vm.data().lock().unwrap().iter() {
+            if name.starts_with("gate") || name.starts_with("ind_") || name == "verdict" {
+                var.set(&Tensor::randn(0f32, 1.0, var.as_tensor().shape(), &dev).unwrap()).unwrap();
+            }
+        }
+        let tokens: Vec<u32> = vec![3, 10, 17, 24, 31, 38, 45, 52, 59, 3, 10, 17, 24, 5, 38, 45, 7, 8, 9];
+        let packed = crate::pack::pack_model(&model, &vm).unwrap();
+        let engine = Engine::from_packed(&packed).unwrap();
+        let mut runner = crate::train::Runner::new(model, 1, false, 1000, KvPrecision::Trit2, &dev).unwrap();
+        let mut s = engine.session(0);
+        let mut logits = engine.step(&mut s, tokens[0]);
+        for w in 0..2 {
+            let x = &tokens[w * 9..w * 9 + 9];
+            let y = &tokens[w * 9 + 1..w * 9 + 10];
+            let (out, next) = runner.forward(x, 9, &dev).unwrap();
+            let nll = runner.losses(&out, x, y).unwrap().to_vec1::<f32>().unwrap();
+            for (i, &target) in y.iter().enumerate() {
+                let diff = (-logits[target as usize] - nll[i]).abs();
+                assert!(diff < 1e-3, "window {w} position {i}: loss differs by {diff}");
+                logits = engine.step(&mut s, target);
+            }
+            runner.commit(x, 9, &out, next).unwrap();
+        }
+    }
+
     fn engine_matches(ternary_h: bool) {
         let dev = Device::Cpu;
         let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h };
@@ -651,11 +692,12 @@ mod tests {
                 let z: f32 = row.iter().map(|l| (l - mx).exp()).sum();
                 let mut p: Vec<f32> = row.iter().map(|l| gate[t] * (l - mx).exp() / z).collect();
                 for j in 0..8 {
-                    p[tokens[j + 1] as usize] += point[t][j];
+                    p[tokens[j + 1] as usize] += point[t][9 + j];
                 }
-                // Columns: 9 window, 1 (empty) memory row, induction, null.
+                // Columns: 9 previous window (none), 9 window, 1 (empty) memory
+                // row, induction, null.
                 if ind[t].len > 0 {
-                    p[ind[t].tok as usize] += point[t][10];
+                    p[ind[t].tok as usize] += point[t][19];
                 }
                 p.into_iter().map(|v| v.ln()).collect()
             })

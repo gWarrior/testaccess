@@ -237,6 +237,10 @@ impl StreamMemory {
 /// Everything needed to run the model over parallel streams.
 pub struct Runner {
     pub model: Model,
+    /// The last committed window's keys, values and tokens (the local
+    /// window reaches back into it) and the absolute position of the next.
+    prev: Option<(Tensor, Tensor, Vec<u32>)>,
+    pos: u64,
     /// Drop the recurrent state between windows (ablation).
     pub reset_state: bool,
     pub state: State,
@@ -255,8 +259,10 @@ pub struct WindowOut {
     /// Token after each memory row and its position `(B, nb, M)`, and `M`.
     pub far_next: Vec<u32>,
     pub far_pos: Vec<u64>,
-    /// Induction candidates `(B·T)` (empty without the memory).
+    /// Induction candidates `(B·T)`.
     pub ind: Vec<IndCand>,
+    /// The previous window's tokens `(B·T)` (empty for the first window).
+    pub prev_tokens: Vec<u32>,
     pub m: usize,
     pub trunk: Trunk,
     pub known: usize,
@@ -276,7 +282,7 @@ impl Runner {
         let state = model.zero_state(batch, device)?;
         let dim = model.cfg.mem_dim;
         let memories = (0..batch).map(|_| StreamMemory::new(dim, max_tokens, precision)).collect();
-        Ok(Self { model, state, memories, use_memory, top_k: 3, rows: 81, reset_state: false })
+        Ok(Self { model, state, memories, use_memory, top_k: 3, rows: 81, reset_state: false, prev: None, pos: 0 })
     }
 
     /// Forward one window `x` (`B × T`, row-major) without committing it.
@@ -317,6 +323,7 @@ impl Runner {
                 .concat();
             (MemBatch::empty(b, nb, dim, device)?.with_induction(ind), 0, 0)
         };
+        let mem = mem.with_prev(self.prev.as_ref().map(|p| (p.0.clone(), p.1.clone())), self.pos);
         let h = self.model.head(&trunk, &mem)?;
         let out = WindowOut {
             logits: h.logits,
@@ -325,6 +332,7 @@ impl Runner {
             far_next: mem.next,
             far_pos: mem.pos,
             ind: mem.ind,
+            prev_tokens: self.prev.as_ref().map(|p| p.2.clone()).unwrap_or_default(),
             m: mem.m,
             trunk,
             known,
@@ -334,20 +342,29 @@ impl Runner {
         Ok((out, next))
     }
 
-    /// Token each pointer column would copy: `(B, L)` for the window part
-    /// (`x[j + 1]`) and `(B, T, M)` for the memory rows via their block.
+    /// Token each pointer column would copy: the previous window's
+    /// positions, the current window's (`x[j + 1]`), the memory rows (via
+    /// their block), the induction candidate.
     fn column_token(&self, out: &WindowOut, x: &[u32], t: usize, bi: usize, ti: usize, col: usize) -> u32 {
         let block = self.model.cfg.block;
         let nb = t / block;
         if col < t {
-            if col + 1 < t {
-                x[bi * t + col + 1]
+            // Previous window: its next token, or this window's first.
+            match out.prev_tokens.get(bi * t + col + 1) {
+                Some(&tok) if col + 1 < t => tok,
+                _ if col + 1 == t && !out.prev_tokens.is_empty() => x[bi * t],
+                _ => u32::MAX,
+            }
+        } else if col < 2 * t {
+            let j = col - t;
+            if j + 1 < t {
+                x[bi * t + j + 1]
             } else {
                 u32::MAX
             }
-        } else if col < t + out.m {
-            out.far_next[(bi * nb + ti / block) * out.m + (col - t)]
-        } else if col == t + out.m {
+        } else if col < 2 * t + out.m {
+            out.far_next[(bi * nb + ti / block) * out.m + (col - 2 * t)]
+        } else if col == 2 * t + out.m {
             // No candidates without the memory (the column is masked).
             out.ind.get(bi * t + ti).filter(|c| c.len > 0).map_or(u32::MAX, |c| c.tok)
         } else {
@@ -427,8 +444,11 @@ impl Runner {
         Ok(pred)
     }
 
-    /// Commit a window: carry the state and write it to the memories.
+    /// Commit a window: carry the state, keep its keys/values for the next
+    /// window's local attention, and write it to the memories.
     pub fn commit(&mut self, x: &[u32], t: usize, out: &WindowOut, next: State) -> Result<()> {
+        self.prev = Some((out.trunk.k.detach(), out.trunk.v.detach(), x.to_vec()));
+        self.pos += t as u64;
         self.state =
             if self.reset_state { self.model.zero_state(self.memories.len(), out.logits.device())? } else { next };
         if self.use_memory {
