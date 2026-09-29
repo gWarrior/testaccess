@@ -143,6 +143,8 @@ pub struct RetrievedSpan {
     pub chunks: Vec<MemoryId>,
     /// `false` for pinned chunks that already left the window.
     pub in_window: bool,
+    /// Found by the lexical memory (else by the semantic one only).
+    pub lexical: bool,
 }
 
 impl RetrievedSpan {
@@ -175,11 +177,21 @@ pub struct MemoryRows {
     pub keys: Vec<f32>,
     /// `positions.len() × value_dim`, row-major.
     pub values: Vec<f32>,
+    /// Where each row came from, a trit: 0 = lexical match, 1 = semantic
+    /// match only, 2 = the newest tokens, not yet indexed.
+    pub sources: Vec<u8>,
 }
 
 impl Default for MemoryRows {
     fn default() -> Self {
-        Self { verdict: Verdict::Unknown, confidence: 0.0, positions: Vec::new(), keys: Vec::new(), values: Vec::new() }
+        Self {
+            verdict: Verdict::Unknown,
+            confidence: 0.0,
+            positions: Vec::new(),
+            keys: Vec::new(),
+            values: Vec::new(),
+            sources: Vec::new(),
+        }
     }
 }
 
@@ -469,7 +481,7 @@ impl ContextMemory {
     pub fn retrieve(&mut self, probe: Probe<'_>, top_k: usize) -> Result<Retrieval, MemoryError> {
         let opts = RecallOptions { top_k, ..RecallOptions::default() };
         let mut verdicts = Vec::new();
-        let mut hits: Vec<(f32, MemoryId, Chunk)> = Vec::new();
+        let mut hits: Vec<(f32, MemoryId, Chunk, bool)> = Vec::new();
         let (tokens, key) = match probe {
             Probe::Tokens(t) => (Some(t), None),
             Probe::Key(k) => (None, Some(k)),
@@ -478,13 +490,13 @@ impl ContextMemory {
         if let Some(t) = tokens.filter(|t| !t.is_empty()) {
             let r = self.lexical.recall(Input::Tokens(t), &opts)?;
             verdicts.push(r.verdict);
-            hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?))));
+            hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?, true))));
         }
         if let Some(k) = key {
             let sem = self.semantic.as_mut().ok_or(MemoryError::InvalidConfig("no semantic index".into()))?;
             let r = sem.recall(Input::Dense(k), &opts)?;
             verdicts.push(r.verdict);
-            hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?))));
+            hits.extend(r.hits.into_iter().filter_map(|h| Some((h.confidence, h.id, h.payload?, false))));
         }
         let verdict = if verdicts.contains(&Verdict::Known) {
             Verdict::Known
@@ -497,15 +509,15 @@ impl ContextMemory {
     }
 
     /// Turn chunk hits into merged spans of context.
-    fn spans_of(&self, hits: Vec<(f32, MemoryId, Chunk)>) -> Vec<RetrievedSpan> {
+    fn spans_of(&self, hits: Vec<(f32, MemoryId, Chunk, bool)>) -> Vec<RetrievedSpan> {
         let pad = (self.cfg.neighbors * self.cfg.stride) as u64;
         let (lo, hi) = (self.base, self.position());
-        let mut inside: Vec<(u64, u64, f32, MemoryId)> = Vec::new();
+        let mut inside: Vec<(u64, u64, f32, MemoryId, bool)> = Vec::new();
         let mut out = Vec::new();
-        for (conf, id, chunk) in hits {
+        for (conf, id, chunk, lexical) in hits {
             let end = chunk.start + chunk.tokens.len() as u64;
             if chunk.start >= lo && end <= hi {
-                inside.push((chunk.start.saturating_sub(pad).max(lo), (end + pad).min(hi), conf, id));
+                inside.push((chunk.start.saturating_sub(pad).max(lo), (end + pad).min(hi), conf, id, lexical));
             } else {
                 out.push(RetrievedSpan {
                     start: chunk.start,
@@ -513,27 +525,30 @@ impl ContextMemory {
                     confidence: conf,
                     chunks: vec![id],
                     in_window: false,
+                    lexical,
                 });
             }
         }
         inside.sort_by_key(|s| s.0);
-        let mut merged: Vec<(u64, u64, f32, Vec<MemoryId>)> = Vec::new();
-        for (s, e, c, id) in inside {
+        let mut merged: Vec<(u64, u64, f32, Vec<MemoryId>, bool)> = Vec::new();
+        for (s, e, c, id, lexical) in inside {
             match merged.last_mut() {
                 Some(m) if s <= m.1 => {
                     m.1 = m.1.max(e);
                     m.2 = m.2.max(c);
                     m.3.push(id);
+                    m.4 |= lexical;
                 }
-                _ => merged.push((s, e, c, vec![id])),
+                _ => merged.push((s, e, c, vec![id], lexical)),
             }
         }
-        out.extend(merged.into_iter().map(|(s, e, c, ids)| RetrievedSpan {
+        out.extend(merged.into_iter().map(|(s, e, c, ids, lexical)| RetrievedSpan {
             start: s,
             tokens: self.tokens(s, e).expect("span is held").to_vec(),
             confidence: c,
             chunks: ids,
             in_window: true,
+            lexical,
         }));
         out.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then(b.start.cmp(&a.start)));
         out
@@ -655,16 +670,22 @@ impl ContextMemory {
         let kv = self.kv.as_ref().expect("checked above");
         let mut rows = MemoryRows { verdict: r.verdict, ..Default::default() };
         let (mut key, mut value) = (vec![0f32; dk], vec![0f32; dv]);
-        'spans: for span in r.spans.iter().filter(|s| s.in_window) {
+        let mut push = |rows: &mut MemoryRows, pos: u64, source: u8| {
+            if rows.positions.len() < limit && kv.read(pos, &mut key, &mut value) {
+                rows.positions.push(pos);
+                rows.sources.push(source);
+                rows.keys.extend_from_slice(&key);
+                rows.values.extend_from_slice(&value);
+            }
+        };
+        // The newest tokens not yet in a chunk come first: no index finds them.
+        let covered = self.chunks.back().map_or(self.base, |c| c.start + self.cfg.chunk_size as u64);
+        for pos in covered.max(self.base)..self.position() {
+            push(&mut rows, pos, 2);
+        }
+        for span in r.spans.iter().filter(|s| s.in_window) {
             for pos in span.start..span.end() {
-                if rows.positions.len() == limit {
-                    break 'spans;
-                }
-                if kv.read(pos, &mut key, &mut value) {
-                    rows.positions.push(pos);
-                    rows.keys.extend_from_slice(&key);
-                    rows.values.extend_from_slice(&value);
-                }
+                push(&mut rows, pos, if span.lexical { 0 } else { 1 });
             }
         }
         rows.confidence = r.spans.iter().map(|s| s.confidence).fold(0.0, f32::max);

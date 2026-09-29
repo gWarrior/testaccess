@@ -175,6 +175,12 @@ fn read_head_attends_over_retrieved_tokens() {
     assert_eq!(&rows.keys[i * dk..(i + 1) * dk], &keys[target * dk..(target + 1) * dk]);
     assert_eq!(rows.values.len(), rows.positions.len() * dv);
     assert!(rows.positions.len() <= 243);
+    assert_eq!(rows.sources[i], 0, "found by the lexical memory");
+    assert_eq!(rows.sources.len(), rows.positions.len());
+    // The newest, not yet indexed tokens come first, marked as the tail.
+    let end = ctx.position();
+    let tail: Vec<u64> = rows.positions.iter().zip(&rows.sources).filter(|r| *r.1 == 2).map(|r| *r.0).collect();
+    assert!(tail.iter().all(|&p| p + 27 > end && p < end), "{tail:?} vs {end}");
 
     // Semantic probe: the mean key of a chunk retrieves that chunk.
     let chunk_start = 2_700usize;
