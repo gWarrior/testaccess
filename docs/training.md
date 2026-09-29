@@ -134,6 +134,18 @@ template — «не знаю / мой друг», known — доля блоко�
 напишет `resumed exactly from step N`. После `kill -9` или падения теряются
 только шаги после последнего сохранения (не более 81).
 
+### Продолжение с чекпоинта в репозитории
+
+Точное состояние (`resume/`, ~1 ГБ) в git не хранится. В репозитории лежат веса последнего
+прогона: `lm/checkpoints/v4b/model.safetensors` и `model.ema.safetensors` (+ `model.cfg`).
+Новый прогон с них — тёплый старт: моменты оптимизатора и память потоков начинаются заново.
+
+```bash
+snn-lm train --out /home/user/data/v4c --init lm/checkpoints/v4b/model.ema.safetensors \
+    --hours 3 --lr 2e-3 --warmup 54 --seed 29 --log-every 27 --val-every 243 \
+    --micro 3 --parallel 5 --state-trits 2
+```
+
 ## 6. Оценка, экспорт, чат
 
 ```bash
