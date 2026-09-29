@@ -757,7 +757,9 @@ pub fn train(
         // Early on the average follows the weights (horizon grows with the step).
         let d = cfg.ema.min((1.0 + step as f64) / (10.0 + step as f64));
         for (_, v, e) in &mut ema {
-            *e = ((&*e * d)? + (v.as_tensor() * (1.0 - d))?)?;
+            // Detached: otherwise every average keeps the previous one alive
+            // through the autograd graph (the whole history, ~64 MB a step).
+            *e = ((&*e * d)? + (v.as_tensor() * (1.0 - d))?)?.detach();
         }
         timing[2] += t2.elapsed().as_secs_f64();
 
