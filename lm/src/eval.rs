@@ -97,20 +97,31 @@ pub fn reread(model: Model, passages: &[Vec<u32>], memory: bool, precision: KvPr
 }
 
 /// Recall result at one distance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Recall {
     pub distance: usize,
-    /// Episodes whose every answer token was the model's top prediction.
-    pub exact: usize,
     pub episodes: usize,
+    /// Episodes whose every answer token was the top prediction, and whose
+    /// first answer token was.
+    pub exact: usize,
+    pub first: usize,
     /// Mean loss on answer tokens.
     pub loss: f64,
+    /// Retrieval: the key was among the memory rows (or in the window) at
+    /// the first answer token.
+    pub found: usize,
+    /// Mean pointer weights at the first answer token: vocabulary (null),
+    /// window, memory rows, induction column.
+    pub weights: [f64; 4],
 }
 
-/// Each of `batch` streams states a key once, then asks for it after each
-/// distance in `distances` (ascending), with held-out filler in between.
+/// Each stream states a secret word once and asks for it (in other words)
+/// `d` tokens later, with held-out filler around. Every distance runs on
+/// fresh streams and memories, one episode per stream, so no answer can be
+/// copied from an earlier answer.
+#[allow(clippy::too_many_arguments)]
 pub fn recall(
-    model: Model,
+    mut model: Model,
     filler: &[u16],
     ep: &Episodes,
     distances: &[usize],
@@ -121,78 +132,98 @@ pub fn recall(
 ) -> Result<Vec<Recall>> {
     let device = Device::Cpu;
     let t = 243;
-    let mut rng = snn_memory::rng::SplitMix64::new(seed);
-    // Build every stream: filler, key, then filler with questions.
-    let lead = 2 * t;
-    let mut streams: Vec<(Vec<u32>, Vec<(usize, usize, usize)>)> = Vec::new();
-    for b in 0..batch {
-        let (intro, question, answer) = ep.sample_secret(&mut rng);
-        let mut src = (b * 7919) % filler.len().max(1);
-        let mut take = |n: usize, out: &mut Vec<u32>| {
-            for _ in 0..n {
-                out.push(filler[src] as u32);
-                src = (src + 1) % filler.len();
-            }
-        };
-        let mut seq = Vec::new();
-        take(lead, &mut seq);
-        seq.extend(&intro);
-        let key_end = seq.len();
-        let mut marks = Vec::new();
-        for (di, &d) in distances.iter().enumerate() {
-            let target = key_end + d;
-            let n = target.saturating_sub(seq.len());
-            take(n, &mut seq);
+    let mut out = Vec::new();
+    for (di, &d) in distances.iter().enumerate() {
+        let mut rng = snn_memory::rng::SplitMix64::new(seed ^ (di as u64 + 1).wrapping_mul(0x9e37_79b9));
+        // (tokens, key span, answer start, answer length) per stream.
+        let mut streams = Vec::new();
+        for b in 0..batch {
+            let (intro, question, answer) = ep.sample_secret(&mut rng);
+            let mut src = (b * 7919 + di * 104_729) % filler.len().max(1);
+            let mut take = |n: usize, out: &mut Vec<u32>| {
+                for _ in 0..n {
+                    out.push(filler[src] as u32);
+                    src = (src + 1) % filler.len();
+                }
+            };
+            let mut seq = Vec::new();
+            take(2 * t, &mut seq);
+            // The answer is the key plus ".\n", which also ends the statement.
+            let key_len = answer.len() - ep.end_len();
+            let key_end = seq.len() + intro.len() - ep.end_len();
+            let key = (key_end - key_len, key_end);
+            seq.extend(&intro);
+            take((seq.len() + d).saturating_sub(seq.len() + question.len()), &mut seq);
             seq.extend(&question);
             let start = seq.len();
             seq.extend(&answer);
-            marks.push((di, start, answer.len()));
+            take(t + 1, &mut seq);
+            streams.push((seq, key, start, answer.len()));
         }
-        take(t + 1, &mut seq);
-        streams.push((seq, marks));
-    }
-    let len = streams.iter().map(|s| s.0.len()).min().unwrap_or(0);
-    let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
-    let mut res: Vec<Recall> =
-        distances.iter().map(|&d| Recall { distance: d, exact: 0, episodes: batch, loss: 0.0 }).collect();
-    let mut hits: Vec<Vec<(usize, bool, f64)>> = vec![Vec::new(); batch];
-    let mut pos = 0;
-    while pos + t < len {
-        let (mut x, mut y) = (Vec::new(), Vec::new());
-        for (seq, _) in &streams {
-            x.extend_from_slice(&seq[pos..pos + t]);
-            y.extend_from_slice(&seq[pos + 1..pos + t + 1]);
-        }
-        let (out, next) = runner.forward(&x, t, &device)?;
-        let needs = streams.iter().any(|(_, marks)| marks.iter().any(|&(_, s, n)| s < pos + t + 1 && s + n > pos + 1));
-        if needs {
-            let losses = runner.losses(&out, &x, &y)?.to_vec1::<f32>()?;
-            let argmax = runner.predict(&out, &x)?;
-            for (b, (seq, marks)) in streams.iter().enumerate() {
-                for &(di, s, n) in marks {
-                    for p in s..s + n {
+        let len = streams.iter().map(|s| s.0.len()).min().unwrap_or(0);
+        let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
+        let mut r = Recall { distance: d, episodes: batch, ..Default::default() };
+        let mut hits = vec![(true, false, 0f64, 0usize); batch];
+        let mut pos = 0;
+        while pos + t < len {
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            for (seq, ..) in &streams {
+                x.extend_from_slice(&seq[pos..pos + t]);
+                y.extend_from_slice(&seq[pos + 1..pos + t + 1]);
+            }
+            let (o, next) = runner.forward(&x, t, &device)?;
+            let needs = streams.iter().any(|&(_, _, s, n)| s < pos + t + 1 && s + n > pos + 1);
+            if needs {
+                let losses = runner.losses(&o, &x, &y)?.to_vec1::<f32>()?;
+                let pred = runner.predict(&o, &x)?;
+                let (_, _, l) = o.point.dims3()?;
+                let point = o.point.flatten_all()?.to_vec1::<f32>()?;
+                let blk = runner.model.cfg.block;
+                let nb = t / blk;
+                for (b, (seq, key, s, n)) in streams.iter().enumerate() {
+                    for p in *s..s + n {
                         // Target at sequence position p is predicted at p − 1.
-                        if p >= pos + 1 && p < pos + t + 1 {
-                            let i = b * t + (p - 1 - pos);
-                            hits[b].push((di, argmax[i] == seq[p], losses[i] as f64));
+                        if p < pos + 1 || p >= pos + t + 1 {
+                            continue;
+                        }
+                        let i = p - 1 - pos;
+                        let ok = pred[b * t + i] == seq[p];
+                        hits[b].0 &= ok;
+                        hits[b].2 += losses[b * t + i] as f64;
+                        hits[b].3 += 1;
+                        if p == *s {
+                            hits[b].1 = ok;
+                            let row = &point[(b * t + i) * l..(b * t + i + 1) * l];
+                            let m = o.m;
+                            r.weights[0] += row[t + m + 1] as f64 / batch as f64;
+                            r.weights[1] += row[..t].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
+                            r.weights[2] += row[t..t + m].iter().map(|&a| a as f64).sum::<f64>() / batch as f64;
+                            r.weights[3] += row[t + m] as f64 / batch as f64;
+                            // Found: a row (or a window position) whose next token is the key's first.
+                            let (k0, k1) = (key.0 as u64, key.1 as u64);
+                            let block = i / blk;
+                            let rows = &o.far_pos[(b * nb + block) * m..(b * nb + block + 1) * m];
+                            let in_rows = rows.iter().any(|&q| q + 1 >= k0 && q < k1);
+                            let in_window = key.0 >= pos;
+                            if in_rows || in_window {
+                                r.found += 1;
+                            }
                         }
                     }
                 }
             }
+            runner.commit(&x, t, &o, next)?;
+            pos += t;
         }
-        runner.commit(&x, t, &out, next)?;
-        pos += t;
-    }
-    for per in &hits {
-        for (di, r) in res.iter_mut().enumerate() {
-            let tokens: Vec<&(usize, bool, f64)> = per.iter().filter(|h| h.0 == di).collect();
-            if !tokens.is_empty() && tokens.iter().all(|h| h.1) {
-                r.exact += 1;
-            }
-            r.loss += tokens.iter().map(|h| h.2).sum::<f64>() / tokens.len().max(1) as f64 / batch as f64;
+        for h in &hits {
+            r.exact += usize::from(h.0 && h.3 > 0);
+            r.first += usize::from(h.1);
+            r.loss += h.2 / h.3.max(1) as f64 / batch as f64;
         }
+        out.push(r);
+        model = runner.model;
     }
-    Ok(res)
+    Ok(out)
 }
 
 /// Copy head on held-out text: mean loss without and with it, how often it

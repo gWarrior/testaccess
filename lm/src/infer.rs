@@ -18,8 +18,9 @@ use rayon::prelude::*;
 use snn_memory::{ContextConfig, ContextMemory, KvConfig, KvPrecision, Probe, Verdict};
 
 use crate::model::Config;
+use crate::model::IndCand;
 use crate::pack::{Packed, PackedModel};
-use crate::train::{IND_MAX, IND_MIN};
+use crate::train::{IND_EXT, IND_MAX, IND_MIN};
 
 /// Length of the local attention ring (the training window).
 pub const RING: usize = 243;
@@ -28,7 +29,10 @@ pub const RING: usize = 243;
 pub struct ShiftLinear {
     rows: usize,
     cols: usize,
-    /// Per row: 9 offsets into `idx` delimiting groups `+1,+2,+3,+4,-1,-2,-3,-4`.
+    /// Largest level (4 for two trits, 13 for three).
+    top: usize,
+    /// Per row: `2·top + 1` offsets into `idx` delimiting the groups of
+    /// levels `+1…+top, −1…−top`.
     offs: Vec<u32>,
     idx: Vec<u16>,
     steps: Vec<f32>,
@@ -37,8 +41,9 @@ pub struct ShiftLinear {
 
 impl ShiftLinear {
     pub fn new(rows: usize, cols: usize, levels: &[i8], exps: &[i8]) -> Self {
-        let order = [1i8, 2, 3, 4, -1, -2, -3, -4];
-        let mut offs = Vec::with_capacity(rows * 9);
+        let top = levels.iter().map(|l| l.unsigned_abs() as usize).max().unwrap_or(1).max(4);
+        let order: Vec<i8> = (1..=top as i8).chain((1..=top as i8).map(|l| -l)).collect();
+        let mut offs = Vec::with_capacity(rows * (order.len() + 1));
         let mut idx = Vec::new();
         for r in 0..rows {
             let row = &levels[r * cols..(r + 1) * cols];
@@ -49,19 +54,21 @@ impl ShiftLinear {
             }
         }
         let steps = exps.iter().map(|&e| 2f32.powi(e as i32)).collect();
-        Self { rows, cols, offs, idx, steps, levels: levels.to_vec() }
+        Self { rows, cols, top, offs, idx, steps, levels: levels.to_vec() }
     }
 
+    /// `step · Σₖ k·(Σx[+k] − Σx[−k])`: additions per level, then small
+    /// integer multiples; the power-of-two step is an exponent shift.
     #[inline]
     fn row(&self, r: usize, x: &[f32]) -> f32 {
-        let o = &self.offs[r * 9..r * 9 + 9];
-        let mut s = [0f32; 8];
-        for (g, sg) in s.iter_mut().enumerate() {
-            *sg = self.idx[o[g] as usize..o[g + 1] as usize].iter().map(|&c| x[c as usize]).sum();
+        let g = 2 * self.top;
+        let o = &self.offs[r * (g + 1)..(r + 1) * (g + 1)];
+        let sum = |k: usize| self.idx[o[k] as usize..o[k + 1] as usize].iter().map(|&c| x[c as usize]).sum::<f32>();
+        let mut acc = 0f32;
+        for k in 1..=self.top {
+            acc += k as f32 * (sum(k - 1) - sum(self.top + k - 1));
         }
-        let (a1, a2, a3, a4) = (s[0] - s[4], s[1] - s[5], s[2] - s[6], s[3] - s[7]);
-        // ×2 and ×4 are exponent shifts (exact); ×3 = ×2 + ×1.
-        self.steps[r] * (a1 + (a2 + a2) + (a3 + a3 + a3) + a4 * 4.0)
+        self.steps[r] * acc
     }
 
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
@@ -116,7 +123,8 @@ struct LayerW {
     wu: ShiftLinear,
     wz: ShiftLinear,
     sign: Vec<f32>,
-    gain: Vec<f32>,
+    /// Ternary decays `1 − 3^−k` of the Hadamard recurrence.
+    decay: Vec<f32>,
     n2: Vec<f32>,
     wq: ShiftLinear,
     wk: ShiftLinear,
@@ -148,7 +156,21 @@ pub struct Engine {
     /// Ablation: all weight on the vocabulary, no copying.
     pub no_pointer: bool,
     ind_len: Vec<f32>,
+    ind_count: Vec<f32>,
+    ind_verdict: Vec<f32>,
     ind_w: Vec<f32>,
+    ind_p: Vec<f32>,
+    far_verdict: Vec<f32>,
+    far_source: Vec<f32>,
+}
+
+/// Rows retrieved for the current block.
+#[derive(Default)]
+struct Rows {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    next: Vec<u32>,
+    source: Vec<u8>,
 }
 
 /// Recurrent state of one conversation.
@@ -158,8 +180,9 @@ pub struct Session {
     ring: VecDeque<(u32, Vec<f32>, Vec<f32>)>,
     pub memory: Option<ContextMemory>,
     recent: VecDeque<u32>,
-    /// Retrieved keys, values, count and the token after each row.
-    rows: (Vec<f32>, Vec<f32>, usize, Vec<u32>),
+    rows: Rows,
+    /// The last induction candidate and the position it was computed at.
+    last_ind: Option<(u64, IndCand)>,
     verdict: usize,
     pos: u64,
     /// Position where the current reply starts: the pointer and the
@@ -170,7 +193,7 @@ pub struct Session {
 impl Engine {
     pub fn from_packed(p: &PackedModel) -> Result<Self, String> {
         let mat = |n: &str| match p.tensors.get(n) {
-            Some(Packed::Matrix { rows, cols, levels, exps }) => Ok(ShiftLinear::new(*rows, *cols, levels, exps)),
+            Some(Packed::Matrix { rows, cols, levels, exps, .. }) => Ok(ShiftLinear::new(*rows, *cols, levels, exps)),
             _ => Err(format!("missing matrix {n}")),
         };
         let vec = |n: &str| match p.tensors.get(n) {
@@ -188,7 +211,7 @@ impl Engine {
                         Some(Packed::Signs { data }) => data.iter().map(|&s| s as f32).collect(),
                         _ => return Err(format!("missing {}", l("cell.sign"))),
                     },
-                    gain: vec(&l("cell.gain"))?.into_iter().map(sigmoid).collect(),
+                    decay: crate::layers::hadam_decays(p.cfg.d),
                     n2: vec(&l("n2"))?,
                     wq: mat(&l("ret.wq"))?,
                     wk: mat(&l("ret.wk"))?,
@@ -220,14 +243,19 @@ impl Engine {
             gate_verdict: vec("gate_verdict")?,
             no_pointer: false,
             ind_len: vec("ind_len")?,
+            ind_count: vec("ind_count")?,
+            ind_verdict: vec("ind_verdict")?,
             ind_w: vec("ind_w")?,
+            ind_p: vec("ind_p")?,
+            far_verdict: vec("far_verdict")?,
+            far_source: vec("far_source")?,
         })
     }
 
-    /// A fresh session with ternary K/V memory (~115 MB at 300k tokens);
-    /// `memory_tokens = 0` disables the SNN memory.
+    /// A fresh session with two-trit K/V memory (the model's own keys,
+    /// stored exactly); `memory_tokens = 0` disables the SNN memory.
     pub fn session(&self, memory_tokens: usize) -> Session {
-        self.session_with(memory_tokens, KvPrecision::Ternary)
+        self.session_with(memory_tokens, KvPrecision::Trit2)
     }
 
     /// A fresh session with the given K/V precision.
@@ -248,7 +276,8 @@ impl Engine {
             ring: VecDeque::new(),
             memory,
             recent: VecDeque::new(),
-            rows: (Vec::new(), Vec::new(), 0, Vec::new()),
+            rows: Rows::default(),
+            last_ind: None,
             verdict: 1,
             pos: 0,
             reply_start: u64::MAX,
@@ -272,8 +301,18 @@ impl Engine {
     /// after `limit` are skipped, so a reply never copies itself. Returns
     /// the copied token and the suffix length, or `None` ("не знаю").
     pub fn copy(&self, s: &mut Session, logits: &mut [f32], lambda: f32, limit: u64) -> Option<(u32, usize)> {
-        let first = s.pos - s.ring.len() as u64;
-        let (token, n) = self.continuation(s, first, limit)?;
+        let c = match s.last_ind {
+            // Computed by the last step with the same limit.
+            Some((pos, c)) if pos + 1 == s.pos && limit == s.reply_start => c,
+            _ => {
+                let first = s.pos - s.ring.len() as u64;
+                self.continuation(s, first, limit)
+            }
+        };
+        if c.len == 0 {
+            return None;
+        }
+        let (token, n) = (c.tok, c.len as usize);
         // p' = (1 − λ)·p + λ·[token], written back as log-probabilities.
         let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
@@ -284,35 +323,52 @@ impl Engine {
         Some((token, n))
     }
 
-    /// The token that followed the most recent earlier occurrence of the
-    /// longest suffix of the ring (8 down to 3 tokens): in the ring, or in the
-    /// SNN memory when it is sure (`Known`). `first` is the position of the
-    /// ring's first token; continuations at or after `limit` are skipped.
-    fn continuation(&self, s: &mut Session, first: u64, limit: u64) -> Option<(u32, usize)> {
+    /// The induction candidate: the token that followed the most recent
+    /// earlier occurrence of the longest suffix of the ring (8 down to 3
+    /// tokens, then extended up to 27), in the ring or in the SNN memory
+    /// when it is sure (`Known`), with the number of earlier occurrences.
+    /// `first` is the position of the ring's first token; continuations at
+    /// or after `limit` are skipped.
+    fn continuation(&self, s: &mut Session, first: u64, limit: u64) -> IndCand {
         let ring: Vec<u32> = s.ring.iter().map(|e| e.0).collect();
-        let ring_start = first;
-        (IND_MIN..=IND_MAX).rev().filter(|&n| n < ring.len()).find_map(|n| {
-            let suffix = &ring[ring.len() - n..];
-            // The ring first: exact and cheap.
-            let local = (0..ring.len() - n)
-                .rev()
-                .find(|&i| &ring[i..i + n] == suffix && ring_start + ((i + n) as u64) < limit)
-                .map(|i| ring[i + n]);
-            local
-                .or_else(|| {
-                    let mem = s.memory.as_mut()?;
-                    let located = mem.locate(suffix).ok()?;
-                    if located.verdict != Verdict::Known {
-                        return None;
+        let len = ring.len();
+        for n in (IND_MIN..=IND_MAX).rev().filter(|&n| n < len) {
+            let suffix = &ring[len - n..];
+            // Every earlier occurrence in the ring whose continuation is allowed.
+            let local: Vec<usize> =
+                (0..len - n).filter(|&i| &ring[i..i + n] == suffix && first + ((i + n) as u64) < limit).collect();
+            let mut far: Vec<u64> = Vec::new();
+            if let Some(mem) = s.memory.as_mut() {
+                if let Ok(located) = mem.locate(suffix) {
+                    if located.verdict == Verdict::Known {
+                        let end = mem.position();
+                        far = located.positions.into_iter().filter(|&p| p + (n as u64) < limit.min(end)).collect();
                     }
-                    let end = mem.position();
-                    located.positions.iter().rev().find_map(|&p| {
-                        let from = p + n as u64;
-                        (from < limit && from < end).then(|| mem.tokens(from, from + 1)).flatten().map(|t| t[0])
-                    })
-                })
-                .map(|t| (t, n))
-        })
+                }
+            }
+            let count = (local.len() + far.len()) as u32;
+            // The most recent occurrence: the ring's last, else the memory's.
+            let (tok, before): (u32, Box<dyn Fn(usize) -> Option<u32>>) = if let Some(&i) = local.last() {
+                let r = ring.clone();
+                (ring[i + n], Box::new(move |k: usize| (k <= i).then(|| r[i - k])))
+            } else if let Some(&p) = far.iter().max() {
+                let mem = s.memory.as_ref().expect("far matches come from the memory");
+                let Some(t) = mem.tokens(p + n as u64, p + n as u64 + 1).map(|t| t[0]) else { continue };
+                let ctx: Vec<u32> = (1..=IND_EXT as u64)
+                    .map_while(|k| p.checked_sub(k).and_then(|q| mem.tokens(q, q + 1)).map(|t| t[0]))
+                    .collect();
+                (t, Box::new(move |k: usize| ctx.get(k - 1).copied()))
+            } else {
+                continue;
+            };
+            // Extend the match backwards, as the training index does.
+            let mut m = n;
+            while m < IND_EXT && m < len && before(m - n + 1) == Some(ring[len - 1 - m]) {
+                m += 1;
+            }
+            return IndCand { tok, len: m as u16, count };
+        }
+        IndCand::NONE
     }
 
     /// Feed many tokens (e.g. a document into memory); returns the logits
@@ -338,7 +394,7 @@ impl Engine {
             fwht(&mut r);
             let inv_sqrt_d = 1.0 / (d as f32).sqrt();
             for j in 0..d {
-                s.h[li][j] = (r[j] * inv_sqrt_d * l.gain[j] + u[j]).tanh();
+                s.h[li][j] = (r[j] * inv_sqrt_d * l.decay[j] + u[j]).tanh();
                 x[j] += s.h[li][j] * sigmoid(z[j]);
             }
             // Retention: S = γS + kᵀv, o = q·S.
@@ -382,13 +438,15 @@ impl Engine {
         // Memory head.
         let m = self.cfg.mem_dim;
         let xn = rms_gain(&x, &self.nm);
-        let (q, k, v) = (self.mq.apply(&xn), self.mk.apply(&xn), self.mv.apply(&xn));
+        let q = self.mq.apply(&xn);
+        // Keys and values as two-trit vectors, as in training.
+        let (k, v) = (quant_act_vec(&self.mk.apply(&xn)), quant_act_vec(&self.mv.apply(&xn)));
         s.recent.push_back(token);
         if s.recent.len() > crate::model::PROBE {
             s.recent.pop_front();
         }
         if s.pos % self.cfg.block as u64 == 0 {
-            s.rows = (Vec::new(), Vec::new(), 0, Vec::new());
+            s.rows = Rows::default();
             s.verdict = 1;
             if let Some(mem) = &mut s.memory {
                 let probe: Vec<u32> = s.recent.iter().copied().collect();
@@ -398,7 +456,6 @@ impl Engine {
                         Verdict::Unknown => 1,
                         Verdict::Absent => 2,
                     };
-                    let n = r.positions.len();
                     // The memory's last position is followed by the ring's first token.
                     let first = s.ring.front().map_or(u32::MAX, |e| e.0);
                     let end = mem.position();
@@ -409,7 +466,7 @@ impl Engine {
                             |&p| if p + 1 == end { first } else { mem.tokens(p + 1, p + 2).map_or(u32::MAX, |t| t[0]) },
                         )
                         .collect();
-                    s.rows = (r.keys, r.values, n, next);
+                    s.rows = Rows { keys: r.keys, values: r.values, next, source: r.sources };
                 }
             }
         }
@@ -417,7 +474,8 @@ impl Engine {
         let scale = 1.0 / (m as f32).sqrt();
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>() * scale;
         let mut scores: Vec<f32> = s.ring.iter().map(|(_, k, _)| dot(&q, k)).collect();
-        scores.extend((0..s.rows.2).map(|i| dot(&q, &s.rows.0[i * m..(i + 1) * m])));
+        let n_rows = s.rows.next.len();
+        scores.extend((0..n_rows).map(|i| dot(&q, &s.rows.keys[i * m..(i + 1) * m])));
         let mx = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut z = 0f32;
         for sc in &mut scores {
@@ -429,20 +487,21 @@ impl Engine {
             let w = scores[i] / z;
             o.iter_mut().zip(vv).for_each(|(a, b)| *a += w * b);
         }
-        for i in 0..s.rows.2 {
+        for i in 0..n_rows {
             let w = scores[s.ring.len() + i] / z;
-            o.iter_mut().zip(&s.rows.1[i * m..(i + 1) * m]).for_each(|(a, b)| *a += w * b);
+            o.iter_mut().zip(&s.rows.values[i * m..(i + 1) * m]).for_each(|(a, b)| *a += w * b);
         }
         let mo = self.mo.apply(&o);
         let vr = &self.verdict[s.verdict * d..(s.verdict + 1) * d];
         for j in 0..d {
             x[j] += mo[j] + vr[j];
         }
-        // Pointer over strictly earlier ring positions and the memory rows:
-        // each column copies the token that followed it.
+        let logits = want_logits.then(|| self.emb.apply(&rms_gain(&x, &self.nout)));
+        // Pointer over strictly earlier ring positions, the memory rows, the
+        // induction column and the null: each copies the token that followed.
         let mut copy: Vec<(u32, f32)> = Vec::new();
         let mut gate = 1f32;
-        if want_logits && !self.no_pointer {
+        if let (Some(lg), false) = (&logits, self.no_pointer) {
             let pq = self.pq.apply(&xn);
             // Ring positions: the current token (the last) is at `s.pos`; a
             // reply never copies from itself.
@@ -452,11 +511,25 @@ impl Engine {
                 .filter(|&i| first + i as u64 + 1 < s.reply_start)
                 .map(|i| (s.ring[i + 1].0, dot(&pq, &s.ring[i].1)))
                 .collect();
-            sc.extend((0..s.rows.2).map(|i| (s.rows.3[i], dot(&pq, &s.rows.0[i * m..(i + 1) * m]))));
-            // Induction column: the memory's exact continuation.
-            if let Some((tok, n)) = self.continuation(s, first, s.reply_start) {
+            let fv = self.far_verdict[s.verdict];
+            sc.extend((0..n_rows).map(|i| {
+                let bias = fv + self.far_source[s.rows.source[i] as usize];
+                (s.rows.next[i], dot(&pq, &s.rows.keys[i * m..(i + 1) * m]) + bias)
+            }));
+            let c = self.continuation(s, first, s.reply_start);
+            s.last_ind = Some((s.pos, c));
+            if c.len > 0 {
+                let mx = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let lse = mx + lg.iter().map(|l| (l - mx).exp()).sum::<f32>().ln();
+                let lp_tok = lg.get(c.tok as usize).map_or(0.0, |l| l - lse);
                 let w: f32 = xn.iter().zip(&self.ind_w).map(|(a, b)| a * b).sum();
-                sc.push((tok, self.ind_len[n] + w));
+                let logit = self.ind_len[c.len_bin() as usize]
+                    + self.ind_count[c.count_trit() as usize]
+                    + self.ind_verdict[s.verdict]
+                    + w
+                    + self.ind_p[0] * lp_tok
+                    + self.ind_p[1] * (mx - lse);
+                sc.push((c.tok, logit));
             }
             // The null column's weight is the vocabulary's share.
             let null: f32 = xn.iter().zip(&self.gate_w).map(|(a, b)| a * b).sum::<f32>()
@@ -476,12 +549,7 @@ impl Engine {
             }
         }
         s.pos += 1;
-        if !want_logits {
-            return None;
-        }
-        let mut xo = rms_gain(&x, &self.nout);
-        rms(&mut xo);
-        let logits = self.emb.apply(&xo);
+        let logits = logits?;
         // Mixture a_null·p_vocab + Σ a·[next], returned as log-probabilities.
         let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
@@ -493,6 +561,13 @@ impl Engine {
         }
         Some(p.into_iter().map(|v| v.max(f32::MIN_POSITIVE).ln()).collect())
     }
+}
+
+/// Two-trit quantization of an activation row, as [`crate::layers::quant_act`].
+fn quant_act_vec(x: &[f32]) -> Vec<f32> {
+    let step = crate::layers::act_step(x, crate::layers::LEVELS);
+    let lv = crate::layers::LEVELS as f32;
+    x.iter().map(|&v| (v / step).round().clamp(-lv, lv) * step).collect()
 }
 
 /// Sample from logits with temperature and top-k.
@@ -530,14 +605,14 @@ mod tests {
         let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3 };
         let vm = VarMap::new();
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
-        // Non-trivial gains/signs/verdict so every path is exercised.
+        // Non-trivial gains/verdict/head features so every path is exercised.
         for (name, var) in vm.data().lock().unwrap().iter() {
-            if name.ends_with("gain")
-                || name == "verdict"
+            if name == "verdict"
                 || name.ends_with(".n1")
                 || name == "nout"
                 || name.starts_with("gate")
                 || name.starts_with("ind_")
+                || name.starts_with("far_")
             {
                 var.set(&Tensor::randn(0f32, 1.0, var.as_tensor().shape(), &dev).unwrap()).unwrap();
             }
@@ -547,8 +622,8 @@ mod tests {
         let ids = Tensor::from_vec(tokens.clone(), (1, 9), &dev).unwrap();
         let (tr, _) = model.trunk(&ids, &model.zero_state(1, &dev).unwrap()).unwrap();
         let ind = crate::train::Induction::new(100).window(&tokens);
-        assert_eq!(ind[7], (24, 3));
-        let mem = MemBatch::empty(1, 3, 9, &dev).unwrap().with_induction(&ind, 1, 9, &dev).unwrap();
+        assert_eq!(ind[7], IndCand { tok: 24, len: 3, count: 1 });
+        let mem = MemBatch::empty(1, 3, 9, &dev).unwrap().with_induction(ind.clone());
         let head = model.head(&tr, &mem).unwrap();
         let logits = head.logits.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
         let point = head.point.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
@@ -564,14 +639,14 @@ mod tests {
                     p[tokens[j + 1] as usize] += point[t][j];
                 }
                 // Columns: 9 window, 1 (empty) memory row, induction, null.
-                if ind[t].1 > 0 {
-                    p[ind[t].0 as usize] += point[t][10];
+                if ind[t].len > 0 {
+                    p[ind[t].tok as usize] += point[t][10];
                 }
                 p.into_iter().map(|v| v.ln()).collect()
             })
             .collect();
 
-        let packed = crate::pack::pack_checkpoint(&vm, cfg).unwrap();
+        let packed = crate::pack::pack_model(&model, &vm).unwrap();
         let engine = Engine::from_packed(&packed).unwrap();
         let mut s = engine.session(0);
         for (t, &tok) in tokens.iter().enumerate() {

@@ -1,23 +1,28 @@
 //! Ternary HadamRNN language model with an SNN long-context memory head.
 //!
 //! ```text
-//! tokens → embedding (2 trits)
-//!        → 3 × [ HadamRNN cell | retention (recurrent attention) | SwiGLU ]
+//! tokens → embedding (3 trits)
+//!        → 3 × [ HadamRNN cell (ternary decays) | retention | SwiGLU ]
 //!        → memory head: one softmax over
 //!             · the window's own tokens (causal, differentiable), and
-//!             · the tokens the SNN memory retrieved from the past 300k
+//!             · the rows the SNN memory retrieved from the past 300k
 //!          + embedding of the memory's ternary verdict
 //!        → tied output embedding
 //!        → pointer (copy) mix: p = a_null·p_vocab + Σⱼ aⱼ·[token after j]
 //! ```
 //!
-//! The pointer attends over the window's earlier positions and the rows the
-//! SNN memory retrieved, and copies the token that *followed* the attended
-//! position. Its null column is the gate: its logit sees the state and the
-//! memory's ternary verdict, and it competes with the matches themselves,
-//! so copying wins exactly where the pointer found a confident match.
-//! Unlike the value read, whose values only predict the next token, the
-//! pointer copies the real one — the direct path for exact recall.
+//! Memory keys and values are two-trit vectors (straight-through), in
+//! training exactly as the SNN memory stores them.
+//!
+//! The pointer attends over the window's earlier positions, the rows the
+//! SNN memory retrieved, one *induction* column and a null, and copies the
+//! token that followed the attended position. The induction column is the
+//! memory's exact continuation of the longest recent suffix; its logit
+//! sees the match length (up to 27), a trit for how often the suffix
+//! occurred, the memory's verdict, the state and how probable the
+//! vocabulary finds the candidate. Memory rows get a bias per verdict and
+//! per source trit (lexical / semantic / newest). The null column is the
+//! gate: copying wins exactly where a match is confident.
 //!
 //! The forward pass is split in two: [`Model::trunk`] computes everything up
 //! to the memory query; the caller then asks the SNN memory for rows
@@ -26,7 +31,7 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 
-use crate::layers::{quant2, rms, HadamCell, Mlp, Retention, RmsNorm, TLinear};
+use crate::layers::{quant_act, HadamCell, Mlp, QTensor, Retention, RmsNorm, TLinear, LEVELS, LEVELS3};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -70,13 +75,66 @@ pub struct Trunk {
     pub x: Tensor,
     /// Normalized residual feeding the memory head `(B, T, d)`.
     pub xn: Tensor,
-    /// Memory head query/key/value `(B, T, mem_dim)`.
+    /// Memory head query `(B, T, mem_dim)` and two-trit key/value.
     pub q: Tensor,
     pub k: Tensor,
     pub v: Tensor,
 }
 
-/// Rows retrieved from the SNN memory, one set per block.
+/// One block's retrieved rows.
+#[derive(Clone, Debug, Default)]
+pub struct BlockRows {
+    /// `rows × mem_dim` each.
+    pub keys: Vec<f32>,
+    pub values: Vec<f32>,
+    /// 0 = known, 1 = unknown, 2 = absent.
+    pub verdict: u32,
+    /// Token after each row (`u32::MAX` if unknown), row position, and
+    /// source trit (0 lexical, 1 semantic, 2 newest).
+    pub next: Vec<u32>,
+    pub pos: Vec<u64>,
+    pub source: Vec<u8>,
+}
+
+/// An induction candidate: the token that followed the most recent earlier
+/// occurrence of the longest suffix, the matched length (0 = none) and how
+/// many times that suffix occurred before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndCand {
+    pub tok: u32,
+    pub len: u16,
+    pub count: u32,
+}
+
+impl IndCand {
+    pub const NONE: Self = Self { tok: u32::MAX, len: 0, count: 0 };
+
+    /// Length bin: 0 none, then 3, 4, 5–6, 7–8, 9–13, 14–26, 27+.
+    pub fn len_bin(&self) -> u32 {
+        match self.len {
+            0..=2 => 0,
+            3 => 1,
+            4 => 2,
+            5..=6 => 3,
+            7..=8 => 4,
+            9..=13 => 5,
+            14..=26 => 6,
+            _ => 7,
+        }
+    }
+
+    /// Occurrence trit: once, a few times (2–3), many times (4+).
+    pub fn count_trit(&self) -> u32 {
+        match self.count {
+            0..=1 => 0,
+            2..=3 => 1,
+            _ => 2,
+        }
+    }
+}
+
+/// Rows retrieved from the SNN memory, one set per block, and the window's
+/// induction candidates.
 pub struct MemBatch {
     /// `(B, nb, M, mem_dim)`.
     pub keys: Tensor,
@@ -85,38 +143,42 @@ pub struct MemBatch {
     pub mask: Tensor,
     /// Verdict per block `(B, nb)`: 0 = known, 1 = unknown, 2 = absent.
     pub verdict: Tensor,
-    /// Token that followed each row `(B, nb, M)`, `u32::MAX` for padding.
+    /// Source trit per row `(B, nb, M)`.
+    pub source: Tensor,
+    /// Token after each row and its position `(B, nb, M)`, `MAX` for padding.
     pub next: Vec<u32>,
+    pub pos: Vec<u64>,
     pub m: usize,
-    /// Induction column: suffix length per position `(B, T)` (0 = none)
-    /// and the token that followed the matched suffix.
-    pub ind_n: Option<Tensor>,
-    pub ind_tok: Vec<u32>,
+    /// Induction candidates `(B·T)`.
+    pub ind: Vec<IndCand>,
 }
-
-/// One retrieved block: keys, values, verdict, token after each row.
-pub type BlockRows = (Vec<f32>, Vec<f32>, u32, Vec<u32>);
 
 impl MemBatch {
     /// Build from per-(stream, block) rows, padding to the longest set.
     pub fn from_rows(rows: &[Vec<BlockRows>], dim: usize, device: &Device) -> Result<Self> {
         let b = rows.len();
         let nb = rows[0].len();
-        let m = rows.iter().flatten().map(|r| r.0.len() / dim).max().unwrap_or(0).max(1);
+        let m = rows.iter().flatten().map(|r| r.pos.len()).max().unwrap_or(0).max(1);
         let mut keys = vec![0f32; b * nb * m * dim];
         let mut values = vec![0f32; b * nb * m * dim];
         let mut mask = vec![-1e9f32; b * nb * m];
         let mut verdict = vec![1u32; b * nb];
+        let mut source = vec![0u32; b * nb * m];
         let mut next = vec![u32::MAX; b * nb * m];
+        let mut pos = vec![u64::MAX; b * nb * m];
         for (bi, blocks) in rows.iter().enumerate() {
-            for (j, (k, v, verd, nx)) in blocks.iter().enumerate() {
-                let n = k.len() / dim;
+            for (j, r) in blocks.iter().enumerate() {
+                let n = r.pos.len();
                 let base = (bi * nb + j) * m;
-                keys[base * dim..(base + n) * dim].copy_from_slice(k);
-                values[base * dim..(base + n) * dim].copy_from_slice(v);
+                keys[base * dim..(base + n) * dim].copy_from_slice(&r.keys);
+                values[base * dim..(base + n) * dim].copy_from_slice(&r.values);
                 mask[base..base + n].iter_mut().for_each(|x| *x = 0.0);
-                verdict[bi * nb + j] = *verd;
-                next[base..base + nx.len().min(n)].copy_from_slice(&nx[..nx.len().min(n)]);
+                verdict[bi * nb + j] = r.verdict;
+                next[base..base + n].copy_from_slice(&r.next);
+                pos[base..base + n].copy_from_slice(&r.pos);
+                for (s, &x) in source[base..base + n].iter_mut().zip(&r.source) {
+                    *s = x as u32;
+                }
             }
         }
         Ok(Self {
@@ -124,24 +186,23 @@ impl MemBatch {
             values: Tensor::from_vec(values, (b, nb, m, dim), device)?,
             mask: Tensor::from_vec(mask, (b, nb, m), device)?,
             verdict: Tensor::from_vec(verdict, (b, nb), device)?,
+            source: Tensor::from_vec(source, (b, nb, m), device)?,
             next,
+            pos,
             m,
-            ind_n: None,
-            ind_tok: Vec::new(),
+            ind: Vec::new(),
         })
     }
 
-    /// Attach the induction candidates `(token, suffix length)` of a window.
-    pub fn with_induction(mut self, ind: &[(u32, u8)], b: usize, t: usize, device: &Device) -> Result<Self> {
-        self.ind_tok = ind.iter().map(|c| c.0).collect();
-        let n: Vec<u32> = ind.iter().map(|c| c.1 as u32).collect();
-        self.ind_n = Some(Tensor::from_vec(n, (b, t), device)?);
-        Ok(self)
+    /// Attach the window's induction candidates `(B·T)`.
+    pub fn with_induction(mut self, ind: Vec<IndCand>) -> Self {
+        self.ind = ind;
+        self
     }
 
     /// No memory (ablation / first window).
     pub fn empty(b: usize, nb: usize, dim: usize, device: &Device) -> Result<Self> {
-        Self::from_rows(&vec![vec![(Vec::new(), Vec::new(), 1, Vec::new()); nb]; b], dim, device)
+        Self::from_rows(&vec![vec![BlockRows { verdict: 1, ..Default::default() }; nb]; b], dim, device)
     }
 }
 
@@ -157,10 +218,13 @@ pub struct Ablation {
 /// Tokens in the lexical probe of a memory read.
 pub const PROBE: usize = 9;
 
+/// Bins of the induction match length (see [`IndCand::len_bin`]).
+pub const LEN_BINS: usize = 8;
+
 pub struct Model {
     pub cfg: Config,
     pub ablation: Ablation,
-    emb: Tensor,
+    emb: QTensor,
     layers: Vec<Layer>,
     nm: RmsNorm,
     mq: TLinear,
@@ -172,13 +236,20 @@ pub struct Model {
     /// Pointer query (keys are the memory keys `mk`, so the SNN memory's
     /// stored rows serve both the value read and the pointer).
     pq: TLinear,
-    /// Null-column logit of the pointer: `xn·gate_w + gate_b + gate_verdict[verdict]`.
+    /// Null logit: `xn·gate_w + gate_b + gate_verdict[verdict]`.
     gate_w: Tensor,
     gate_b: Tensor,
     gate_verdict: Tensor,
-    /// Induction column logit: `ind_len[suffix length] + xn·ind_w`.
+    /// Induction logit: `ind_len[bin] + ind_count[trit] + ind_verdict[v] +
+    /// xn·ind_w + ind_p[0]·log p_vocab(candidate) + ind_p[1]·max log p_vocab`.
     ind_len: Tensor,
+    ind_count: Tensor,
+    ind_verdict: Tensor,
     ind_w: Tensor,
+    ind_p: Tensor,
+    /// Memory-row biases per block verdict and per row source trit.
+    far_verdict: Tensor,
+    far_source: Tensor,
 }
 
 /// Output of the head.
@@ -193,11 +264,15 @@ pub struct HeadOut {
     pub gate: Tensor,
 }
 
+/// Per-block values `(B, nb)` repeated over each block's positions `(B, T)`.
+fn per_block(x: &Tensor, b: usize, nb: usize, blk: usize) -> Result<Tensor> {
+    x.reshape((b, nb, 1))?.broadcast_as((b, nb, blk))?.reshape((b, nb * blk))
+}
+
 impl Model {
     pub fn new(vb: VarBuilder, cfg: Config) -> Result<Self> {
         let d = cfg.d;
-        let emb =
-            vb.get_with_hints((cfg.vocab, d), "emb", Init::Randn { mean: 0.0, stdev: 1.0 / (d as f64).sqrt() })?;
+        let emb = QTensor::new(&vb, "emb", cfg.vocab, d, 1.0 / (d as f64).sqrt(), LEVELS3)?;
         let layers = (0..cfg.layers)
             .map(|i| {
                 let vb = vb.pp(format!("l{i}"));
@@ -212,6 +287,7 @@ impl Model {
             })
             .collect::<Result<Vec<_>>>()?;
         let m = cfg.mem_dim;
+        let zeros = |n: usize, name: &str| vb.get_with_hints(n, name, Init::Const(0.0));
         Ok(Self {
             emb,
             layers,
@@ -223,11 +299,17 @@ impl Model {
             verdict: vb.get_with_hints((3, d), "verdict", Init::Const(0.0))?,
             nout: RmsNorm::new(vb.clone(), "nout", d)?,
             pq: TLinear::new(vb.clone(), "pq", d, m)?,
-            gate_w: vb.get_with_hints(d, "gate_w", Init::Const(0.0))?,
+            gate_w: zeros(d, "gate_w")?,
+            // The vocabulary starts with nearly all the weight.
             gate_b: vb.get_with_hints(1, "gate_b", Init::Const(8.0))?,
-            gate_verdict: vb.get_with_hints(3, "gate_verdict", Init::Const(0.0))?,
-            ind_len: vb.get_with_hints(9, "ind_len", Init::Const(0.0))?,
-            ind_w: vb.get_with_hints(d, "ind_w", Init::Const(0.0))?,
+            gate_verdict: zeros(3, "gate_verdict")?,
+            ind_len: zeros(LEN_BINS, "ind_len")?,
+            ind_count: zeros(3, "ind_count")?,
+            ind_verdict: zeros(3, "ind_verdict")?,
+            ind_w: zeros(d, "ind_w")?,
+            ind_p: zeros(2, "ind_p")?,
+            far_verdict: zeros(3, "far_verdict")?,
+            far_source: zeros(3, "far_source")?,
             ablation: Ablation::default(),
             cfg,
         })
@@ -246,7 +328,7 @@ impl Model {
     /// Everything up to the memory query. `ids`: `(B, T)` u32.
     pub fn trunk(&self, ids: &Tensor, state: &State) -> Result<(Trunk, State)> {
         let (b, t) = ids.dims2()?;
-        let emb = quant2(&self.emb)?;
+        let emb = self.emb.q()?;
         let mut x = emb.index_select(&ids.flatten_all()?, 0)?.reshape((b, t, self.cfg.d))?;
         let mut next = State { h: Vec::new(), s: Vec::new() };
         for (i, l) in self.layers.iter().enumerate() {
@@ -263,7 +345,10 @@ impl Model {
             next.s.push(s.detach());
         }
         let xn = self.nm.forward(&x)?;
-        let (q, k, v) = (self.mq.forward(&xn)?, self.mk.forward(&xn)?, self.mv.forward(&xn)?);
+        let q = self.mq.forward(&xn)?;
+        // Keys and values as the SNN memory stores them: two trits each.
+        let k = quant_act(&self.mk.forward(&xn)?, LEVELS)?;
+        let v = quant_act(&self.mv.forward(&xn)?, LEVELS)?;
         Ok((Trunk { x, xn, q, k, v }, next))
     }
 
@@ -274,6 +359,7 @@ impl Model {
         let nb = t / blk;
         let scale = 1.0 / (m as f64).sqrt();
         let device = tr.q.device();
+        let verdict_ids = mem.verdict.flatten_all()?;
 
         let causal = Tensor::tril2(t, DType::F32, device)?.affine(1e9, -1e9)?;
         let local = tr.q.matmul(&tr.k.t()?)?.affine(scale, 0.0)?.broadcast_add(&causal)?;
@@ -290,35 +376,31 @@ impl Model {
         let o_far = att.narrow(2, t, mm)?.reshape((b, nb, blk, mm))?.matmul(&mem.values)?.reshape((b, t, m))?;
         let o = self.mo.forward(&(o_local + o_far)?)?;
 
-        let verdict = self.verdict.index_select(&mem.verdict.flatten_all()?, 0)?.reshape((b, nb, 1, self.cfg.d))?;
+        let verdict = self.verdict.index_select(&verdict_ids, 0)?.reshape((b, nb, 1, self.cfg.d))?;
         let verdict = verdict.broadcast_as((b, nb, blk, self.cfg.d))?.reshape((b, t, self.cfg.d))?;
         let x = ((&tr.x + o)? + verdict)?;
-        let emb = quant2(&self.emb)?;
-        let logits = crate::layers::linear(&rms(&self.nout.forward(&x)?)?, &emb)?;
+        let emb = self.emb.q()?;
+        let logits = crate::layers::linear(&self.nout.forward(&x)?, &emb)?;
 
-        // Pointer: strictly earlier window positions, memory rows, a null.
+        // Pointer: strictly earlier window positions, memory rows, induction, null.
         let pq = self.pq.forward(&tr.xn)?;
         let strict: Vec<f32> = (0..t * t).map(|i| if i % t < i / t { 0.0 } else { -1e9 }).collect();
         let strict = Tensor::from_vec(strict, (t, t), device)?;
         let p_local = pq.matmul(&tr.k.t()?)?.affine(scale, 0.0)?.broadcast_add(&strict)?;
+        let row_bias = self
+            .far_source
+            .index_select(&mem.source.flatten_all()?, 0)?
+            .reshape((b, nb, mm))?
+            .broadcast_add(&self.far_verdict.index_select(&verdict_ids, 0)?.reshape((b, nb, 1))?)?;
         let p_far = pq
             .reshape((b, nb, blk, m))?
             .matmul(&mem.keys.transpose(2, 3)?.contiguous()?)?
             .affine(scale, 0.0)?
-            .broadcast_add(&mem.mask.unsqueeze(2)?)?
+            .broadcast_add(&(mem.mask.clone() + row_bias)?.unsqueeze(2)?)?
             .reshape((b, t, mm))?;
-        let gv = self.gate_verdict.index_select(&mem.verdict.flatten_all()?, 0)?.reshape((b, nb, 1))?;
-        let gv = gv.broadcast_as((b, nb, blk))?.reshape((b, t))?;
-        let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + gv)?;
-        // Induction column: the memory's exact continuation, weighted by the
-        // matched suffix length and the state; masked where nothing matched.
-        let ind_n = match &mem.ind_n {
-            Some(n) => n.clone(),
-            None => Tensor::zeros((b, t), DType::U32, device)?,
-        };
-        let len_logit = self.ind_len.index_select(&ind_n.flatten_all()?, 0)?.reshape((b, t))?;
-        let none = ind_n.eq(0u32)?.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
-        let ind = ((len_logit + tr.xn.broadcast_mul(&self.ind_w)?.sum(D::Minus1)?)? + none)?;
+        let gv = per_block(&self.gate_verdict.index_select(&verdict_ids, 0)?, b, nb, blk)?;
+        let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + &gv)?;
+        let ind = self.induction_logit(tr, mem, &logits, &verdict_ids, b, t, nb, blk)?;
         let cols = Tensor::cat(&[&p_local, &p_far, &ind.unsqueeze(2)?, &null.unsqueeze(2)?], 2)?;
         let point = candle_nn::ops::softmax(&cols, D::Minus1)?;
         let point = if self.ablation.no_pointer {
@@ -330,6 +412,57 @@ impl Model {
         };
         let gate = point.narrow(2, t + mm + 1, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
+    }
+
+    /// The induction column's logit `(B, T)`, `-1e9` where nothing matched.
+    #[allow(clippy::too_many_arguments)]
+    fn induction_logit(
+        &self,
+        tr: &Trunk,
+        mem: &MemBatch,
+        logits: &Tensor,
+        verdict_ids: &Tensor,
+        b: usize,
+        t: usize,
+        nb: usize,
+        blk: usize,
+    ) -> Result<Tensor> {
+        let device = tr.xn.device();
+        let none_cands = vec![IndCand::NONE; b * t];
+        let cands = if mem.ind.len() == b * t { &mem.ind } else { &none_cands };
+        let u =
+            |f: &dyn Fn(&IndCand) -> u32| Tensor::from_vec(cands.iter().map(f).collect::<Vec<u32>>(), b * t, device);
+        let len = self.ind_len.index_select(&u(&|c| c.len_bin())?, 0)?;
+        let count = self.ind_count.index_select(&u(&|c| c.count_trit())?, 0)?;
+        let none = u(&|c| u32::from(c.len == 0))?.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
+        let verdict = per_block(&self.ind_verdict.index_select(verdict_ids, 0)?, b, nb, blk)?.flatten_all()?;
+        // How probable the vocabulary finds the candidate, and its own best
+        // guess (both detached: features, not a path for gradients).
+        let lg = logits.detach().flatten_to(1)?;
+        let lse = lg.log_sum_exp(1)?;
+        let tok = u(&|c| if c.len == 0 { 0 } else { c.tok })?;
+        let lp_tok = (lg.gather(&tok.unsqueeze(1)?, 1)?.squeeze(1)? - &lse)?;
+        let lp_max = (lg.max(1)? - &lse)?;
+        let p0 = self.ind_p.narrow(0, 0, 1)?;
+        let p1 = self.ind_p.narrow(0, 1, 1)?;
+        let feats = (lp_tok.broadcast_mul(&p0)? + lp_max.broadcast_mul(&p1)?)?;
+        let state = tr.xn.broadcast_mul(&self.ind_w)?.sum(D::Minus1)?.flatten_all()?;
+        let logit = ((((((len + count)? + verdict)? + state)? + feats)?) + none)?;
+        logit.reshape((b, t))
+    }
+
+    /// Named quantized matrices (for packing and health checks).
+    pub fn qtensors(&self) -> Vec<(String, &QTensor)> {
+        let mut out = vec![("emb".to_string(), &self.emb)];
+        for (i, l) in self.layers.iter().enumerate() {
+            for (n, q) in l.cell.qtensors().into_iter().chain(l.ret.qtensors()).chain(l.mlp.qtensors()) {
+                out.push((format!("l{i}.{n}"), q));
+            }
+        }
+        for (n, lin) in [("mq", &self.mq), ("mk", &self.mk), ("mv", &self.mv), ("mo", &self.mo), ("pq", &self.pq)] {
+            out.push((n.to_string(), &lin.w));
+        }
+        out
     }
 
     /// Number of trainable parameters.
@@ -362,14 +495,21 @@ mod tests {
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), small()).unwrap();
         let ids = Tensor::from_vec((0..18u32).map(|i| i % 5).collect::<Vec<_>>(), (2, 9), &dev).unwrap();
         let (tr, _) = model.trunk(&ids, &model.zero_state(2, &dev).unwrap()).unwrap();
-        let mut rows = vec![vec![(Vec::new(), Vec::new(), 1u32, Vec::new()); 3]; 2];
-        rows[0][1] = (vec![0.5; 9], vec![1.0; 9], 0, vec![3]);
+        let mut rows = vec![vec![BlockRows { verdict: 1, ..Default::default() }; 3]; 2];
+        rows[0][1] = BlockRows {
+            keys: vec![0.5; 9],
+            values: vec![1.0; 9],
+            verdict: 0,
+            next: vec![3],
+            pos: vec![0],
+            source: vec![0],
+        };
         let h = model.head(&tr, &MemBatch::from_rows(&rows, 9, &dev).unwrap()).unwrap();
         let loss = (h.logits.sqr().unwrap().mean_all().unwrap() + h.point.narrow(2, 0, 9).unwrap().sum_all().unwrap())
             .unwrap();
         let grads = loss.backward().unwrap();
         for (name, var) in vm.data().lock().unwrap().iter() {
-            if ["mq", "mk", "pq", "gate_w"].iter().any(|p| name.starts_with(p)) {
+            if ["mq", "mk", "pq", "gate_w", "far_", "emb_step"].iter().any(|p| name.starts_with(p)) {
                 let g =
                     grads.get(var.as_tensor()).map(|g| g.abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap());
                 assert!(g.is_some_and(|g| g > 0.0), "{name}: no gradient ({g:?})");
@@ -398,8 +538,15 @@ mod tests {
         }
 
         // A retrieved row for block 1 of stream 0 changes only that block.
-        let mut rows = vec![vec![(Vec::new(), Vec::new(), 1u32, Vec::new()); 3]; 2];
-        rows[0][1] = (vec![3.0; 9], vec![5.0; 9], 0, vec![7]);
+        let mut rows = vec![vec![BlockRows { verdict: 1, ..Default::default() }; 3]; 2];
+        rows[0][1] = BlockRows {
+            keys: vec![3.0; 9],
+            values: vec![5.0; 9],
+            verdict: 0,
+            next: vec![7],
+            pos: vec![0],
+            source: vec![1],
+        };
         let mem = MemBatch::from_rows(&rows, 9, &dev).unwrap();
         let with = model.head(&tr, &mem).unwrap().logits;
         let diff = (with - &base).unwrap().abs().unwrap().sum(2).unwrap().to_vec2::<f32>().unwrap();

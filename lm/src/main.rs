@@ -147,10 +147,11 @@ fn ngram(args: &[String]) -> std::io::Result<()> {
 }
 
 fn kv_precision(args: &[String]) -> snn_memory::KvPrecision {
-    match arg(args, "--kv", "ternary").as_str() {
+    match arg(args, "--kv", "trit2").as_str() {
         "f16" => snn_memory::KvPrecision::F16,
         "f32" => snn_memory::KvPrecision::F32,
-        _ => snn_memory::KvPrecision::Ternary,
+        "ternary" => snn_memory::KvPrecision::Ternary,
+        _ => snn_memory::KvPrecision::Trit2,
     }
 }
 
@@ -195,12 +196,21 @@ fn recall(args: &[String]) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?;
     for r in res {
         println!(
-            "memory {} distance {:>7}: exact {}/{}  answer loss {:.3}",
+            "memory {} distance {:>7}: exact {}/{}  first token {}/{}  answer loss {:.3}  key found {}/{}  \
+             weights vocab {:.2} window {:.2} rows {:.2} induction {:.2}",
             if memory { "on " } else { "off" },
             r.distance,
             r.exact,
             r.episodes,
-            r.loss
+            r.first,
+            r.episodes,
+            r.loss,
+            r.found,
+            r.episodes,
+            r.weights[0],
+            r.weights[1],
+            r.weights[2],
+            r.weights[3]
         );
     }
     println!("({:.0}s)", t.elapsed().as_secs_f64());
@@ -213,14 +223,13 @@ fn export(args: &[String]) -> std::io::Result<()> {
     let out = PathBuf::from(arg(args, "--out", "lm/model"));
     std::fs::create_dir_all(&out)?;
     let mut varmap = candle_nn::VarMap::new();
-    let _ = snn_lm::model::Model::new(
+    let model = snn_lm::model::Model::new(
         candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &candle_core::Device::Cpu),
         snn_lm::model::Config::default(),
     )
     .map_err(std::io::Error::other)?;
     varmap.load(run.join("model.safetensors")).map_err(std::io::Error::other)?;
-    let packed =
-        snn_lm::pack::pack_checkpoint(&varmap, snn_lm::model::Config::default()).map_err(std::io::Error::other)?;
+    let packed = snn_lm::pack::pack_model(&model, &varmap).map_err(std::io::Error::other)?;
     packed.save(std::io::BufWriter::new(std::fs::File::create(out.join("model.snnt"))?))?;
     std::fs::copy(data.join("tokenizer.bpe"), out.join("tokenizer.bpe"))?;
     println!(
@@ -522,7 +531,7 @@ fn main() {
                 "       snn-lm ngram [--tokens N] | eval [--run DIR] | recall [--distances a,b,..] [--memory on|off]"
             );
             eprintln!(
-                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv ternary|f16] [--copy λ]"
+                "       snn-lm export [--run DIR] [--out lm/model] | chat [--model lm/model] [--temp X] [--memory N] [--kv trit2|ternary|f16] [--copy λ]"
             );
             eprintln!("       snn-lm probe --context FILE --probes FILE [--model lm/model]  (memory alone, lines prefix|answer)");
             eprintln!("       snn-lm copyeval [--copy λ] [--pointer on|off] [--distances a,b,..] [--tokens N]");

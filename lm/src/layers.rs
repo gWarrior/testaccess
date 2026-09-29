@@ -9,41 +9,103 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Init, VarBuilder};
 
-/// Largest magnitude of a two-trit weight (balanced ternary `±(3 + 1)`).
-pub const LEVELS: f64 = 4.0;
+/// Largest level of a two-trit weight (balanced ternary `±(3 + 1)`).
+pub const LEVELS: i32 = 4;
+/// Largest level of a three-trit weight (`±(9 + 3 + 1)`).
+pub const LEVELS3: i32 = 13;
 
-/// Quantization step relative to the row's mean |w|. For Gaussian weights
-/// a 9-level uniform quantizer has minimal squared error at a step of about
-/// 0.55 σ = 0.69 · mean|w|: coarser steps round too many weights to zero,
-/// finer ones clip too many at ±4.
-const STEP: f64 = 0.69;
-
-/// Per-row step, rounded to a power of two so dequantization is a shift.
-/// Clamped far from f32 underflow.
-fn row_step(w: &Tensor) -> Result<Tensor> {
-    let s = w.abs()?.mean_keepdim(D::Minus1)?;
-    let steps: Vec<f32> = s
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .into_iter()
-        .map(|m| 2f64.powi((m as f64 * STEP).max(1e-30).log2().round() as i32) as f32)
-        .collect();
-    Tensor::from_vec(steps, s.shape(), w.device())
+/// MSE-optimal uniform step relative to mean|w| for Gaussian weights: the
+/// initial step; training then learns each row's step.
+fn step_ratio(levels: i32) -> f64 {
+    if levels >= LEVELS3 {
+        0.272
+    } else {
+        0.669
+    }
 }
 
-/// Quantize to two trits per weight (power-of-two row step), with STE.
-pub fn quant2(w: &Tensor) -> Result<Tensor> {
-    w.contiguous()?.apply_op1(Quant2)
+/// A weight matrix quantized to `levels` per side (4: two trits, 13: three
+/// trits) with a learned per-row step that is always an exact power of two,
+/// `2^round(θ)`, so dequantization is a shift in training and inference
+/// alike. The forward pass sees the quantized weights; gradients pass
+/// straight through inside the range (clipped outside) and reach θ by the
+/// LSQ rule.
+#[derive(Clone, Debug)]
+pub struct QTensor {
+    pub w: Tensor,
+    pub theta: Tensor,
+    pub levels: i32,
 }
 
-/// One parallel pass per row: `step = 2^round(log2(0.69·mean|w|))`,
-/// `q = clamp(round(w / step), ±4) · step`; the gradient passes straight
-/// through. The step is an exact power of two, as in the packed model.
-struct Quant2;
+impl QTensor {
+    /// `(rows, cols)` weights `N(0, std²)`, the step initialized to the optimum.
+    pub fn new(vb: &VarBuilder, name: &str, rows: usize, cols: usize, std: f64, levels: i32) -> Result<Self> {
+        let w = vb.get_with_hints((rows, cols), name, Init::Randn { mean: 0.0, stdev: std })?;
+        let theta0 = (step_ratio(levels) * std * (2.0 / std::f64::consts::PI).sqrt()).log2();
+        let theta = vb.get_with_hints(rows, &format!("{name}_step"), Init::Const(theta0))?;
+        Ok(Self { w, theta, levels })
+    }
 
-impl candle_core::CustomOp1 for Quant2 {
+    pub fn q(&self) -> Result<Tensor> {
+        self.w.contiguous()?.apply_op2(&self.theta.contiguous()?, Quant { levels: self.levels })
+    }
+
+    /// Integer levels and per-row exponents (the packed form).
+    pub fn levels_and_exps(&self) -> Result<(Vec<i8>, Vec<i8>)> {
+        let w = self.w.to_vec2::<f32>()?;
+        let theta = self.theta.to_vec1::<f32>()?;
+        let mut levels = Vec::new();
+        let mut exps = Vec::new();
+        for (row, &t) in w.iter().zip(&theta) {
+            let e = t.round().clamp(-127.0, 127.0) as i8;
+            let step = 2f32.powi(e as i32);
+            exps.push(e);
+            levels.extend(row.iter().map(|&x| (x / step).round().clamp(-self.levels as f32, self.levels as f32) as i8));
+        }
+        Ok((levels, exps))
+    }
+
+    /// Fractions of weights rounded to zero and clipped, and ‖q − w‖ / ‖w‖.
+    pub fn health(&self) -> Result<(f64, f64, f64)> {
+        let (levels, exps) = self.levels_and_exps()?;
+        let w = self.w.to_vec2::<f32>()?;
+        let (mut zero, mut clip, mut err, mut norm, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let cols = w.first().map_or(0, Vec::len);
+        for (r, row) in w.iter().enumerate() {
+            let step = 2f64.powi(exps[r] as i32);
+            for (c, &x) in row.iter().enumerate() {
+                let l = levels[r * cols + c];
+                zero += f64::from(l == 0);
+                clip += f64::from((x as f64 / step).abs() > self.levels as f64 + 0.5);
+                err += (l as f64 * step - x as f64).powi(2);
+                norm += (x as f64).powi(2);
+                n += 1.0;
+            }
+        }
+        Ok((zero / n, clip / n, (err / norm.max(1e-30)).sqrt()))
+    }
+}
+
+/// Quantize an activation (e.g. a memory key) to `levels` per side along
+/// its last dimension, step `2^round(log2(c·mean|x|))` per row, as the SNN
+/// memory stores it; the gradient passes straight through.
+pub fn quant_act(x: &Tensor, levels: i32) -> Result<Tensor> {
+    x.contiguous()?.apply_op1(QuantAct { levels })
+}
+
+/// The per-row step of [`quant_act`] (shared with the K/V store).
+pub fn act_step(row: &[f32], levels: i32) -> f32 {
+    let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len().max(1) as f64;
+    2f64.powi((mean * step_ratio(levels)).max(1e-30).log2().round() as i32) as f32
+}
+
+struct QuantAct {
+    levels: i32,
+}
+
+impl candle_core::CustomOp1 for QuantAct {
     fn name(&self) -> &'static str {
-        "quant2"
+        "quant-act"
     }
 
     fn cpu_fwd(
@@ -52,14 +114,14 @@ impl candle_core::CustomOp1 for Quant2 {
         l: &candle_core::Layout,
     ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
         use rayon::prelude::*;
-        let w = cpu_tensor(s, l)?.flatten_all()?.to_vec1::<f32>()?;
+        let x = cpu_tensor(s, l)?.flatten_all()?.to_vec1::<f32>()?;
         let cols = *l.shape().dims().last().expect("rank >= 1");
-        let mut out = vec![0f32; w.len()];
-        out.par_chunks_mut(cols).zip(w.par_chunks(cols)).for_each(|(o, row)| {
-            let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / cols as f64;
-            let step = 2f64.powi((mean * STEP).max(1e-30).log2().round() as i32) as f32;
-            for (o, &x) in o.iter_mut().zip(row) {
-                *o = (x / step).round().clamp(-LEVELS as f32, LEVELS as f32) * step;
+        let lv = self.levels as f32;
+        let mut out = vec![0f32; x.len()];
+        out.par_chunks_mut(cols).zip(x.par_chunks(cols)).for_each(|(o, row)| {
+            let step = act_step(row, self.levels);
+            for (o, &v) in o.iter_mut().zip(row) {
+                *o = (v / step).round().clamp(-lv, lv) * step;
             }
         });
         Ok((candle_core::CpuStorage::F32(out), l.shape().clone()))
@@ -70,26 +132,70 @@ impl candle_core::CustomOp1 for Quant2 {
     }
 }
 
-/// Integer levels and per-row power-of-two steps of a weight matrix.
-pub fn quant2_levels(w: &Tensor) -> Result<(Vec<i8>, Vec<f32>)> {
-    let step = row_step(w)?;
-    let q = w.broadcast_div(&step)?.round()?.clamp(-LEVELS, LEVELS)?;
-    let levels = q.flatten_all()?.to_vec1::<f32>()?.into_iter().map(|x| x as i8).collect();
-    Ok((levels, step.flatten_all()?.to_vec1::<f32>()?))
+/// Quantize rows of `w` with steps `2^round(θ)`.
+struct Quant {
+    levels: i32,
 }
 
-/// Fractions of weights rounded to zero and clipped at ±4, and the relative
-/// quantization error ‖q − w‖ / ‖w‖.
-pub fn quant2_health(w: &Tensor) -> Result<(f64, f64, f64)> {
-    let step = row_step(w)?;
-    let x = w.broadcast_div(&step)?;
-    let n = w.elem_count() as f64;
-    let zero = x.abs()?.lt(0.5)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64 / n;
-    let clip = x.abs()?.gt(LEVELS + 0.5)?.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64 / n;
-    let q = x.round()?.clamp(-LEVELS, LEVELS)?.broadcast_mul(&step)?;
-    let err = (q - w)?.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-    let norm = w.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
-    Ok((zero, clip, (err / norm.max(1e-30)).sqrt()))
+impl candle_core::CustomOp2 for Quant {
+    fn name(&self) -> &'static str {
+        "quant"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &candle_core::CpuStorage,
+        l1: &candle_core::Layout,
+        s2: &candle_core::CpuStorage,
+        l2: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        use rayon::prelude::*;
+        let w = cpu_tensor(s1, l1)?.flatten_all()?.to_vec1::<f32>()?;
+        let theta = cpu_tensor(s2, l2)?.to_vec1::<f32>()?;
+        let cols = *l1.shape().dims().last().expect("rank 2");
+        let lv = self.levels as f32;
+        let mut out = vec![0f32; w.len()];
+        out.par_chunks_mut(cols).zip(w.par_chunks(cols)).zip(theta.par_iter()).for_each(|((o, row), &t)| {
+            let step = 2f32.powi(t.round() as i32);
+            for (o, &x) in o.iter_mut().zip(row) {
+                *o = (x / step).round().clamp(-lv, lv) * step;
+            }
+        });
+        Ok((candle_core::CpuStorage::F32(out), l1.shape().clone()))
+    }
+
+    fn bwd(&self, w: &Tensor, theta: &Tensor, _res: &Tensor, g: &Tensor) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        use rayon::prelude::*;
+        let (rows, cols) = w.dims2()?;
+        let wv = w.detach().flatten_all()?.to_vec1::<f32>()?;
+        let tv = theta.detach().to_vec1::<f32>()?;
+        let gv = g.detach().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        let lv = self.levels as f32;
+        // LSQ gradient scale: 1 / sqrt(cols · levels).
+        let scale = 1.0 / ((cols as f32) * lv).sqrt();
+        let mut gw = vec![0f32; rows * cols];
+        let gt: Vec<f32> = gw
+            .par_chunks_mut(cols)
+            .enumerate()
+            .map(|(r, gw)| {
+                let step = 2f32.powi(tv[r].round() as i32);
+                let mut dt = 0f32;
+                for c in 0..cols {
+                    let i = r * cols + c;
+                    let x = wv[i] / step;
+                    let inside = x.abs() <= lv + 0.5;
+                    // Clipped STE for the weight.
+                    gw[c] = if inside { gv[i] } else { 0.0 };
+                    // dq/ds (LSQ), then ds/dθ = s·ln2 through the rounding.
+                    let dq = if inside { x.round().clamp(-lv, lv) - x } else { x.signum() * lv };
+                    dt += gv[i] * dq;
+                }
+                dt * step * std::f32::consts::LN_2 * scale
+            })
+            .collect();
+        let dev = w.device();
+        Ok((Some(Tensor::from_vec(gw, (rows, cols), dev)?), Some(Tensor::from_vec(gt, rows, dev)?)))
+    }
 }
 
 /// Binary sign with STE (used for the Hadamard recurrence).
@@ -100,17 +206,20 @@ pub fn ste_sign(w: &Tensor) -> Result<Tensor> {
 
 /// Linear map `x · Wᵀ` with a two-trit weight.
 pub struct TLinear {
-    pub w: Tensor,
+    pub w: QTensor,
 }
 
 impl TLinear {
     pub fn new(vb: VarBuilder, name: &str, d_in: usize, d_out: usize) -> Result<Self> {
-        let std = (1.0 / d_in as f64).sqrt();
-        Ok(Self { w: vb.get_with_hints((d_out, d_in), name, Init::Randn { mean: 0.0, stdev: std })? })
+        Self::with_std(vb, name, d_in, d_out, (1.0 / d_in as f64).sqrt())
+    }
+
+    pub fn with_std(vb: VarBuilder, name: &str, d_in: usize, d_out: usize, std: f64) -> Result<Self> {
+        Ok(Self { w: QTensor::new(&vb, name, d_out, d_in, std, LEVELS)? })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        linear(x, &quant2(&self.w)?)
+        linear(x, &self.w.q()?)
     }
 }
 
@@ -219,26 +328,38 @@ pub struct HadamCell {
     wu: TLinear,
     wz: TLinear,
     sign: Tensor,
-    gain: Tensor,
+    decay: Tensor,
     h: Tensor,
+}
+
+/// Ternary decays of the Hadamard recurrence: unit `j` keeps `1 − 3^−k`
+/// of its state per step, `k = 1…5` in five equal groups — horizons from 3
+/// to about 243 tokens, fixed rather than learned (as in retention).
+pub fn hadam_decays(d: usize) -> Vec<f32> {
+    (0..d).map(|j| 1.0 - 3f32.powi(-(1 + (j * 5 / d) as i32))).collect()
 }
 
 impl HadamCell {
     pub fn new(vb: VarBuilder, d: usize) -> Result<Self> {
         let device = vb.device().clone();
         Ok(Self {
-            wu: TLinear::new(vb.clone(), "wu", d, d)?,
+            // Half the usual input scale keeps tanh out of saturation.
+            wu: TLinear::with_std(vb.clone(), "wu", d, d, 0.5 / (d as f64).sqrt())?,
             wz: TLinear::new(vb.clone(), "wz", d, d)?,
             sign: vb.get_with_hints(d, "sign", Init::Randn { mean: 0.0, stdev: 1.0 })?,
-            gain: vb.get_with_hints(d, "gain", Init::Const(2.0))?,
+            decay: Tensor::from_vec(hadam_decays(d), d, &device)?,
             h: hadamard(d, &device)?,
         })
+    }
+
+    pub fn qtensors(&self) -> Vec<(String, &QTensor)> {
+        vec![("cell.wu".into(), &self.wu.w), ("cell.wz".into(), &self.wz.w)]
     }
 
     fn recurrence(&self) -> Result<Tensor> {
         self.h
             .broadcast_mul(&ste_sign(&self.sign)?.unsqueeze(1)?)?
-            .broadcast_mul(&candle_nn::ops::sigmoid(&self.gain)?.unsqueeze(0)?)?
+            .broadcast_mul(&self.decay.unsqueeze(0)?)?
             .contiguous()
     }
 
@@ -337,6 +458,15 @@ pub struct Retention {
 }
 
 impl Retention {
+    pub fn qtensors(&self) -> Vec<(String, &QTensor)> {
+        vec![
+            ("ret.wq".into(), &self.wq.w),
+            ("ret.wk".into(), &self.wk.w),
+            ("ret.wv".into(), &self.wv.w),
+            ("ret.wo".into(), &self.wo.w),
+        ]
+    }
+
     pub fn new(vb: VarBuilder, d: usize, heads: usize) -> Result<Self> {
         // γ_h = 1 − 3^{−(h+2)}: 0.889, 0.963, 0.988, 0.996, …
         let decays = (0..heads).map(|h| 1.0 - 3f64.powi(-(h as i32 + 2))).collect();
@@ -400,6 +530,10 @@ pub struct Mlp {
 }
 
 impl Mlp {
+    pub fn qtensors(&self) -> Vec<(String, &QTensor)> {
+        vec![("mlp.w1".into(), &self.w1.w), ("mlp.w3".into(), &self.w3.w), ("mlp.w2".into(), &self.w2.w)]
+    }
+
     pub fn new(vb: VarBuilder, d: usize, hidden: usize) -> Result<Self> {
         Ok(Self {
             w1: TLinear::new(vb.clone(), "w1", d, hidden)?,
@@ -504,33 +638,60 @@ mod tests {
     use super::*;
     use candle_nn::VarMap;
 
+    fn qtensor(rows: usize, cols: usize, std: f64, levels: i32) -> (VarMap, QTensor) {
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+        let q = QTensor::new(&vb, "w", rows, cols, std, levels).unwrap();
+        (vm, q)
+    }
+
     #[test]
-    fn two_trit_quantization_has_nine_levels() {
-        let dev = Device::Cpu;
-        let w = Tensor::randn(0f32, 1.0, (27, 81), &dev).unwrap();
-        let (levels, scales) = quant2_levels(&w).unwrap();
-        assert_eq!(scales.len(), 27);
-        assert!(levels.iter().all(|&l| (-4..=4).contains(&l)));
-        let distinct: std::collections::HashSet<i8> = levels.iter().copied().collect();
-        assert!(distinct.len() >= 7, "most of the nine levels are used: {distinct:?}");
-        // Quantized weights stay close to the latent ones.
-        let q = quant2(&w).unwrap();
-        let err = (q - &w).unwrap().abs().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap();
-        assert!(err < 0.25, "mean quantization error {err}");
+    fn two_and_three_trit_quantization_use_their_levels() {
+        for (levels, min_distinct, max_err) in [(LEVELS, 7, 0.2), (LEVELS3, 19, 0.09)] {
+            let (_, w) = qtensor(27, 243, 1.0, levels);
+            let (lv, exps) = w.levels_and_exps().unwrap();
+            assert_eq!(exps.len(), 27);
+            assert!(lv.iter().all(|&l| (-levels..=levels).contains(&(l as i32))));
+            let distinct: std::collections::HashSet<i8> = lv.iter().copied().collect();
+            assert!(distinct.len() >= min_distinct, "{levels}: {distinct:?}");
+            let (_, _, err) = w.health().unwrap();
+            assert!(err < max_err, "{levels} levels: relative error {err:.3}");
+            // The forward pass sees exactly the packed values.
+            let q = w.q().unwrap().to_vec2::<f32>().unwrap();
+            for (r, row) in q.iter().enumerate() {
+                for (c, &x) in row.iter().enumerate() {
+                    assert_eq!(x, lv[r * 243 + c] as f32 * 2f32.powi(exps[r] as i32));
+                }
+            }
+        }
     }
 
     #[test]
     fn quantization_neither_zeroes_nor_clips_too_much() {
-        let w = Tensor::randn(0f32, 0.05, (243, 729), &Device::Cpu).unwrap();
-        let (zero, clip, err) = quant2_health(&w).unwrap();
+        let (_, w) = qtensor(243, 729, 0.05, LEVELS);
+        let (zero, clip, err) = w.health().unwrap();
         assert!(zero < 0.45 && clip < 0.02, "zero {zero:.3} clip {clip:.3}");
         assert!(err < 0.2, "relative error {err:.3}");
-        let (_, steps) = quant2_levels(&w).unwrap();
-        assert!(steps.iter().all(|s| s.log2().fract() == 0.0), "steps are powers of two");
         // Tiny weights are neither flushed to zero nor overflow.
-        let tiny = Tensor::randn(0f32, 1e-20, (3, 81), &Device::Cpu).unwrap();
-        let (zero, _, err) = quant2_health(&tiny).unwrap();
+        let (_, tiny) = qtensor(3, 81, 1e-20, LEVELS);
+        let (zero, _, err) = tiny.health().unwrap();
         assert!(zero < 0.45 && err < 0.2, "tiny weights keep precision: zero {zero} err {err}");
+    }
+
+    #[test]
+    fn step_learns_by_lsq_and_clipped_weights_get_no_gradient() {
+        let (vm, w) = qtensor(3, 81, 1.0, LEVELS);
+        // Push one weight far outside the range.
+        let mut v = w.w.to_vec2::<f32>().unwrap();
+        v[0][0] = 1e3;
+        vm.data().lock().unwrap()["w"].set(&Tensor::new(v, &Device::Cpu).unwrap()).unwrap();
+        let loss = w.q().unwrap().sqr().unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        let gw = grads.get(&w.w).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(gw[0][0], 0.0, "a clipped weight gets no gradient");
+        assert!(gw[1].iter().any(|&g| g != 0.0));
+        let gt = grads.get(&w.theta).unwrap().to_vec1::<f32>().unwrap();
+        assert!(gt.iter().all(|g| g.is_finite()) && gt.iter().any(|&g| g != 0.0), "{gt:?}");
     }
 
     #[test]
