@@ -308,6 +308,8 @@ pub struct Session {
     ring: VecDeque<(u32, Vec<f32>, Vec<f32>)>,
     pub memory: Option<ContextMemory>,
     recent: VecDeque<u32>,
+    /// Their two-trit keys, for the semantic probe.
+    recent_k: VecDeque<Vec<f32>>,
     rows: Rows,
     /// The last induction candidate and the position it was computed at.
     last_ind: Option<(u64, IndCand)>,
@@ -407,6 +409,7 @@ impl Engine {
             ring: VecDeque::new(),
             memory,
             recent: VecDeque::new(),
+            recent_k: VecDeque::new(),
             rows: Rows::default(),
             last_ind: None,
             verdict: 1,
@@ -599,8 +602,10 @@ impl Engine {
         // Keys and values as two-trit vectors, as in training.
         let (k, v) = (quant_vec(&self.mk.apply(&xn), self.kv_step[0]), quant_vec(&self.mv.apply(&xn), self.kv_step[1]));
         s.recent.push_back(token);
+        s.recent_k.push_back(k.clone());
         if s.recent.len() > crate::model::PROBE {
             s.recent.pop_front();
+            s.recent_k.pop_front();
         }
         if s.pos % self.cfg.block as u64 == 0 {
             s.rows = Rows::default();
@@ -608,8 +613,10 @@ impl Engine {
             if let Some(mem) = &mut s.memory {
                 let recent: Vec<u32> = s.recent.iter().copied().collect();
                 let probe = crate::model::probe_of(&recent);
+                let keys: Vec<f32> = s.recent_k.iter().flatten().copied().collect();
+                let key = crate::model::probe_key(&keys, m, probe.len());
                 if let Ok(r) =
-                    mem.retrieve_rows(Probe::Both(probe, &q), crate::model::MEM_TOP_K, crate::model::MEM_ROWS)
+                    mem.retrieve_rows(Probe::Both(probe, &key), crate::model::MEM_TOP_K, crate::model::MEM_ROWS)
                 {
                     s.verdict = match r.verdict {
                         Verdict::Known => 0,

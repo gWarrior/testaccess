@@ -258,6 +258,8 @@ impl Induction {
 pub struct StreamMemory {
     pub mem: ContextMemory,
     history: Vec<u32>,
+    /// Their keys (`history.len() × dim`), for the semantic probe.
+    history_k: Vec<f32>,
     pub induction: Induction,
     /// Without the memory: induction over the last 243 tokens only, as the
     /// engine's ring.
@@ -273,6 +275,7 @@ impl StreamMemory {
         Self {
             mem: ContextMemory::new(Self::config(dim, max_tokens, precision)).expect("valid memory config"),
             history: Vec::new(),
+            history_k: Vec::new(),
             induction: Induction::new(max_tokens),
             // Two windows: every position of the current window can look
             // LOCAL tokens back (a limit of one window dropped the previous
@@ -288,6 +291,10 @@ impl StreamMemory {
         put_u64(&mut out, mem.len() as u64);
         out.extend_from_slice(&mem);
         put_u32s(&mut out, &self.history);
+        put_u64(&mut out, self.history_k.len() as u64);
+        for k in &self.history_k {
+            out.extend_from_slice(&k.to_le_bytes());
+        }
         self.induction.save(&mut out);
         self.local.save(&mut out);
         out
@@ -299,33 +306,39 @@ impl StreamMemory {
         let mem = ContextMemory::restore_full(Self::config(dim, max_tokens, precision), take(&mut input, n)?)
             .map_err(candle_core::Error::wrap)?;
         let history = get_u32s(&mut input)?;
+        let n = get_u64(&mut input)? as usize;
+        let history_k: Vec<f32> = take(&mut input, n * 4)?
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+            .collect();
         let induction = Induction::load(&mut input)?;
         let local = Induction::load(&mut input)?;
         if !input.is_empty() {
             candle_core::bail!("trailing bytes in a stream memory");
         }
-        Ok(Self { mem, history, induction, local })
+        Ok(Self { mem, history, history_k, induction, local })
     }
 
     /// Rows for every block of this window.
     fn retrieve(
         &mut self,
         x: &[u32],
-        q: &[f32],
+        k: &[f32],
         block: usize,
         dim: usize,
         top_k: usize,
         rows: usize,
     ) -> Vec<BlockRows> {
         let ctx: Vec<u32> = self.history.iter().chain(x).copied().collect();
+        let ctx_k: Vec<f32> = self.history_k.iter().chain(k).copied().collect();
         let off = self.history.len();
         (0..x.len() / block)
             .map(|j| {
                 let s = j * block;
                 let probe_end = off + s + 1;
                 let tokens = crate::model::probe_of(&ctx[probe_end.saturating_sub(crate::model::PROBE)..probe_end]);
-                let key = &q[s * dim..(s + 1) * dim];
-                match self.mem.retrieve_rows(Probe::Both(tokens, key), top_k, rows) {
+                let key = crate::model::probe_key(&ctx_k[..probe_end * dim], dim, tokens.len());
+                match self.mem.retrieve_rows(Probe::Both(tokens, &key), top_k, rows) {
                     Ok(r) => BlockRows {
                         next: r.positions.iter().map(|&p| self.next_token(p, x[0])).collect(),
                         verdict: verdict_index(r.verdict),
@@ -354,6 +367,8 @@ impl StreamMemory {
         self.mem.append_kv(x, k, v).expect("append");
         let keep = crate::model::PROBE - 1;
         self.history = x[x.len().saturating_sub(keep)..].to_vec();
+        let dim = k.len() / x.len().max(1);
+        self.history_k = k[k.len().saturating_sub(keep * dim)..].to_vec();
     }
 }
 
@@ -483,14 +498,23 @@ impl Runner {
         let (block, dim) = (self.model.cfg.block, self.model.cfg.mem_dim);
         let nb = t / block;
         let (mem, known, mem_rows) = if self.use_memory {
-            let q = trunk.q.flatten_all()?.to_vec1::<f32>()?;
+            // The window's two-trit keys, as the memory stores them: the
+            // semantic probe is their mean over the probe's tokens.
+            let keys = trunk.k.flatten_all()?.to_vec1::<f32>()?;
             let (top_k, rows) = (self.top_k, self.rows);
             let per: Vec<Vec<BlockRows>> = self
                 .memories
                 .par_iter_mut()
                 .enumerate()
                 .map(|(bi, m)| {
-                    m.retrieve(&x[bi * t..(bi + 1) * t], &q[bi * t * dim..(bi + 1) * t * dim], block, dim, top_k, rows)
+                    m.retrieve(
+                        &x[bi * t..(bi + 1) * t],
+                        &keys[bi * t * dim..(bi + 1) * t * dim],
+                        block,
+                        dim,
+                        top_k,
+                        rows,
+                    )
                 })
                 .collect();
             let known = per.iter().flatten().filter(|r| r.verdict == 0).count();

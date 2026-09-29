@@ -257,6 +257,23 @@ pub struct Ablation {
 /// Tokens in the lexical probe of a memory read.
 pub const PROBE: usize = 9;
 
+/// The semantic probe of a memory read: the mean of the keys of the probe's
+/// tokens (`keys`: the last `n` keys, row-major, `dim` wide). It lives in
+/// the space of the keys the memory stores (unlike the head's query),
+/// so the SNN memory's semantic index can compare them.
+pub fn probe_key(keys: &[f32], dim: usize, n: usize) -> Vec<f32> {
+    let rows = keys.len() / dim;
+    let n = n.min(rows).max(1);
+    let mut mean = vec![0f32; dim];
+    for r in rows - n..rows {
+        for (m, k) in mean.iter_mut().zip(&keys[r * dim..(r + 1) * dim]) {
+            *m += k;
+        }
+    }
+    mean.iter_mut().for_each(|m| *m /= n as f32);
+    mean
+}
+
 /// Chunks a memory read asks for (several places, a chunk of rows each)
 /// and rows it reads at most.
 pub const MEM_TOP_K: usize = 9;
