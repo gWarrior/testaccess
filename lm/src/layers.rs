@@ -24,6 +24,17 @@ fn step_ratio(levels: i32) -> f64 {
     }
 }
 
+/// The MSE-optimal θ = log2(ratio · mean |w|) of every row of `w`.
+pub fn optimal_theta_of(w: &Tensor, levels: i32) -> Result<Vec<f32>> {
+    Ok(w.to_vec2::<f32>()?
+        .iter()
+        .map(|row| {
+            let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len().max(1) as f64;
+            (mean * step_ratio(levels)).max(1e-30).log2() as f32
+        })
+        .collect())
+}
+
 /// A weight matrix quantized to `levels` per side (4: two trits, 13: three
 /// trits) with a learned per-row step that is always an exact power of two,
 /// `2^round(θ)`, so dequantization is a shift in training and inference
@@ -48,14 +59,7 @@ impl QTensor {
 
     /// Every row's optimal θ for its current weights (for a warm start).
     pub fn optimal_theta(&self) -> Result<Tensor> {
-        let w = self.w.to_vec2::<f32>()?;
-        let theta: Vec<f32> = w
-            .iter()
-            .map(|row| {
-                let mean = row.iter().map(|x| x.abs() as f64).sum::<f64>() / row.len().max(1) as f64;
-                (mean * step_ratio(self.levels)).max(1e-30).log2() as f32
-            })
-            .collect();
+        let theta = optimal_theta_of(&self.w, self.levels)?;
         Tensor::from_vec(theta, self.theta.shape(), self.theta.device())
     }
 

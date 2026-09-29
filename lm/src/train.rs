@@ -1127,9 +1127,7 @@ pub fn train(
         }
         let save_ema = || -> Result<()> {
             if !ema.is_empty() {
-                let m: std::collections::HashMap<String, Tensor> =
-                    ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
-                candle_core::safetensors::save(&m, &ema_file)?;
+                candle_core::safetensors::save(&ema_weights(&ema, &model, cfg.auto_steps)?, &ema_file)?;
             }
             Ok(())
         };
@@ -1146,9 +1144,9 @@ pub fn train(
                 let vm = VarMap::new();
                 let m = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &device), mcfg.clone())?;
                 let data = vm.data().lock().expect("varmap lock");
-                for (name, _, t) in &ema {
-                    if let Some(v) = data.get(name) {
-                        v.set(t)?;
+                for (name, t) in ema_weights(&ema, &model, cfg.auto_steps)? {
+                    if let Some(v) = data.get(&name) {
+                        v.set(&t)?;
                     }
                 }
                 drop(data);
@@ -1163,8 +1161,7 @@ pub fn train(
             std::fs::create_dir_all(&snaps)?;
             varmap.save(snaps.join(format!("step{}.safetensors", step + 1)))?;
             if !ema.is_empty() {
-                let m: std::collections::HashMap<String, Tensor> =
-                    ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
+                let m = ema_weights(&ema, &model, cfg.auto_steps)?;
                 candle_core::safetensors::save(&m, snaps.join(format!("step{}.ema.safetensors", step + 1)))?;
             }
         }
@@ -1220,14 +1217,49 @@ fn opt_group(name: &str) -> usize {
 }
 
 /// Set every weight row's step to the MSE optimum of its latents.
+///
+/// The exponent is an integer and moves only when the optimum is more than
+/// 0.6 away from it: with a bare rounding, rows sitting at a boundary (most
+/// rows of a tensor move together) flipped their step back and forth for
+/// hundreds of steps (analyst 8: 68–81% of mlp.w2 rows within ±0.05).
 fn anchor_steps(model: &Model, varmap: &VarMap) -> Result<()> {
     let data = varmap.data().lock().expect("varmap lock");
     for (name, q) in model.qtensors() {
         if let Some(var) = data.get(&format!("{name}_step")) {
-            var.set(&q.optimal_theta()?)?;
+            let cur = var.as_tensor().to_vec1::<f32>()?;
+            let opt = crate::layers::optimal_theta_of(&q.w, q.levels)?;
+            let next: Vec<f32> = cur
+                .iter()
+                .zip(&opt)
+                .map(|(&c, &o)| if c.fract() != 0.0 || (o - c).abs() > 0.6 { o.round() } else { c })
+                .collect();
+            var.set(&Tensor::from_vec(next, cur.len(), var.device())?)?;
         }
     }
     Ok(())
+}
+
+/// The moving average as saved and evaluated. With automatic steps the
+/// averaged θ is not the step of the averaged latents: each row's exponent
+/// is recomputed from the averaged latents (rounded).
+fn ema_weights(
+    ema: &[(String, candle_core::Var, Tensor)],
+    model: &Model,
+    auto_steps: bool,
+) -> Result<std::collections::HashMap<String, Tensor>> {
+    let mut m: std::collections::HashMap<String, Tensor> = ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
+    if auto_steps {
+        for (name, q) in model.qtensors() {
+            let step = format!("{name}_step");
+            if let (Some(w), true) = (m.get(&name), m.contains_key(&step)) {
+                let theta: Vec<f32> =
+                    crate::layers::optimal_theta_of(w, q.levels)?.into_iter().map(f32::round).collect();
+                let n = theta.len();
+                m.insert(step, Tensor::from_vec(theta, n, w.device())?);
+            }
+        }
+    }
+    Ok(m)
 }
 
 /// What one group of streams returns from a step.
