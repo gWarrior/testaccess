@@ -149,7 +149,14 @@ impl EpisodeSet {
                 let which = rng.below(4);
                 ep.sample_person_held_out(rng, which)
             }
-            Self::Who => ep.sample_person(rng, false, Some(4)),
+            // Half about the stated friend, half about a name never stated.
+            Self::Who => {
+                if rng.below(2) == 0 {
+                    ep.sample_person(rng, false, Some(4))
+                } else {
+                    ep.sample_unknown(rng)
+                }
+            }
         }
     }
 }

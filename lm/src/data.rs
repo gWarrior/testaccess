@@ -377,25 +377,43 @@ impl Episodes {
         (intro, q, a)
     }
 
-    /// [`sample`](Self::sample) with the episode's type: 0 secret, 1 name,
-    /// 2 town, 3 pet, 4 friend ("Кто такой N" shares the friend line). Two
-    /// open episodes of one type would make the question ambiguous.
+    /// [`sample`](Self::sample) with the episode's type: 10 + kind for a
+    /// secret (each wording of the statement is its own type), 1 name, 2
+    /// town, 20 + kind for a pet, 4 friend ("Кто такой F" shares the friend
+    /// line), 30 "Кто такой N" about a name never stated. Two open episodes
+    /// of one type would make the question ambiguous, so the stream starts
+    /// no episode of an open type; many types keep that from discarding most
+    /// episodes (with five types it dropped 80%, Fable analyst 11).
     pub fn sample_tagged(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>, u8) {
+        // One in nine: "не знаю" for a name never stated. It has no
+        // statement, so any number may be open at once.
+        if rng.below(9) == 0 {
+            let (intro, q, a) = self.sample_unknown(rng);
+            return (intro, q, a, 30);
+        }
         // A third asked with the statement's own words: the induction column
         // answers those by itself; paraphrases are what has to be learned.
         let same_words = rng.below(3) == 0;
         if rng.below(4) == 0 {
             let (intro, q, a) = self.sample_secret(rng);
-            if same_words {
-                // The question is the statement's own opening.
-                let kind = self.intros.iter().position(|i| intro.starts_with(i)).unwrap_or(0);
-                return (intro, self.intros[kind].clone(), a, 0);
-            }
-            return (intro, q, a, 0);
+            let kind = self.intros.iter().position(|i| intro.starts_with(i)).unwrap_or(0);
+            let q = if same_words { self.intros[kind].clone() } else { q };
+            return (intro, q, a, 10 + kind as u8);
         }
         let which = rng.below(5);
         let (intro, q, a) = self.sample_person(rng, same_words, Some(which));
-        (intro, q, a, [1, 2, 3, 4, 4][which as usize])
+        let tag = match which {
+            2 => 20 + self.pets.iter().position(|p| intro.starts_with(&p.0)).unwrap_or(0) as u8,
+            w => [1, 2, 0, 4, 4][w as usize],
+        };
+        (intro, q, a, tag)
+    }
+
+    /// "Кто такой N" about a name that was never stated: " не знаю.". No
+    /// statement (an empty intro).
+    pub fn sample_unknown(&self, rng: &mut snn_memory::rng::SplitMix64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let who = &self.names[rng.below(self.names.len() as u64) as usize];
+        (Vec::new(), [&self.who.0[..], who, &self.who.1].concat(), self.dont_know.clone())
     }
 
     /// A person episode: `which` = 0 name, 1 town, 2 pet, 3 friend, 4 "Кто
@@ -461,15 +479,9 @@ impl Episodes {
             1 => (intro, ask(&self.ask_town, rng), answer(&town)),
             2 => (intro, ask(pet, rng), answer(&pet_name)),
             3 => (intro, ask(&self.ask_friend, rng), answer(&friend)),
-            _ => {
-                // Who is N? The friend, or a name never stated.
-                let (who, a) = if rng.below(2) == 0 {
-                    (friend, self.my_friend.clone())
-                } else {
-                    (pick(&self.names, rng), self.dont_know.clone())
-                };
-                (intro, [&self.who.0[..], &who, &self.who.1].concat(), a)
-            }
+            // Who is N? The stated friend (a name never stated is
+            // `sample_unknown`, an episode without a statement).
+            _ => (intro, [&self.who.0[..], &friend, &self.who.1].concat(), self.my_friend.clone()),
         }
     }
 }
@@ -586,14 +598,19 @@ impl TaskStream {
         let sampled = episode.then(|| ep.sample_tagged(&mut self.rng));
         // Not while a question of the same type is open: it would be asked
         // about two statements.
-        if let Some((intro, q, a, tag)) = sampled.filter(|e| self.questions.iter().all(|q| q.4 != e.3)) {
+        // (An episode without a statement — "не знаю" — never conflicts.)
+        let free = |e: &(Vec<u32>, Vec<u32>, Vec<u32>, u8)| e.0.is_empty() || self.questions.iter().all(|q| q.4 != e.3);
+        if let Some((intro, q, a, tag)) = sampled.filter(free) {
             let (lo, hi) = self.distance;
             let d = ((lo as f64).ln() + self.rng.next_f64() * ((hi as f64).ln() - (lo as f64).ln())).exp() as usize;
             // The intro starts now: the statement spans these positions.
             let src = (self.emitted, self.emitted + intro.len() as u64);
+            let stated = !intro.is_empty();
             self.pending.extend(intro.into_iter().map(|t| (t, PLAIN, NO_SRC)));
             self.questions.push((d.max(1), q, a, src, tag));
-            return self.pending.pop_front().expect("intro is not empty");
+            if stated {
+                return self.pending.pop_front().expect("intro is not empty");
+            }
         }
         let t = tokens[self.start + self.pos % self.len] as u32;
         self.pos += 1;
