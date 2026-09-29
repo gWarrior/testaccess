@@ -394,7 +394,8 @@ impl Engine {
             fwht(&mut r);
             let inv_sqrt_d = 1.0 / (d as f32).sqrt();
             for j in 0..d {
-                s.h[li][j] = (r[j] * inv_sqrt_d * l.decay[j] + u[j]).tanh();
+                let c = (r[j] * inv_sqrt_d * l.decay[j] + u[j]).tanh();
+                s.h[li][j] = if self.cfg.ternary_h { c.round() } else { c };
                 x[j] += s.h[li][j] * sigmoid(z[j]);
             }
             // Retention: S = γS + kᵀv, o = q·S.
@@ -601,8 +602,17 @@ mod tests {
 
     #[test]
     fn engine_matches_the_training_model() {
+        engine_matches(false);
+    }
+
+    #[test]
+    fn engine_matches_the_training_model_with_ternary_state() {
+        engine_matches(true);
+    }
+
+    fn engine_matches(ternary_h: bool) {
         let dev = Device::Cpu;
-        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3 };
+        let cfg = Config { vocab: 81, d: 16, layers: 2, heads: 2, mlp: 27, mem_dim: 9, block: 3, ternary_h };
         let vm = VarMap::new();
         let model = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &dev), cfg.clone()).unwrap();
         // Non-trivial gains/verdict/head features so every path is exercised.

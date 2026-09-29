@@ -8,7 +8,7 @@
 //! stay `f32`; recurrent signs are single trits.
 //!
 //! ```text
-//! "SNNT" v2 | vocab d layers heads mlp mem_dim block (u32 each) | n (u32)
+//! "SNNT" v2 | vocab d layers heads mlp mem_dim block ternary_h (u32 each) | n (u32)
 //! per tensor: name (u16 len, utf-8) | kind u8 | rank u8 | dims u32* | data
 //!   kind 0 (trit matrix): trits u8 | exponents i8 × rows | words u32 | u64 words
 //!   kind 1 (f32):             f32 × elements
@@ -87,7 +87,7 @@ impl PackedModel {
         w.write_all(b"SNNT")?;
         w.write_all(&2u32.to_le_bytes())?;
         let c = &self.cfg;
-        for x in [c.vocab, c.d, c.layers, c.heads, c.mlp, c.mem_dim, c.block] {
+        for x in [c.vocab, c.d, c.layers, c.heads, c.mlp, c.mem_dim, c.block, usize::from(c.ternary_h)] {
             w.write_all(&(x as u32).to_le_bytes())?;
         }
         w.write_all(&(self.tensors.len() as u32).to_le_bytes())?;
@@ -129,11 +129,20 @@ impl PackedModel {
         if &read_exact::<4>(&mut r)? != b"SNNT" || read_u32(&mut r)? != 2 {
             return Err(bad("not an SNNT v2 model"));
         }
-        let mut c = [0usize; 7];
+        let mut c = [0usize; 8];
         for x in &mut c {
             *x = read_u32(&mut r)? as usize;
         }
-        let cfg = Config { vocab: c[0], d: c[1], layers: c[2], heads: c[3], mlp: c[4], mem_dim: c[5], block: c[6] };
+        let cfg = Config {
+            vocab: c[0],
+            d: c[1],
+            layers: c[2],
+            heads: c[3],
+            mlp: c[4],
+            mem_dim: c[5],
+            block: c[6],
+            ternary_h: c[7] != 0,
+        };
         let n = read_u32(&mut r)?;
         let mut tensors = BTreeMap::new();
         for _ in 0..n {

@@ -109,7 +109,8 @@ fn train(args: &[String]) -> std::io::Result<()> {
     let tokens = load_tokens(&data, "train.bin");
     let tok = load_tokenizer(&data);
     println!("{cfg:?}");
-    snn_lm::train::train(&cfg, snn_lm::model::Config::default(), &tokens.tokens, &tok).map_err(std::io::Error::other)
+    let mcfg = snn_lm::model::Config { ternary_h: arg(args, "--ternary-h", "off") == "on", ..Default::default() };
+    snn_lm::train::train(&cfg, mcfg, &tokens.tokens, &tok).map_err(std::io::Error::other)
 }
 
 fn ngram(args: &[String]) -> std::io::Result<()> {
@@ -156,7 +157,13 @@ fn kv_precision(args: &[String]) -> snn_memory::KvPrecision {
 }
 
 fn load_model(dir: &std::path::Path) -> snn_lm::model::Model {
-    snn_lm::train::load_model(dir, snn_lm::model::Config::default(), &candle_core::Device::Cpu).expect("checkpoint")
+    snn_lm::train::load_model(dir, model_config(dir), &candle_core::Device::Cpu).expect("checkpoint")
+}
+
+/// The model configuration a run was trained with (`model.cfg`).
+fn model_config(dir: &std::path::Path) -> snn_lm::model::Config {
+    let text = std::fs::read_to_string(dir.join("model.cfg")).unwrap_or_default();
+    snn_lm::model::Config { ternary_h: text.contains("ternary_h=1"), ..Default::default() }
 }
 
 fn eval(args: &[String]) -> std::io::Result<()> {
@@ -225,7 +232,7 @@ fn export(args: &[String]) -> std::io::Result<()> {
     let mut varmap = candle_nn::VarMap::new();
     let model = snn_lm::model::Model::new(
         candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &candle_core::Device::Cpu),
-        snn_lm::model::Config::default(),
+        model_config(&run),
     )
     .map_err(std::io::Error::other)?;
     varmap.load(run.join("model.safetensors")).map_err(std::io::Error::other)?;

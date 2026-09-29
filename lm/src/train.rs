@@ -479,6 +479,7 @@ fn clip(grads: &mut candle_core::backprop::GradStore, vars: &[candle_core::Var],
 pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::tokenizer::Tokenizer) -> Result<()> {
     let device = Device::Cpu;
     std::fs::create_dir_all(&cfg.out)?;
+    std::fs::write(cfg.out.join("model.cfg"), format!("ternary_h={}\n", u8::from(mcfg.ternary_h)))?;
     let mut varmap = VarMap::new();
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), mcfg.clone())?;
     let ckpt = cfg.out.join("model.safetensors");
