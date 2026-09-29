@@ -544,28 +544,60 @@ impl Runner {
         }
     }
 
-    /// Whether some pointer column holds each target `(B·T)`.
-    pub fn findable(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Vec<bool> {
-        let Ok((b, t, l)) = out.point.dims3() else { return vec![false; y.len()] };
-        (0..b * t).map(|r| (0..l).any(|col| self.column_token(out, x, t, r / t, r % t, col) == y[r])).collect()
+    /// Stream position of the token column `col` copies (`None` for the
+    /// null or an empty column). The window starts at `self.pos`.
+    fn column_source(&self, out: &WindowOut, t: usize, bi: usize, ti: usize, col: usize) -> Option<u64> {
+        let (block, nb, start) = (self.model.cfg.block, t / self.model.cfg.block, self.pos);
+        if col < t {
+            (!out.prev_tokens.is_empty()).then(|| start - t as u64 + col as u64 + 1)
+        } else if col < 2 * t {
+            Some(start + (col - t) as u64 + 1)
+        } else if col < 2 * t + out.m {
+            let p = out.far_pos[(bi * nb + ti / block) * out.m + (col - 2 * t)];
+            (p != u64::MAX).then_some(p + 1)
+        } else if col == 2 * t + out.m {
+            let c = out.ind.get(bi * t + ti).filter(|c| c.len > 0)?;
+            (start + ti as u64 + 1).checked_sub(c.dist as u64)
+        } else {
+            None
+        }
     }
 
     /// Per-token loss of the mixture `a_null·p_vocab + Σ a·[next]`, `(B·T,)`.
     pub fn losses(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<Tensor> {
-        Ok(self.losses_and_pointer(out, x, y)?.0)
+        Ok(self.losses_and_pointer(out, x, y, None)?.0)
     }
 
-    /// The mixture loss and the pointer's own loss `−ln Σ_{j: next_j = y} a_j`
-    /// (without the vocabulary), both `(B·T,)`.
-    pub fn losses_and_pointer(&self, out: &WindowOut, x: &[u32], y: &[u32]) -> Result<(Tensor, Tensor)> {
+    /// The mixture loss, the pointer's own loss `−ln Σ_{j hits} a_j`
+    /// (without the vocabulary), both `(B·T,)`, and whether some column
+    /// hits each target. A column hits when it copies the target token; for
+    /// a fact answer with a statement span in `src`, only a column copying
+    /// from the statement itself hits the pointer loss — another occurrence
+    /// of the same token (a syllable of an older answer) is not the fact.
+    pub fn losses_and_pointer(
+        &self,
+        out: &WindowOut,
+        x: &[u32],
+        y: &[u32],
+        src: Option<&[crate::data::Src]>,
+    ) -> Result<(Tensor, Tensor, Vec<bool>)> {
         let (b, t, l) = out.point.dims3()?;
         let mut hit = vec![0f32; b * t * l];
+        let mut own = vec![0f32; b * t * l];
+        let mut found = vec![false; b * t];
         for bi in 0..b {
             for ti in 0..t {
-                let target = y[bi * t + ti];
+                let r = bi * t + ti;
+                let span = src.map_or(crate::data::NO_SRC, |s| s[r]);
                 for col in 0..l {
-                    if self.column_token(out, x, t, bi, ti, col) == target {
-                        hit[(bi * t + ti) * l + col] = 1.0;
+                    if self.column_token(out, x, t, bi, ti, col) == y[r] {
+                        hit[r * l + col] = 1.0;
+                        let from_statement = span == crate::data::NO_SRC
+                            || self.column_source(out, t, bi, ti, col).is_some_and(|p| p >= span.0 && p < span.1);
+                        if from_statement {
+                            own[r * l + col] = 1.0;
+                            found[r] = true;
+                        }
                     }
                 }
             }
@@ -575,6 +607,9 @@ impl Runner {
         let miss: Vec<f32> = hit.iter().map(|&h| if h > 0.0 { 0.0 } else { -1e9 }).collect();
         let miss = Tensor::from_vec(miss, (b, t, l), out.point.device())?;
         let c = (&out.log_point + miss)?.log_sum_exp(2)?.flatten_all()?;
+        let miss_own: Vec<f32> = own.iter().map(|&h| if h > 0.0 { 0.0 } else { -1e9 }).collect();
+        let miss_own = Tensor::from_vec(miss_own, (b, t, l), out.point.device())?;
+        let c_own = (&out.log_point + miss_own)?.log_sum_exp(2)?.flatten_all()?;
         let ce = token_losses(&out.logits, y)?;
         let log_g = out.log_point.narrow(2, l - 1, 1)?.flatten_all()?;
         // −ln(a_null·e^−ce + c), as a log-sum-exp of the two branches.
@@ -582,7 +617,7 @@ impl Runner {
         let both = Tensor::stack(&[&a, &c], 1)?;
         let mx = both.max_keepdim(1)?.detach();
         let lse = (both.broadcast_sub(&mx)?.exp()?.sum_keepdim(1)?.log()? + mx)?;
-        Ok((lse.flatten_all()?.neg()?, c.neg()?))
+        Ok((lse.flatten_all()?.neg()?, c_own.neg()?, found))
     }
 
     /// Top-1 token of the mixture for every position, `(B·T)`.
@@ -880,11 +915,13 @@ pub fn train(
         let mut x = Vec::with_capacity(b * t);
         let mut y = Vec::with_capacity(b * t);
         let mut kinds = Vec::with_capacity(b * t);
+        let mut srcs = Vec::with_capacity(b * t);
         for s in &mut streams {
-            let (w, k) = s.window(tokens, &ep, t);
+            let (w, k, src) = s.window_src(tokens, &ep, t);
             x.extend_from_slice(&w[..t]);
             y.extend_from_slice(&w[1..]);
             kinds.extend_from_slice(&k[1..]);
+            srcs.extend_from_slice(&src[1..]);
         }
         let mut grads: Option<candle_core::backprop::GradStore> = None;
         let mut loss_value = 0f32;
@@ -894,15 +931,14 @@ pub fn train(
         // run at once; their gradients are summed in group order.
         let run_group = |gi: usize, runner: &mut Runner| -> Result<GroupOut> {
             let r = gi * micro * t..(gi + 1) * micro * t;
-            let (xs, ys, ks) = (&x[r.clone()], &y[r.clone()], &kinds[r]);
+            let (xs, ys, ks, ss) = (&x[r.clone()], &y[r.clone()], &kinds[r.clone()], &srcs[r]);
             let t0 = Instant::now();
             let (out, next) = runner.forward(xs, t, &device)?;
-            let (losses, pointer) = runner.losses_and_pointer(&out, xs, ys)?;
+            let (losses, pointer, findable) = runner.losses_and_pointer(&out, xs, ys, Some(ss))?;
             // Auxiliary pointer loss where the answer is in the context (fact
             // answers, re-read spans) and some column holds it — otherwise it
             // would pull the pointer towards uniform: teaches the pointer to
             // find the row instead of leaning on the vocabulary.
-            let findable = runner.findable(&out, xs, ys);
             let mask: Vec<f32> = ks
                 .iter()
                 .zip(&findable)

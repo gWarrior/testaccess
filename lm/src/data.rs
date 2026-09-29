@@ -468,16 +468,25 @@ pub const ANSWER: u8 = 1;
 pub const REREAD: u8 = 2;
 pub const TEMPLATE: u8 = 3;
 
+/// Stream positions `[start, end)` of a fact's statement.
+pub type Src = (u64, u64);
+
+/// No statement span (plain text, templates, re-reading).
+pub const NO_SRC: Src = (0, 0);
+
 /// A token stream over a region of the corpus with recall episodes.
 pub struct TaskStream {
     start: usize,
     len: usize,
     pos: usize,
     rng: snn_memory::rng::SplitMix64,
-    pending: std::collections::VecDeque<(u32, u8)>,
+    pending: std::collections::VecDeque<(u32, u8, Src)>,
     /// Questions waiting for their distance: (tokens left, question, answer).
-    questions: Vec<(usize, Vec<u32>, Vec<u32>)>,
-    carry: Option<(u32, u8)>,
+    /// Questions waiting: (tokens left, question, answer, statement span).
+    questions: Vec<(usize, Vec<u32>, Vec<u32>, Src)>,
+    carry: Option<(u32, u8, Src)>,
+    /// Tokens emitted so far: the stream position of the next token.
+    emitted: u64,
     /// Probability of starting an episode at a token.
     pub p_episode: f64,
     /// Distance range, sampled log-uniformly.
@@ -505,6 +514,7 @@ impl TaskStream {
             pending: Default::default(),
             questions: Vec::new(),
             carry: None,
+            emitted: 0,
             p_episode: 1.0 / 729.0,
             distance: (27, 19_683),
             jump: false,
@@ -514,8 +524,10 @@ impl TaskStream {
         }
     }
 
-    /// Next token and its kind: [`PLAIN`], [`ANSWER`] or [`REREAD`].
-    fn next(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, u8) {
+    /// Next token, its kind ([`PLAIN`], [`ANSWER`], [`REREAD`],
+    /// [`TEMPLATE`]) and, for a fact answer, the stream positions of its
+    /// statement ([`NO_SRC`] otherwise).
+    fn next(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, u8, Src) {
         if self.pending.is_empty() && self.p_reread > 0.0 && self.past.len() > 2 * 243 {
             if self.rng.next_f64() < self.p_reread {
                 let len = 27 + self.rng.below(55) as usize;
@@ -526,11 +538,13 @@ impl TaskStream {
                 let start = self.past.len() - back;
                 let span: Vec<u32> = self.past.range(start..start + len).copied().collect();
                 // The first token of the span cannot be predicted; the rest can be copied.
-                self.pending
-                    .extend(span.into_iter().enumerate().map(|(i, t)| (t, if i == 0 { PLAIN } else { REREAD })));
+                self.pending.extend(
+                    span.into_iter().enumerate().map(|(i, t)| (t, if i == 0 { PLAIN } else { REREAD }, NO_SRC)),
+                );
             }
         }
         let out = self.next_raw(tokens, ep);
+        self.emitted += 1;
         if self.p_reread > 0.0 {
             self.past.push_back(out.0);
             if self.past.len() > self.distance.1 {
@@ -540,7 +554,7 @@ impl TaskStream {
         out
     }
 
-    fn next_raw(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, u8) {
+    fn next_raw(&mut self, tokens: &[u16], ep: &Episodes) -> (u32, u8, Src) {
         if let Some(t) = self.pending.pop_front() {
             return t;
         }
@@ -548,18 +562,20 @@ impl TaskStream {
             q.0 = q.0.saturating_sub(1);
         }
         if let Some(i) = self.questions.iter().position(|q| q.0 == 0) {
-            let (_, q, a) = self.questions.swap_remove(i);
-            self.pending.extend(q.iter().map(|&t| (t, PLAIN)));
-            let kind = if ep.is_template(&a) { TEMPLATE } else { ANSWER };
-            self.pending.extend(a.iter().map(|&t| (t, kind)));
+            let (_, q, a, src) = self.questions.swap_remove(i);
+            self.pending.extend(q.iter().map(|&t| (t, PLAIN, NO_SRC)));
+            let (kind, src) = if ep.is_template(&a) { (TEMPLATE, NO_SRC) } else { (ANSWER, src) };
+            self.pending.extend(a.iter().map(|&t| (t, kind, src)));
             return self.pending.pop_front().expect("question is not empty");
         }
         if self.p_episode > 0.0 && self.rng.next_f64() < self.p_episode {
             let (intro, q, a) = ep.sample(&mut self.rng);
             let (lo, hi) = self.distance;
             let d = ((lo as f64).ln() + self.rng.next_f64() * ((hi as f64).ln() - (lo as f64).ln())).exp() as usize;
-            self.pending.extend(intro.into_iter().map(|t| (t, PLAIN)));
-            self.questions.push((d.max(1), q, a));
+            // The intro starts now: the statement spans these positions.
+            let src = (self.emitted, self.emitted + intro.len() as u64);
+            self.pending.extend(intro.into_iter().map(|t| (t, PLAIN, NO_SRC)));
+            self.questions.push((d.max(1), q, a, src));
             return self.pending.pop_front().expect("intro is not empty");
         }
         let t = tokens[self.start + self.pos % self.len] as u32;
@@ -577,7 +593,7 @@ impl TaskStream {
                 }
             }
         }
-        (t, PLAIN)
+        (t, PLAIN, NO_SRC)
     }
 
     /// Whether the document starting at `p` breaks lines more often than
@@ -600,16 +616,24 @@ impl TaskStream {
     /// `window + 1` tokens continuing the stream (the first is the last of
     /// the previous call), with their kinds.
     pub fn window(&mut self, tokens: &[u16], ep: &Episodes, window: usize) -> (Vec<u32>, Vec<u8>) {
+        let (out, ans, _) = self.window_src(tokens, ep, window);
+        (out, ans)
+    }
+
+    /// [`window`](Self::window) with each token's statement span (the
+    /// stream positions a fact answer can be copied from, [`NO_SRC`] for
+    /// other tokens). Stream position `i` of window `w` is `w·window + i`.
+    pub fn window_src(&mut self, tokens: &[u16], ep: &Episodes, window: usize) -> (Vec<u32>, Vec<u8>, Vec<Src>) {
         let first = self.carry.take().unwrap_or_else(|| self.next(tokens, ep));
-        let mut out = vec![first.0];
-        let mut ans = vec![first.1];
+        let (mut out, mut ans, mut src) = (vec![first.0], vec![first.1], vec![first.2]);
         for _ in 0..window {
-            let (t, a) = self.next(tokens, ep);
+            let (t, a, r) = self.next(tokens, ep);
             out.push(t);
             ans.push(a);
+            src.push(r);
         }
-        self.carry = Some((out[window], ans[window]));
-        (out, ans)
+        self.carry = Some((out[window], ans[window], src[window]));
+        (out, ans, src)
     }
 }
 
@@ -687,5 +711,41 @@ mod episode_tests {
         // "не знаю" and "мой друг" answers need not).
         let repeats = (0..all.len()).filter(|&i| ans[i] == ANSWER && all[..i].contains(&all[i])).count();
         assert!(repeats > 0);
+    }
+
+    #[test]
+    fn fact_answers_point_at_their_statement() {
+        let tok = Tokenizer::train(
+            &"Меня зовут Лами. Я живу в городе Роке. Мою кошку зовут Нита. Секретное слово — маяк.\n".repeat(30),
+            400,
+        );
+        let ep = Episodes::new(&tok);
+        let filler: Vec<u16> = (0..5000).map(|i| 300 + (i % 50) as u16).collect();
+        let mut s = TaskStream::new(0, filler.len(), 7);
+        s.p_episode = 1.0 / 200.0;
+        s.distance = (27, 729);
+        let (mut all, mut kinds, mut srcs) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..81 {
+            let (w, k, r) = s.window_src(&filler, &ep, 81);
+            // Window w holds stream positions 81·w … 81·w + 80.
+            all.extend_from_slice(&w[..81]);
+            kinds.extend_from_slice(&k[..81]);
+            srcs.extend_from_slice(&r[..81]);
+        }
+        let mut checked = 0;
+        for i in 0..all.len() {
+            if kinds[i] != ANSWER {
+                assert_eq!(srcs[i], NO_SRC);
+                continue;
+            }
+            let (a, b) = (srcs[i].0 as usize, srcs[i].1 as usize);
+            assert!(a < b && b <= i, "the statement comes before the answer");
+            // The answer's end marker need not be in the statement; its words are.
+            if !ep.end.contains(&all[i]) {
+                assert!(all[a..b].contains(&all[i]), "{} not in {}", tok.decode(&all[i..=i]), tok.decode(&all[a..b]));
+                checked += 1;
+            }
+        }
+        assert!(checked > 5, "{checked} answer tokens checked");
     }
 }
