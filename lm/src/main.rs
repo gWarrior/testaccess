@@ -110,9 +110,11 @@ fn train(args: &[String]) -> std::io::Result<()> {
         aux: arg(args, "--aux", &d.aux.to_string()).parse().expect("--aux"),
         micro: arg(args, "--micro", &d.micro.to_string()).parse().expect("--micro"),
         ema: arg(args, "--ema", &d.ema.to_string()).parse().expect("--ema"),
+        val_every: arg(args, "--val-every", &d.val_every.to_string()).parse().expect("--val-every"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");
+    let val = load_tokens(&data, "val.bin");
     let tok = load_tokenizer(&data);
     println!("{cfg:?}");
     let d = snn_lm::model::Config::default();
@@ -122,7 +124,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         mlp: arg(args, "--mlp", &d.mlp.to_string()).parse().expect("--mlp"),
         ..d
     };
-    snn_lm::train::train(&cfg, mcfg, &tokens.tokens, &tok).map_err(std::io::Error::other)
+    snn_lm::train::train(&cfg, mcfg, &tokens.tokens, &val.tokens, &tok).map_err(std::io::Error::other)
 }
 
 fn ngram(args: &[String]) -> std::io::Result<()> {

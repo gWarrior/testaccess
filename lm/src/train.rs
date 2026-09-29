@@ -57,6 +57,9 @@ pub struct TrainConfig {
     /// Decay of the exponential moving average of the latent weights and
     /// steps, saved as `model.ema.safetensors` (0 = off).
     pub ema: f64,
+    /// Validation loss (memory on, 9 streams × 27 windows) of the weights
+    /// and of their average every this many steps, into val.tsv (0 = off).
+    pub val_every: usize,
 }
 
 impl Default for TrainConfig {
@@ -86,6 +89,7 @@ impl Default for TrainConfig {
             aux: 1.0,
             micro: 3,
             ema: 1.0 - 1.0 / 729.0,
+            val_every: 729,
         }
     }
 }
@@ -543,7 +547,13 @@ fn clip(grads: &mut candle_core::backprop::GradStore, vars: &[candle_core::Var],
     Ok(norm)
 }
 
-pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::tokenizer::Tokenizer) -> Result<()> {
+pub fn train(
+    cfg: &TrainConfig,
+    mcfg: Config,
+    tokens: &[u16],
+    val: &[u16],
+    tok: &crate::tokenizer::Tokenizer,
+) -> Result<()> {
     let device = Device::Cpu;
     std::fs::create_dir_all(&cfg.out)?;
     std::fs::write(
@@ -834,6 +844,28 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
             }
             Ok(())
         };
+        if cfg.val_every > 0 && ((step + 1) % cfg.val_every == 0 || step + 1 == cfg.steps) && !val.is_empty() {
+            let t0 = Instant::now();
+            let last = crate::eval::val_loss_fitted(model.clone(), val, 9, 27, cfg.memory, KvPrecision::Trit2)?;
+            let avg = if ema.is_empty() {
+                f64::NAN
+            } else {
+                let vm = VarMap::new();
+                let m = Model::new(VarBuilder::from_varmap(&vm, DType::F32, &device), mcfg.clone())?;
+                let data = vm.data().lock().expect("varmap lock");
+                for (name, _, t) in &ema {
+                    if let Some(v) = data.get(name) {
+                        v.set(t)?;
+                    }
+                }
+                drop(data);
+                crate::eval::val_loss_fitted(m, val, 9, 27, cfg.memory, KvPrecision::Trit2)?
+            };
+            println!("val: step {} loss {last:.4} ema {avg:.4} ({:.0}s)", step + 1, t0.elapsed().as_secs_f64());
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(cfg.out.join("val.tsv"))?;
+            use std::io::Write as _;
+            writeln!(f, "{}\t{last:.4}\t{avg:.4}", step + 1)?;
+        }
         if (step + 1) % cfg.ckpt_every == 0 || step + 1 == cfg.steps {
             save_ema()?;
             varmap.save(&ckpt)?;

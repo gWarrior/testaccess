@@ -20,6 +20,19 @@ pub fn val_loss(
     Ok(val_loss_detail(model, tokens, batch, windows, memory, precision, false)?.0)
 }
 
+/// Validation loss with memory sized to the windows read (a periodic check
+/// during training must not hold 300k tokens of memory per stream).
+pub fn val_loss_fitted(
+    model: Model,
+    tokens: &[u16],
+    batch: usize,
+    windows: usize,
+    memory: bool,
+    precision: KvPrecision,
+) -> Result<f64> {
+    Ok(val_loss_sized(model, tokens, batch, windows, memory, precision, false, (windows + 1) * 243)?.0)
+}
+
 /// Mean loss and mean loss by position inside the window (in 9 buckets of
 /// 27 positions), optionally dropping the recurrent state between windows.
 pub fn val_loss_detail(
@@ -31,9 +44,23 @@ pub fn val_loss_detail(
     precision: KvPrecision,
     reset_state: bool,
 ) -> Result<(f64, Vec<f64>)> {
+    val_loss_sized(model, tokens, batch, windows, memory, precision, reset_state, 300_000)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn val_loss_sized(
+    model: Model,
+    tokens: &[u16],
+    batch: usize,
+    windows: usize,
+    memory: bool,
+    precision: KvPrecision,
+    reset_state: bool,
+    max_tokens: usize,
+) -> Result<(f64, Vec<f64>)> {
     let device = Device::Cpu;
     let t = 243;
-    let mut runner = Runner::new(model, batch, memory, 300_000, precision, &device)?;
+    let mut runner = Runner::new(model, batch, memory, max_tokens, precision, &device)?;
     runner.reset_state = reset_state;
     let region = tokens.len() / batch;
     let (mut sum, mut n) = (0f64, 0usize);
