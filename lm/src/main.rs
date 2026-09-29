@@ -103,6 +103,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         warmup: arg(args, "--warmup", &d.warmup.to_string()).parse().expect("--warmup"),
         init: args.iter().any(|a| a == "--init").then(|| PathBuf::from(arg(args, "--init", ""))),
         jump: arg(args, "--jump", "on") == "on",
+        seed: arg(args, "--seed", &d.seed.to_string()).parse().expect("--seed"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");
