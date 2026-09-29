@@ -88,6 +88,10 @@ pub struct MemBatch {
     /// Token that followed each row `(B, nb, M)`, `u32::MAX` for padding.
     pub next: Vec<u32>,
     pub m: usize,
+    /// Induction column: suffix length per position `(B, T)` (0 = none)
+    /// and the token that followed the matched suffix.
+    pub ind_n: Option<Tensor>,
+    pub ind_tok: Vec<u32>,
 }
 
 /// One retrieved block: keys, values, verdict, token after each row.
@@ -122,7 +126,17 @@ impl MemBatch {
             verdict: Tensor::from_vec(verdict, (b, nb), device)?,
             next,
             m,
+            ind_n: None,
+            ind_tok: Vec::new(),
         })
+    }
+
+    /// Attach the induction candidates `(token, suffix length)` of a window.
+    pub fn with_induction(mut self, ind: &[(u32, u8)], b: usize, t: usize, device: &Device) -> Result<Self> {
+        self.ind_tok = ind.iter().map(|c| c.0).collect();
+        let n: Vec<u32> = ind.iter().map(|c| c.1 as u32).collect();
+        self.ind_n = Some(Tensor::from_vec(n, (b, t), device)?);
+        Ok(self)
     }
 
     /// No memory (ablation / first window).
@@ -162,14 +176,18 @@ pub struct Model {
     gate_w: Tensor,
     gate_b: Tensor,
     gate_verdict: Tensor,
+    /// Induction column logit: `ind_len[suffix length] + xn·ind_w`.
+    ind_len: Tensor,
+    ind_w: Tensor,
 }
 
 /// Output of the head.
 pub struct HeadOut {
     /// Vocabulary logits `(B, T, V)`.
     pub logits: Tensor,
-    /// Pointer attention `(B, T, L)` over `L = T + M + 1` columns: the
-    /// window (strictly earlier positions), the block's memory rows, a null.
+    /// Pointer attention `(B, T, L)` over `L = T + M + 2` columns: the
+    /// window (strictly earlier positions), the block's memory rows, the
+    /// induction column and the null.
     pub point: Tensor,
     /// Weight of the vocabulary distribution, the null column `(B, T)`.
     pub gate: Tensor,
@@ -208,6 +226,8 @@ impl Model {
             gate_w: vb.get_with_hints(d, "gate_w", Init::Const(0.0))?,
             gate_b: vb.get_with_hints(1, "gate_b", Init::Const(8.0))?,
             gate_verdict: vb.get_with_hints(3, "gate_verdict", Init::Const(0.0))?,
+            ind_len: vb.get_with_hints(9, "ind_len", Init::Const(0.0))?,
+            ind_w: vb.get_with_hints(d, "ind_w", Init::Const(0.0))?,
             ablation: Ablation::default(),
             cfg,
         })
@@ -290,15 +310,25 @@ impl Model {
         let gv = self.gate_verdict.index_select(&mem.verdict.flatten_all()?, 0)?.reshape((b, nb, 1))?;
         let gv = gv.broadcast_as((b, nb, blk))?.reshape((b, t))?;
         let null = (tr.xn.broadcast_mul(&self.gate_w)?.sum(D::Minus1)?.broadcast_add(&self.gate_b)? + gv)?;
-        let point = candle_nn::ops::softmax(&Tensor::cat(&[&p_local, &p_far, &null.unsqueeze(2)?], 2)?, D::Minus1)?;
+        // Induction column: the memory's exact continuation, weighted by the
+        // matched suffix length and the state; masked where nothing matched.
+        let ind_n = match &mem.ind_n {
+            Some(n) => n.clone(),
+            None => Tensor::zeros((b, t), DType::U32, device)?,
+        };
+        let len_logit = self.ind_len.index_select(&ind_n.flatten_all()?, 0)?.reshape((b, t))?;
+        let none = ind_n.eq(0u32)?.to_dtype(DType::F32)?.affine(-1e9, 0.0)?;
+        let ind = ((len_logit + tr.xn.broadcast_mul(&self.ind_w)?.sum(D::Minus1)?)? + none)?;
+        let cols = Tensor::cat(&[&p_local, &p_far, &ind.unsqueeze(2)?, &null.unsqueeze(2)?], 2)?;
+        let point = candle_nn::ops::softmax(&cols, D::Minus1)?;
         let point = if self.ablation.no_pointer {
-            let l = t + mm + 1;
+            let l = t + mm + 2;
             let null: Vec<f32> = (0..b * t * l).map(|i| if i % l == l - 1 { 1.0 } else { 0.0 }).collect();
             Tensor::from_vec(null, (b, t, l), device)?
         } else {
             point
         };
-        let gate = point.narrow(2, t + mm, 1)?.squeeze(2)?;
+        let gate = point.narrow(2, t + mm + 1, 1)?.squeeze(2)?;
         Ok(HeadOut { logits, point, gate })
     }
 

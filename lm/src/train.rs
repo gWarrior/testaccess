@@ -83,10 +83,73 @@ fn verdict_index(v: Verdict) -> u32 {
     }
 }
 
+/// Shortest and longest suffix the induction column matches.
+pub const IND_MIN: usize = 3;
+pub const IND_MAX: usize = 8;
+
+/// Exact suffix index of a stream, the training-time twin of the SNN
+/// memory's `continuation`: for every position, the token that followed the
+/// most recent earlier occurrence of its longest suffix (8 down to 3
+/// tokens). Keeps the last `limit` tokens.
+pub struct Induction {
+    tokens: Vec<u32>,
+    index: std::collections::HashMap<u64, u32>,
+    limit: usize,
+}
+
+fn ngram_key(g: &[u32]) -> u64 {
+    g.iter().fold(0xcbf2_9ce4_8422_2325u64 ^ g.len() as u64, |h, &t| (h ^ t as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+impl Induction {
+    pub fn new(limit: usize) -> Self {
+        Self { tokens: Vec::new(), index: Default::default(), limit }
+    }
+
+    fn insert(&mut self, p: usize) {
+        for n in IND_MIN..=IND_MAX.min(p + 1) {
+            self.index.insert(ngram_key(&self.tokens[p + 1 - n..=p]), p as u32);
+        }
+    }
+
+    /// Feed a window; per position the candidate token and the suffix
+    /// length (`(u32::MAX, 0)` when nothing matched).
+    pub fn window(&mut self, x: &[u32]) -> Vec<(u32, u8)> {
+        if self.tokens.len() + x.len() > 2 * self.limit {
+            let drop = self.tokens.len() - self.limit;
+            self.tokens.drain(..drop);
+            self.index.clear();
+            for p in 0..self.tokens.len() {
+                self.insert(p);
+            }
+        }
+        let mut out = Vec::with_capacity(x.len());
+        for &tok in x {
+            self.tokens.push(tok);
+            let p = self.tokens.len() - 1;
+            let mut best = (u32::MAX, 0u8);
+            for n in (IND_MIN..=IND_MAX.min(p + 1)).rev() {
+                let g = &self.tokens[p + 1 - n..=p];
+                if let Some(&q) = self.index.get(&ngram_key(g)) {
+                    let q = q as usize;
+                    if q + 1 >= n && q < p && &self.tokens[q + 1 - n..=q] == g {
+                        best = (self.tokens[q + 1], n as u8);
+                        break;
+                    }
+                }
+            }
+            self.insert(p);
+            out.push(best);
+        }
+        out
+    }
+}
+
 /// Per-stream context memory plus the last few tokens (for probes).
 pub struct StreamMemory {
     pub mem: ContextMemory,
     history: Vec<u32>,
+    pub induction: Induction,
 }
 
 impl StreamMemory {
@@ -96,7 +159,11 @@ impl StreamMemory {
             kv: Some(KvConfig { precision, ..KvConfig::new(dim, dim) }),
             ..Default::default()
         };
-        Self { mem: ContextMemory::new(cfg).expect("valid memory config"), history: Vec::new() }
+        Self {
+            mem: ContextMemory::new(cfg).expect("valid memory config"),
+            history: Vec::new(),
+            induction: Induction::new(max_tokens),
+        }
     }
 
     /// Rows for every block of this window.
@@ -166,6 +233,8 @@ pub struct WindowOut {
     pub gate: Tensor,
     /// Token after each memory row `(B, nb, M)` and `M`.
     pub far_next: Vec<u32>,
+    /// Induction column's token per position `(B·T)`.
+    pub ind_tok: Vec<u32>,
     pub m: usize,
     pub trunk: Trunk,
     pub known: usize,
@@ -208,7 +277,14 @@ impl Runner {
                 .collect();
             let known = per.iter().flatten().filter(|r| r.2 == 0).count();
             let n_rows = per.iter().flatten().map(|r| r.0.len() / dim).sum();
-            (MemBatch::from_rows(&per, dim, device)?, known, n_rows)
+            let ind: Vec<(u32, u8)> = self
+                .memories
+                .par_iter_mut()
+                .enumerate()
+                .map(|(bi, m)| m.induction.window(&x[bi * t..(bi + 1) * t]))
+                .collect::<Vec<_>>()
+                .concat();
+            (MemBatch::from_rows(&per, dim, device)?.with_induction(&ind, b, t, device)?, known, n_rows)
         } else {
             (MemBatch::empty(b, nb, dim, device)?, 0, 0)
         };
@@ -218,6 +294,7 @@ impl Runner {
             point: h.point,
             gate: h.gate,
             far_next: mem.next,
+            ind_tok: mem.ind_tok,
             m: mem.m,
             trunk,
             known,
@@ -240,6 +317,8 @@ impl Runner {
             }
         } else if col < t + out.m {
             out.far_next[(bi * nb + ti / block) * out.m + (col - t)]
+        } else if col == t + out.m {
+            out.ind_tok[bi * t + ti]
         } else {
             u32::MAX
         }
@@ -530,4 +609,30 @@ pub fn load_model(dir: &Path, mcfg: Config, device: &Device) -> Result<Model> {
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, device), mcfg)?;
     varmap.load(dir.join("model.safetensors"))?;
     Ok(model)
+}
+
+#[cfg(test)]
+mod induction_tests {
+    use super::*;
+
+    #[test]
+    fn induction_continues_the_longest_earlier_suffix() {
+        let mut ind = Induction::new(1000);
+        // 1 2 3 4 5 | 9 9 | 2 3 4 → after "2 3 4" the continuation is 5.
+        let out = ind.window(&[1, 2, 3, 4, 5, 9, 9, 2, 3, 4]);
+        assert_eq!(out[9], (5, 3));
+        assert!(out[..9].iter().all(|c| c.1 == 0));
+        // Across windows, and preferring the longer suffix.
+        let out = ind.window(&[7, 1, 2, 3, 4]);
+        assert_eq!(out[4], (5, 4));
+    }
+
+    #[test]
+    fn induction_keeps_working_after_trimming() {
+        let mut ind = Induction::new(8);
+        ind.window(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        ind.window(&[10, 11, 12, 13, 14, 15, 16, 17]);
+        let out = ind.window(&[11, 12, 13]);
+        assert_eq!(out[2], (14, 3));
+    }
 }
