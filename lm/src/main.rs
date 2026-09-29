@@ -109,6 +109,7 @@ fn train(args: &[String]) -> std::io::Result<()> {
         max_tokens: arg(args, "--mem-train", &d.max_tokens.to_string()).parse().expect("--mem-train"),
         aux: arg(args, "--aux", &d.aux.to_string()).parse().expect("--aux"),
         micro: arg(args, "--micro", &d.micro.to_string()).parse().expect("--micro"),
+        ema: arg(args, "--ema", &d.ema.to_string()).parse().expect("--ema"),
         ..d
     };
     let tokens = load_tokens(&data, "train.bin");
@@ -167,8 +168,16 @@ fn kv_precision(args: &[String]) -> snn_memory::KvPrecision {
     }
 }
 
-fn load_model(dir: &std::path::Path) -> snn_lm::model::Model {
-    snn_lm::train::load_model(dir, model_config(dir), &candle_core::Device::Cpu).expect("checkpoint")
+fn load_model(dir: &std::path::Path, args: &[String]) -> snn_lm::model::Model {
+    snn_lm::train::load_weights(&weights(dir, args), model_config(dir), &candle_core::Device::Cpu).expect("checkpoint")
+}
+
+/// The run's weights file: `--weights ema` picks the moving average.
+fn weights(dir: &std::path::Path, args: &[String]) -> PathBuf {
+    match arg(args, "--weights", "last").as_str() {
+        "ema" => dir.join("model.ema.safetensors"),
+        _ => dir.join("model.safetensors"),
+    }
 }
 
 /// The model configuration a run was trained with (`model.cfg`).
@@ -194,7 +203,7 @@ fn eval(args: &[String]) -> std::io::Result<()> {
     let val = load_tokens(&data, "val.bin");
     for memory in [true, false] {
         let t = Instant::now();
-        let loss = snn_lm::eval::val_loss(load_model(&run), &val.tokens, 27, windows, memory, kv_precision(args))
+        let loss = snn_lm::eval::val_loss(load_model(&run, args), &val.tokens, 27, windows, memory, kv_precision(args))
             .map_err(std::io::Error::other)?;
         println!(
             "val loss (memory {}): {:.4} nats, ppl {:.1} ({:.0}s)",
@@ -227,9 +236,18 @@ fn recall(args: &[String]) -> std::io::Result<()> {
     let ep = snn_lm::data::Episodes::new(&load_tokenizer(&data));
     println!("episodes: {set:?}");
     let t = Instant::now();
-    let res =
-        snn_lm::eval::recall(load_model(&run), &val.tokens, &ep, set, &distances, batch, memory, kv_precision(args), 7)
-            .map_err(std::io::Error::other)?;
+    let res = snn_lm::eval::recall(
+        load_model(&run, args),
+        &val.tokens,
+        &ep,
+        set,
+        &distances,
+        batch,
+        memory,
+        kv_precision(args),
+        7,
+    )
+    .map_err(std::io::Error::other)?;
     for r in res {
         println!(
             "memory {} distance {:>7}: exact {}/{}  first token {}/{}  answer loss {:.3}  key found {}/{}  \
@@ -267,7 +285,7 @@ fn export(args: &[String]) -> std::io::Result<()> {
         model_config(&run),
     )
     .map_err(std::io::Error::other)?;
-    varmap.load(run.join("model.safetensors")).map_err(std::io::Error::other)?;
+    varmap.load(weights(&run, args)).map_err(std::io::Error::other)?;
     let packed = snn_lm::pack::pack_model(&model, &varmap).map_err(std::io::Error::other)?;
     packed.save(std::io::BufWriter::new(std::fs::File::create(out.join("model.snnt"))?))?;
     std::fs::copy(data.join("tokenizer.bpe"), out.join("tokenizer.bpe"))?;
@@ -399,7 +417,7 @@ fn ablate(args: &[String]) -> std::io::Result<()> {
         ("no retention", true, false, false, true, false),
     ];
     for (name, memory, reset, no_hadam, no_ret, no_pointer) in cases {
-        let mut model = load_model(&run);
+        let mut model = load_model(&run, args);
         model.ablation = snn_lm::model::Ablation { no_hadam, no_retention: no_ret, no_pointer };
         let t = Instant::now();
         let (loss, by_pos) = snn_lm::eval::val_loss_detail(model, &val.tokens, 27, windows, memory, kv, reset)
@@ -428,7 +446,7 @@ fn reread(args: &[String]) -> std::io::Result<()> {
     let passages: Vec<Vec<u32>> = (0..n).map(|i| ids[i * stride..i * stride + len].to_vec()).collect();
     for memory in [true, false] {
         let t = Instant::now();
-        let r = snn_lm::eval::reread(load_model(&run), &passages, memory, kv_precision(args))
+        let r = snn_lm::eval::reread(load_model(&run, args), &passages, memory, kv_precision(args))
             .map_err(std::io::Error::other)?;
         println!(
             "memory {}: 1st reading acc {:.3} loss {:.3} | 2nd reading acc {:.3} loss {:.3} ({:.0}s)",

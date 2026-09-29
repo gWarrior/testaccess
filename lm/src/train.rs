@@ -54,6 +54,9 @@ pub struct TrainConfig {
     /// Weight of the auxiliary pointer loss per answer / re-read token,
     /// relative to a token's mixture loss (template answers get none).
     pub aux: f64,
+    /// Decay of the exponential moving average of the latent weights and
+    /// steps, saved as `model.ema.safetensors` (0 = off).
+    pub ema: f64,
 }
 
 impl Default for TrainConfig {
@@ -82,6 +85,7 @@ impl Default for TrainConfig {
             p_episode: 1.0 / 729.0,
             aux: 1.0,
             micro: 3,
+            ema: 1.0 - 1.0 / 729.0,
         }
     }
 }
@@ -580,6 +584,21 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
     }
     let vars = varmap.all_vars();
     println!("parameters: {}", Model::n_params(&vars));
+    // Moving average of the latent weights (and quantization steps): the
+    // averaged latents round to a steadier ternary model than the last step.
+    let ema_file = cfg.out.join("model.ema.safetensors");
+    let mut ema: Vec<(String, candle_core::Var, Tensor)> = Vec::new();
+    if cfg.ema > 0.0 {
+        let saved = if start_step > 0 && ema_file.exists() {
+            candle_core::safetensors::load(&ema_file, &device)?
+        } else {
+            Default::default()
+        };
+        for (name, v) in varmap.data().lock().expect("varmap lock").iter() {
+            let t = saved.get(name).cloned().unwrap_or_else(|| v.as_tensor().copy().expect("copy"));
+            ema.push((name.clone(), v.clone(), t));
+        }
+    }
     // Quantization steps θ move 27× slower: Adam normalizes their gradient,
     // and a crossing of a rounding boundary rescales a whole row.
     // The K/V step (one θ for many activations) moves at lr/3.
@@ -725,6 +744,11 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
         opt.step(&grads)?;
         opt_steps.step(&grads)?;
         opt_kv.step(&grads)?;
+        // Early on the average follows the weights (horizon grows with the step).
+        let d = cfg.ema.min((1.0 + step as f64) / (10.0 + step as f64));
+        for (_, v, e) in &mut ema {
+            *e = ((&*e * d)? + (v.as_tensor() * (1.0 - d))?)?;
+        }
         timing[2] += t2.elapsed().as_secs_f64();
 
         sum_loss += lv.iter().map(|&l| l as f64).sum::<f64>() / lv.len() as f64;
@@ -802,11 +826,21 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
                 err / n
             );
         }
+        let save_ema = || -> Result<()> {
+            if !ema.is_empty() {
+                let m: std::collections::HashMap<String, Tensor> =
+                    ema.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect();
+                candle_core::safetensors::save(&m, &ema_file)?;
+            }
+            Ok(())
+        };
         if (step + 1) % cfg.ckpt_every == 0 || step + 1 == cfg.steps {
+            save_ema()?;
             varmap.save(&ckpt)?;
             std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
         }
         if cfg.time_limit > 0 && clock.elapsed().as_secs() >= cfg.time_limit {
+            save_ema()?;
             varmap.save(&ckpt)?;
             std::fs::write(cfg.out.join("step"), format!("{}", step + 1))?;
             println!("time limit reached at step {}", step + 1);
@@ -818,9 +852,15 @@ pub fn train(cfg: &TrainConfig, mcfg: Config, tokens: &[u16], tok: &crate::token
 
 /// Load a trained model.
 pub fn load_model(dir: &Path, mcfg: Config, device: &Device) -> Result<Model> {
+    load_weights(&dir.join("model.safetensors"), mcfg, device)
+}
+
+/// Load a model from a weights file (`model.safetensors` or its moving
+/// average `model.ema.safetensors`).
+pub fn load_weights(file: &Path, mcfg: Config, device: &Device) -> Result<Model> {
     let mut varmap = VarMap::new();
     let model = Model::new(VarBuilder::from_varmap(&varmap, DType::F32, device), mcfg)?;
-    varmap.load(dir.join("model.safetensors"))?;
+    varmap.load(file)?;
     Ok(model)
 }
 
