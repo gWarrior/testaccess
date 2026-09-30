@@ -1,0 +1,2 @@
+memory on : 1st reading acc 0.358 loss 3.919 | 2nd reading acc 0.980 loss 0.181 (17s)
+memory off: 1st reading acc 0.352 loss 3.954 | 2nd reading acc 0.357 loss 3.918 (13s)
