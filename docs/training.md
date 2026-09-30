@@ -137,11 +137,11 @@ template — «не знаю / мой друг», known — доля блоко�
 ### Продолжение с чекпоинта в репозитории
 
 Точное состояние (`resume/`, ~1 ГБ) в git не хранится. В репозитории лежат веса последнего
-прогона: `lm/checkpoints/v4b/model.safetensors` и `model.ema.safetensors` (+ `model.cfg`).
+прогона: `lm/checkpoints/v4c/model.safetensors` и `model.ema.safetensors` (+ `model.cfg`).
 Новый прогон с них — тёплый старт: моменты оптимизатора и память потоков начинаются заново.
 
 ```bash
-snn-lm train --out /home/user/data/v4c --init lm/checkpoints/v4b/model.ema.safetensors \
+snn-lm train --out /home/user/data/v4d --init lm/checkpoints/v4c/model.ema.safetensors \
     --hours 3 --lr 2e-3 --warmup 54 --seed 29 --log-every 27 --val-every 243 \
     --micro 3 --parallel 5 --state-trits 2
 ```

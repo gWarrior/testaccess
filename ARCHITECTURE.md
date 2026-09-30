@@ -355,4 +355,4 @@ SwiGLU `W_2 (silu(W_1 x) ⊙ W_3 x)`, 256→1458→256. Реализован о�
 | `lm/src/infer.rs`, `pack.rs` | движок shift-add/VNNI, декодирование, формат SNNT v2 |
 | `lm/src/main.rs` | команды `snn-lm` |
 | `scripts/build-native.sh` | необязательная native-сборка |
-| `lm/model/`, `lm/checkpoints/v4b/`, `lm/reports/v4b/` | упакованная модель, веса последнего прогона, его оценки и тесты общения |
+| `lm/model/`, `lm/checkpoints/v4*/`, `lm/reports/v4*/` | упакованная модель (v4c), веса прогонов, их оценки и тесты общения |
