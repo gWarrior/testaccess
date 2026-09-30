@@ -14,6 +14,7 @@
 - [docs/architecture.md](docs/architecture.md) — ядро SNN-памяти подробно;
 - [docs/llm-integration.md](docs/llm-integration.md) — API стыковки с LLM;
 - [docs/training.md](docs/training.md) — корпус, сборка, запуск обучения;
+- [docs/learning.md](docs/learning.md) — принципы обучения и уроки прогонов;
 - [lm/README.md](lm/README.md) — справочник флагов;
 - [lm/REPORT.md](lm/REPORT.md) — результаты.
 
