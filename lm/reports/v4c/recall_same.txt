@@ -1,0 +1,4 @@
+episodes: Same
+memory on  distance     243: exact 9/9  first token 9/9  answer loss 0.202  key found 6/9  weights vocab 0.38 window 0.00 rows 0.04 induction 0.58
+memory on  distance    2187: exact 7/9  first token 9/9  answer loss 0.175  key found 8/9  weights vocab 0.34 window 0.00 rows 0.05 induction 0.61
+memory on  distance   19683: exact 9/9  first token 9/9  answer loss 0.192  key found 8/9  weights vocab 0.47 window 0.00 rows 0.06 induction 0.47
