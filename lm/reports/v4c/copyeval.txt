@@ -1,0 +1,5 @@
+pointer head: on
+held-out 19683 tokens: loss 3.8861 → with copy head 3.8861; fired 3179 times (16.2%), right 1580 (49.7%) (25s)
+distance     243: exact 18-token continuation 8/9 model alone, 8/9 with copy head
+distance    2187: exact 18-token continuation 9/9 model alone, 9/9 with copy head
+distance   19683: exact 18-token continuation 9/9 model alone, 9/9 with copy head

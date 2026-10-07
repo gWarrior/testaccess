@@ -1,0 +1,20 @@
+[package]
+name = "snn-lm"
+version = "0.1.0"
+edition = "2021"
+description = "Ternary HadamRNN language model with SNN long-context memory"
+license = "MIT OR Apache-2.0"
+
+[features]
+# AVX-512 VNNI integer kernel for the ternary matrices of the inference
+# engine (checked at run time; other CPUs keep the shift-add kernel).
+vnni = []
+
+[dependencies]
+snn-memory = { path = ".." }
+candle-core = "0.9"
+candle-nn = "0.9"
+rayon = "1.10"
+memmap2 = "0.9"
+signal-hook = "0.3"
+parquet = { version = "56", default-features = false, features = ["snap", "zstd"] }

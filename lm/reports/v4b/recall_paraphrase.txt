@@ -1,0 +1,4 @@
+episodes: Paraphrase
+memory on  distance     243: exact 0/9  first token 0/9  answer loss 4.223  key found 0/9  weights vocab 0.93 window 0.07 rows 0.00 induction 0.00
+memory on  distance    2187: exact 0/9  first token 0/9  answer loss 4.539  key found 0/9  weights vocab 0.95 window 0.04 rows 0.00 induction 0.00
+memory on  distance   19683: exact 0/9  first token 0/9  answer loss 3.836  key found 0/9  weights vocab 0.92 window 0.07 rows 0.01 induction 0.00

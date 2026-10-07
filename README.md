@@ -1,161 +1,108 @@
-# Unity Addressables Server
+# snn-memory
 
-A NestJS server that lets a Unity app **upload Addressables bundles** (bundles,
-catalog, hash) and **serve them back** for remote loading. All API routes are
-protected with **HTTP Basic auth**, and a built‑in **React admin page** lets you
-browse and manage uploaded content.
+Быстрая управляемая память на спайковых нейронных ансамблях (Rust). Задача: точное запоминание участков контекста для LLM с рекуррентным состоянием (Mamba/RWKV-подобных) вместо лестницы внимания. Опорный размер контекста — **300k токенов**.
 
-## Features
+Цикл из концепта ([docs/concept.md](docs/concept.md)) реализован целиком: **Learn → Recall → Forget → Recall**.
+- **Learn.** Запись одним предъявлением, память сразу доступна для чтения.
+- **Recall.** Извлечение по полному или частичному сигналу через аттракторную LIF-динамику.
+- **Forget.** Адресное удаление, сброс контекста или всей быстрой памяти. Остальные записи не повреждаются.
 
-- 📤 Upload bundles/catalog/hash per platform (`Android`, `iOS`, `StandaloneWindows64`, …)
-- 📥 Serve content back to Unity over `/content/...` (the Addressables RemoteLoadPath)
-- 🔐 HTTP Basic auth on all `/api` routes (downloads optionally protected too)
-- 🖥️ React management UI for browsing, uploading and deleting bundles
-- 📚 Swagger / OpenAPI docs at `/api/docs`
-- 🎮 Unity upload example (Editor script) + auth example for downloads
+Ответ памяти **тернарный**: `+1` «уверен», `0` «не знаю», `−1` «точно нет».
 
-## Project layout
+## Главное
 
+- **Тернарная сеть.** Синапсы принимают значения `+1 / 0 / −1` (возбуждающий, молчащий, тормозной), у каждого медленная и быстрая компонента.
+  - Id нейрона — один **трайт** (9 трит, пространство 3^9 = 19 683 нейрона).
+  - Состояния синапсов упакованы по **40 трит в 64 бита**.
+  - Проекция энкодера тоже тернарная.
+  - Все размеры — степени тройки, пороги — девятые доли.
+- **Энграммы с владением синапсами.** Каждое воспоминание владеет своими синапсами, поэтому `forget` удаляет ровно его вклад. Логическое удаление занимает O(1), физическая очистка — фоновая и амортизированная.
+- **Двухэтапное извлечение.** Индекс «нейрон → синапсы» (сначала редкие нейроны, с бюджетом сканирования), затем LIF-аттрактор: достройка паттерна, латеральное торможение, порог «не знаю».
+- **Жизненный цикл.** Контексты, TTL, закрепление (`pin`), консолидация в долговременную память, сброс быстрой памяти без потери долговременной, снапшоты между сессиями.
+- **Адаптер для LLM (`ContextMemory`).**
+  - Окно 300k токенов из перекрывающихся чанков.
+  - Лексический индекс (детекторы совпадений n-грамм) и семантический (ключи модели).
+  - Точная сверка найденного.
+  - Голова чтения с кросс-вниманием по K/V только выбранных чанков.
+  - «Точно нет» с доказательством через перепись n-грамм окна.
+
+## Быстрый старт
+
+```rust
+use snn_memory::*;
+
+// Ядро памяти: запись, частичное извлечение, забывание.
+let mut mem: SnnMemory<String> = SnnMemory::new(CodeEncoder::new(19_683), MemoryConfig::default())?;
+let apple: Vec<u32> = (0..27).map(|i| i * 729).collect();          // разреженный спайковый код
+let id = mem.learn(Input::Code(&apple), LearnOptions::new().payload("red apple".into()))?;
+
+let r = mem.recall(Input::Code(&apple[..9]), &RecallOptions::default())?; // треть паттерна
+assert_eq!((r.verdict, r.id()), (Verdict::Known, Some(id)));
+
+mem.forget(id);
+assert_eq!(mem.recall(Input::Code(&apple), &RecallOptions::default())?.verdict, Verdict::Absent);
+
+// Контекстная память для рекуррентной LLM.
+let cfg = ContextConfig { kv: Some(KvConfig::new(dk, dv)), ..Default::default() };
+let mut ctx = ContextMemory::new(cfg)?;
+ctx.append_kv(&tokens, &keys, &values)?;                 // по мере генерации
+let next = ctx.continuation(&recent_tokens, 5)?;          // что шло после этого фрагмента
+let yes_no = ctx.contains(&fragment)?;                    // Known / Unknown / Absent
+let out = ctx.read(Probe::Tokens(&recent_tokens), &query, 9)?; // кросс-внимание + тернарный гейт
 ```
-src/                 NestJS server (TypeScript)
-  auth/              HTTP Basic auth guard + helpers
-  bundles/           Upload / list / delete controller + service
-  config/            Env-based configuration
-  main.ts            Bootstrap, Swagger, static serving
-client/              React (Vite) admin UI
-examples/unity/      Unity upload + auth examples (C#)
-```
 
-## Quick start
+Полный рабочий пример: `cargo run --release --example quickstart`.
+
+## Результаты (300k, 4 vCPU Xeon 2.7 ГГц)
+
+`cargo run --release --example bench`. Цель по задержке: **< 1 мс** на запрос.
+
+| Сценарий | Точность | p50 | p99 |
+|---|---|---:|---:|
+| Лексика, 300k токенов: дословное воспроизведение 729 фактов «ключ→значение» | 729/729 | 28 мкс | 81 мкс |
+| Лексика: поиск случайного фрагмента из 9 токенов, точные позиции | 729/729 | 94 мкс | 218 мкс |
+| Лексика: отсутствующий фрагмент → «точно нет» | 729/729 | 17 мкс | 62 мкс |
+| Плотные ключи, 300k записей, d=1024: запрос с шумом cos 0.9 | 726/729, 0 ложных | 463 мкс | 600 мкс |
+| Плотные ключи: запрос с шумом cos 0.8 | 662/729, 0 ложных | 453 мкс | 528 мкс |
+| Плотные ключи: случайные запросы | 0 ложных «уверен» | — | — |
+| Забывание трети записей | забытые молчат 243/243, остальные целы 486/486 | 4.6 мкс на `forget` | — |
+| Голова чтения, 300k токенов с K/V (f16): поиск + внимание по 9 чанкам | argmax точен 729/729 | 111 мкс | 250 мкс |
+| Голова чтения, тернарные K/V | argmax точен 729/729 | 104 мкс | 225 мкс |
+
+Прочее:
+- **Запись:** около 0.9M токенов/с (лексика), около 30k плотных ключей/с при fan-in 9. Fan-in 27 точнее при сильном шуме (683/729 при cos 0.8), но p99 около 1 мс.
+- **Память на 300k токенов:** лексический индекс 36 МБ, семантический 40 МБ. K/V при d_k = d_v = 81: f16 170 МБ, тернарные 22 МБ.
+
+## Структура
+
+| Модуль | Назначение |
+|---|---|
+| `trit` | `Tryte` (9 трит), `TritVec` — плотная упаковка 40 трит / 64 бита |
+| `encoder` | `FlyHashEncoder` (тернарная проекция + k-WTA) для скрытых состояний, `NGramEncoder` (детекторы совпадений) для токенов |
+| `index`, `bank` | синапсы по пресинаптическому нейрону; банки энграмм с тернарными медленными/быстрыми весами, дискретная STDP, торможение |
+| `dynamics` | LIF-аттрактор: достройка паттерна, тормозной интернейрон, порог |
+| `working` | рабочая память: кратковременное облегчение (STP), последнее состояние |
+| `memory` | `SnnMemory`: API концепта (§19), тернарный вердикт, консолидация, TTL, контексты |
+| `persist` | версионированные снапшоты (all / long-term) |
+| `shared` | `SharedMemory` + фоновая очистка |
+| `kv`, `attention`, `context` | K/V-хранилище (f32/f16/тернарное), точное кросс-внимание, `ContextMemory` для LLM |
+
+Документация:
+- [docs/concept.md](docs/concept.md) — исходная концепция;
+- [docs/architecture.md](docs/architecture.md) — как концепция реализована и почему;
+- [docs/llm-integration.md](docs/llm-integration.md) — стыковка с рекуррентной LLM.
+- [docs/training.md](docs/training.md) — языковая модель `lm/`: сборка корпуса, запуск и возобновление обучения, оценка;
+- [lm/README.md](lm/README.md#флаги) — модель и справочник всех флагов `snn-lm`.
+
+## Разработка
 
 ```bash
-# 1. Configure credentials
-cp .env.example .env        # then edit API_USER / API_PASS
-
-# 2. Install + build the admin UI (served by the server at /)
-cd client && npm install && npm run build && cd ..
-
-# 3. Install + run the server
-npm install
-npm run build
-npm run start:prod          # or: npm run start:dev  (watch mode)
+cargo test                                    # 65 тестов: MVP §20, жизненный цикл, тернарность, контекст, снапшоты
+cargo run --release --example bench           # бенчмарки на 300k (lexical | dense | read | all)
+cargo run --release --example quickstart
 ```
 
-Then open:
-
-- Admin UI: <http://localhost:3001/>
-- Swagger:  <http://localhost:3001/api/docs>
-
-## Run with Docker
-
-Frontend and backend each have their own image; `docker-compose` wires them
-together. The frontend (nginx) serves the React UI and reverse‑proxies
-`/api`, `/content` and `/health` to the backend, so everything is reachable on
-a single port.
-
-```bash
-cp .env.example .env        # set API_USER / API_PASS (used by compose)
-docker compose up --build
-```
-
-Then open:
-
-- App + API: <http://localhost:8080/>
-- Swagger:   <http://localhost:8080/api/docs>
-
-Uploaded bundles are persisted in the `bundles` named volume. Point Unity at
-`http://YOUR_HOST:8080/...` for both upload and `RemoteLoadPath`.
-
-Compose env vars (all optional, see `.env.example`):
-
-| Variable            | Default    | Description                           |
-| ------------------- | ---------- | ------------------------------------- |
-| `WEB_PORT`          | `8080`     | Host port for the frontend            |
-| `API_USER`/`API_PASS` | `unity`/`changeme` | Basic-auth credentials      |
-| `PROTECT_DOWNLOADS` | `false`    | Require auth on `/content` downloads  |
-| `MAX_FILE_SIZE`     | `536870912`| Max upload size per file (bytes)      |
-
-> nginx is configured with `client_max_body_size 1024m`; raise it in
-> `client/nginx.conf` if your bundles are larger.
-
-## Configuration
-
-All settings come from environment variables (see `.env.example`):
-
-| Variable            | Default        | Description                                     |
-| ------------------- | -------------- | ----------------------------------------------- |
-| `PORT`              | `3001`         | HTTP port                                       |
-| `API_USER`          | `unity`        | Basic-auth username                             |
-| `API_PASS`          | `changeme`     | Basic-auth password                             |
-| `API_REALM`         | `Addressables` | Basic-auth realm                                |
-| `STORAGE_DIR`       | `./storage`    | Where uploaded files are stored                 |
-| `MAX_FILE_SIZE`     | `536870912`    | Max upload size per file (bytes, default 512MB) |
-| `PROTECT_DOWNLOADS` | `false`        | Require basic auth on `/content` downloads too  |
-
-## API
-
-All `/api` routes require an `Authorization: Basic <base64(user:pass)>` header.
-
-| Method   | Path                              | Description                          |
-| -------- | --------------------------------- | ------------------------------------ |
-| `POST`   | `/api/bundles/:platform`          | Upload files (multipart, field `files`) |
-| `GET`    | `/api/bundles`                    | List all platforms                   |
-| `GET`    | `/api/bundles/:platform`          | List files for a platform            |
-| `DELETE` | `/api/bundles/:platform/:filename`| Delete a file                        |
-| `GET`    | `/content/:platform/:filename`    | Download a file (Unity RemoteLoadPath) |
-| `GET`    | `/health`                         | Health check                         |
-
-### Example with curl
-
-```bash
-# Upload
-curl -u unity:changeme \
-  -F "files=@catalog.json" \
-  -F "files=@assets_all_xxxx.bundle" \
-  http://localhost:3001/api/bundles/Android
-
-# List
-curl -u unity:changeme http://localhost:3001/api/bundles/Android
-
-# Download (what Unity does)
-curl http://localhost:3001/content/Android/catalog.json
-```
-
-## Unity integration
-
-### 1. Point Addressables at the server
-
-In **Addressables Profiles** set your remote paths:
-
-- **RemoteBuildPath**: `ServerData/[BuildTarget]` (default)
-- **RemoteLoadPath**: `http://YOUR_HOST:3001/content/[BuildTarget]`
-
-Build content: *Window → Asset Management → Addressables → Groups → Build → New Build → Default Build Script*.
-
-### 2. Upload the build
-
-Copy [`examples/unity/AddressablesUploader.cs`](examples/unity/AddressablesUploader.cs)
-into an `Assets/Editor/` folder, set `ServerUrl` / `ApiUser` / `ApiPass`, then run
-**Tools → Addressables → Upload To Server**. It uploads everything in
-`ServerData/<BuildTarget>/` to `/api/bundles/<BuildTarget>` with basic auth.
-
-### 3. (Optional) Protected downloads
-
-If you start the server with `PROTECT_DOWNLOADS=true`, downloads also need
-credentials. Add [`examples/unity/AddressablesAuth.cs`](examples/unity/AddressablesAuth.cs)
-to your project — it registers an `Addressables.WebRequestOverride` that attaches
-the `Authorization` header to every download.
-
-## Development
-
-```bash
-# Run the API with hot reload
-npm run start:dev
-
-# Run the admin UI with hot reload (proxies /api to localhost:3001)
-cd client && npm run dev      # http://localhost:5173
-```
-
-> **Security note:** Basic auth only protects credentials in transit when used
-> over **HTTPS**. Put this server behind TLS (a reverse proxy such as Nginx or
-> Caddy) before exposing it publicly, and change the default credentials.
+Необязательные режимы сборки языковой модели: `scripts/build-native.sh`
+(`-C target-cpu=native`, отдельный `target/native`) и `--features vnni`
+(ядро AVX-512 VNNI для тернарных матриц движка). Подробнее — в
+[lm/README.md](lm/README.md#флаги).

@@ -1,0 +1,2 @@
+val loss (memory on ): 4.0890 nats, ppl 59.7 (92s)
+val loss (memory off): 4.2498 nats, ppl 70.1 (67s)
